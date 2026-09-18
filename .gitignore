@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.npmcache/
+node_modules/
+frontend/dist/
+data/
+models/*.pt
+models/*.onnx
+tools/
+.pytest_cache/
+*.log
+Ultralytics/

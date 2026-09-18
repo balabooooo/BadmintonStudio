@@ -1,0 +1,22 @@
+# BadmintonStudio backend runtime dependencies
+# NOTE: torch / torchvision are expected to come from the host environment
+# (inherited through `python -m venv --system-site-packages`).
+
+# --- media I/O ---
+av>=13.0
+imageio-ffmpeg>=0.5.1
+opencv-python>=4.10
+
+# --- numerics ---
+numpy>=2.0
+scipy>=1.13
+
+# --- web API ---
+fastapi>=0.115
+uvicorn>=0.32
+websockets>=13.0
+pydantic>=2.9
+python-multipart>=0.0.12
+
+# --- AI detectors (optional, degrade gracefully if missing) ---
+ultralytics>=8.3
