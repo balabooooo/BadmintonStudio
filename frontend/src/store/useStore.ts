@@ -17,7 +17,7 @@ import type {
   Timeline,
 } from '../lib/types'
 
-export type View = 'library' | 'studio' | 'exports' | 'settings'
+export type View = 'library' | 'studio' | 'annotate' | 'exports' | 'settings'
 
 /**
  * 这个回合在成片里被盖住了多少（0~1），以及盖得最多的那一段。
@@ -207,6 +207,12 @@ export const DEFAULT_PARAMS: AnalysisParams = {
   // 切分优先用「球员运动 + 静默段」：回合之间球员必然会停下来，
   // 而整帧运动会一直被观众和隔壁场地污染，这就是旧版切不准的根因。
   segment_mode: 'auto',
+  // 静默段尺度：这些是「标注 → 优化参数」校准的目标。默认值来自用真实标注
+  // 搜出来的较优解（见 scripts/eval_segmentation.py / 标注页「优化参数」）。
+  seg_min_quiet: 0.7,
+  seg_prominence: 0.18,
+  seg_min_rest: 0.8,
+  seg_min_core: 1.0,
   max_frames: 0,
   sample_fps: 12,
 }

@@ -34,6 +34,7 @@ from .core import store as ST
 from .core.jobs import manager as JOBS
 from .core.models import AnalysisParams, ExportPreset, MediaInfo, Project, Rally, Timeline, Track, now_ms
 from .core.streaming import range_response
+from .api.annotations import router as annotations_router
 
 ensure_dirs()
 
@@ -45,6 +46,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(annotations_router)
 
 
 # ------------------------------------------------------------------ WebSocket 广播

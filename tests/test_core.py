@@ -25,7 +25,8 @@ from bms.analysis import pipeline as P             # noqa: E402
 from bms.analysis import players as PL             # noqa: E402
 from bms.analysis import rally as RA               # noqa: E402
 from bms.analysis import rally_vision as RV        # noqa: E402
-from bms.core.models import AnalysisParams         # noqa: E402
+from bms.analysis import annotation as AN          # noqa: E402
+from bms.core.models import AnalysisParams, AnalysisResult  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -784,6 +785,76 @@ def test_merge_by_availability_windows() -> None:
     check("球员切分有候选 → 用它", has(92, 108), str(spans))
 
 
+def test_annotation_evidence_and_metrics() -> None:
+    """标注评估的纯函数 + 击球密度证据。
+
+    击球密度是这条素材上唯一有区分度的一路（实测量测 AUC≈0.78），
+    它一旦被算错，整个「用标注校准参数」就失去意义。
+    """
+    print("\n标注评估与击球证据")
+    fps = 12.0
+    n = int(60 * fps)
+    # 10~15s 连打 6 拍，其余时间没有击球
+    hd = RA.hit_density_signal(_hits([10, 10.5, 11, 12, 13, 14]), fps, n)
+    check("击球密度长度正确", hd.size == n)
+    check("连打的时段密度高", float(hd[int(10 * fps):int(15 * fps)].mean()) > 0.4,
+          str(float(hd[int(10 * fps):int(15 * fps)].mean())))
+    check("没击球的时段密度低", float(hd[int(40 * fps):int(55 * fps)].mean()) < 0.1,
+          str(float(hd[int(40 * fps):int(55 * fps)].mean())))
+
+    # 球员不动时证据为 0；球员在动 + 在击球时证据高
+    pm = np.zeros(n, dtype=np.float32)
+    pm[int(10 * fps):int(15 * fps)] = 1.0
+    ev = RV.audio_visual_evidence(pm, hd)
+    check("证据曲线长度正确", ev.size == n)
+    check("球员不动 → 证据为 0", float(ev[int(40 * fps):int(55 * fps)].max()) < 0.05)
+    check("球员在动且连打 → 证据明显", float(ev[int(10 * fps):int(15 * fps)].mean()) > 0.4,
+          str(float(ev[int(10 * fps):int(15 * fps)].mean())))
+
+    check("IoU 匹配：完全重合 F1=1", AN.metrics([(0.0, 10.0)], [(0.0, 10.0)])["f1"] == 1.0)
+    check("IoU 匹配：不重合 F1=0", AN.metrics([(0.0, 10.0)], [(20.0, 30.0)])["f1"] == 0.0)
+    clean = AN.normalize_rallies([{"start": 5, "end": 3}, {"start": -1, "end": 2}, {"start": 8, "end": 9}])
+    check("清洗：丢掉倒置、夹取负起点", len(clean) == 2 and clean[0]["start"] == 0.0, str(clean))
+    s = AN.suggest([(0.0, 4.0), (10.0, 15.0), (20.0, 23.0)])
+    check("建议：给出时长统计", s.get("duration_median") == 4.0 and s.get("count") == 3.0, str(s))
+
+
+def test_annotation_optimizer_runs() -> None:
+    """「用标注搜参」必须能跑通并返回可用的最优参数（离线、不重跑 AI）。"""
+    print("\n标注搜参")
+    fps = 12.0
+    dur = 120.0
+    n = int(dur * fps)
+    act = np.full(n, 0.4, dtype=np.float32)
+    pm = np.zeros(n, dtype=np.float32)
+    hits = np.zeros(n, dtype=np.float32)
+    for a, b in ((10, 35), (60, 90)):
+        pm[int(a * fps):int(b * fps)] = 1.0
+        act[int(a * fps):int(b * fps)] = 0.9
+    hit_times = [t for a, b in ((10, 35), (60, 90)) for t in np.arange(a, b, 1.2)]
+    res = AnalysisResult(
+        media_id="m_test", status="done",
+        params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.5, post_roll=0.5),
+        signals={
+            "activity_full": act.tolist(),
+            "player_motion_full": pm.tolist(),
+            "player_coverage_full": np.ones(n, dtype=np.float32).tolist(),
+            "fps": [fps], "duration": [dur], "player_fps": [fps],
+            "hit_times": [round(float(t), 3) for t in hit_times],
+            "hit_strength": [0.8] * len(hit_times),
+            "hit_confidence": [0.9] * len(hit_times),
+        },
+        stats={"audio_reliability": 0.8},
+    )
+    out = AN.optimize(res, [(10.0, 34.0), (61.0, 89.0)], focus=(0.0, dur),
+                      grid=[("seg_min_core", [0.8, 1.8]), ("min_rally_seconds", [2.0])])
+    check("搜到了结果", out["tried"] > 0, str(out.get("tried")))
+    check("有最优参数", out["best"] is not None and "seg_min_core" in (out["best"] or {}).get("params", {}))
+    check("给出了 baseline 指标", "f1" in out["baseline"])
+    check("最优 F1 不低于 baseline F1", out["best"]["f1"] >= out["baseline"]["f1"] - 1e-9,
+          f"{out['best']['f1']} < {out['baseline']['f1']}")
+
+
 def main() -> int:
     test_player_pipeline_contract()
     test_shuttle_pipeline_contract()
@@ -807,6 +878,8 @@ def main() -> int:
     test_pose_gate_degrades()
     test_segment_rallies_reuses_player_signal()
     test_merge_by_availability_windows()
+    test_annotation_evidence_and_metrics()
+    test_annotation_optimizer_runs()
     print()
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：{FAILURES}")

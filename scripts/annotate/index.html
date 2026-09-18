@@ -229,7 +229,17 @@ function exportCsv(){
 }
 
 // ---------------------------------------------------------------- 播放控制
-function seek(t, pause=true){ v.currentTime = clamp(t, 0, Math.max(0,S.duration-0.01)); S.viewCenter = v.currentTime; if(pause) v.pause(); }
+// 注意：seek 必须重画详情时间轴（renderDetail）。旧版只更新了 S.viewCenter，
+// 于是按 ←/→ 时播放头动了、刻度与色块却留在原地，看起来就是「时间轴没跟着走」。
+// 另外视图中心用「夹取后的目标值」而不是回读 v.currentTime：currentTime 的赋值
+// 是异步的，某些浏览器回读到的还是旧值，视图会慢一帧。
+function seek(t, pause=true){
+  const nt = clamp(t, 0, Math.max(0, S.duration-0.01));
+  v.currentTime = nt;
+  S.viewCenter = nt;
+  if(pause) v.pause();
+  renderDetail(); updateHud();
+}
 function step(dt){ seek(v.currentTime + dt); }
 function togglePlay(){ if(v.paused) v.play(); else v.pause(); }
 function nudge(dt){ const r=selAnn(); if(!r) return; pushUndo(); r.start=clamp(r.start+dt,0,r.end-0.05); r.start=Math.max(0,r.start); S.viewCenter=r.start; markDirty(); renderAll(); }

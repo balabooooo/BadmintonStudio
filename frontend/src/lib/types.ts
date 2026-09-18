@@ -116,8 +116,71 @@ export interface AnalysisParams {
   player_max_area: number
   /** 回合切分方式：auto 优先用球员运动切分 */
   segment_mode: 'auto' | 'activity' | 'hybrid'
+  /** 静默段：最短宽度（秒） */
+  seg_min_quiet: number
+  /** 静默段：显著度门限（相对 p95-p20） */
+  seg_prominence: number
+  /** 静默段：两段之间至少隔多久才算回合结束（秒） */
+  seg_min_rest: number
+  /** 允许的最短连续移动段（秒） */
+  seg_min_core: number
   max_frames: number
   sample_fps: number
+}
+
+/* ------------------------------------------------------------------ 人工标注 */
+
+export interface AnnotationRally {
+  start: number
+  end: number
+  note?: string
+  source?: string
+}
+
+/** 自动切分草稿（当前分析结果的回合，用于半自动标注） */
+export interface AnnotationDraft {
+  start: number
+  end: number
+  index: number
+  shots: number
+  score: number
+}
+
+export interface AnnotationResponse {
+  media_id: string
+  media_name: string
+  duration: number
+  fps: number
+  path: string
+  rallies: AnnotationRally[]
+  focus: number[] | null
+  note: string
+  auto: AnnotationDraft[]
+}
+
+/** 一次参数评估的指标 */
+export interface SegmentMetric {
+  iou: number
+  n: number
+  tp: number
+  fp: number
+  fn: number
+  precision: number
+  recall: number
+  f1: number
+  params: Record<string, number>
+}
+
+export interface OptimizeResult {
+  gt_count: number
+  focus: number[]
+  iou_threshold: number
+  baseline: SegmentMetric
+  best: SegmentMetric | null
+  results: SegmentMetric[]
+  tried: number
+  search_fields: string[]
+  suggest: Record<string, number>
 }
 
 /** 场地标定与机位识别结果 */

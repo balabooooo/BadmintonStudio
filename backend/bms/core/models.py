@@ -246,6 +246,18 @@ class AnalysisParams(BaseModel):
     #: 回合切分方式：``auto`` 优先用球员运动切分（推荐），``activity`` 用旧的
     #: 融合活跃度 + 迟滞状态机，``hybrid`` 两种都跑再择优。
     segment_mode: Literal["auto", "activity", "hybrid"] = "auto"
+    #: ---- 静默段切分尺度（人工标注校准的目标参数）----
+    #: 这些是「球员运动 × 击球密度」证据曲线上找静默谷的内部尺度。它们不在旧
+    #: 参数里是因为以前没有 ground truth 可依据（见 HANDOVER 8.6）。有了标注
+    #: 之后它们就是最值得校准的量，所以提升为可持久化、可被优化器写入的参数。
+    #: 单个静默谷的最短宽度：太短会把曲线抖动当成停顿。
+    seg_min_quiet: float = 0.7
+    #: 静默谷的显著度门限（相对 p95-p20）；越大要求谷越深。
+    seg_prominence: float = 0.18
+    #: 两段静默之间至少隔多久才算「回合结束」。
+    seg_min_rest: float = 0.8
+    #: 允许的最短连续移动段，比它短的候选丢掉。
+    seg_min_core: float = 1.0
     #: 逐帧 AI 分析的最大帧数（用于长视频限速；0 = 不限）
     max_frames: int = 0
     #: 分析帧率

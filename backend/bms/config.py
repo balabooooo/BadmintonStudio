@@ -42,6 +42,8 @@ THUMBS_DIR = CACHE_DIR / "thumbs"
 FRAMES_DIR = CACHE_DIR / "frames"
 EXPORT_DIR = DATA_DIR / "exports"
 LOGS_DIR = DATA_DIR / "logs"
+#: 人工回合标注（每段素材一个 <代理名>.anno.json），用来自动优化切分参数
+ANNOTATIONS_DIR = DATA_DIR / "annotations"
 
 MODELS_DIR = _env_path("BMS_MODELS_DIR", ROOT / "models")
 TOOLS_DIR = _env_path("BMS_TOOLS_DIR", ROOT / "tools")
@@ -69,6 +71,7 @@ def ensure_dirs() -> None:
         FRAMES_DIR,
         EXPORT_DIR,
         LOGS_DIR,
+        ANNOTATIONS_DIR,
         MODELS_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True)

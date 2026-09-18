@@ -1,10 +1,12 @@
 import type {
   AnalysisParams,
   AnalysisResult,
+  AnnotationResponse,
   EnvInfo,
   ExportPreset,
   JobInfo,
   MediaInfo,
+  OptimizeResult,
   PlayerProbe,
   Project,
   ProjectSummary,
@@ -123,6 +125,30 @@ export const api = {
   ) => req<AnalysisResult>(`/api/projects/${pid}/resegment`, { method: 'POST', body: JSON.stringify(body) }),
   clearAnalysis: (pid: string, mid: string) =>
     req<{ ok: boolean }>(`/api/projects/${pid}/analysis/${mid}`, { method: 'DELETE' }),
+
+  // ---------------------------------------------------------------- 标注 / 参数优化
+  getAnnotation: (pid: string, mid: string) =>
+    req<AnnotationResponse>(`/api/projects/${pid}/media/${mid}/annotation`),
+  saveAnnotation: (
+    pid: string,
+    mid: string,
+    body: { rallies: { start: number; end: number; note?: string; source?: string }[]; focus?: number[] | null; note?: string },
+  ) =>
+    req<{ ok: boolean; count: number; path: string; updated_at: string }>(
+      `/api/projects/${pid}/media/${mid}/annotation`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+  optimizeSegmentation: (
+    pid: string,
+    mid: string,
+    body: { params?: Partial<AnalysisParams> } = {},
+  ) =>
+    req<OptimizeResult>(`/api/projects/${pid}/media/${mid}/annotation/optimize`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  annotationCsvUrl: (pid: string, mid: string) =>
+    `/api/projects/${pid}/media/${mid}/annotation/export.csv`,
 
   // ---------------------------------------------------------------- 回合
   patchRally: (pid: string, rid: string, patch: Partial<Rally>) =>

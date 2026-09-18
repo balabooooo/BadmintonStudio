@@ -8,12 +8,14 @@ import {
   Download,
   ChevronLeft,
   CircleDot,
+  PenLine,
 } from 'lucide-react'
 import { cn } from './lib/format'
 import { Button, ConfirmProvider, ToastHost, Tooltip } from './components/ui'
 import { useStore } from './store/useStore'
 import LibraryPage from './components/LibraryPage'
 import StudioPage from './components/StudioPage'
+import AnnotatePage from './components/AnnotatePage'
 import ExportsPage from './components/ExportsPage'
 import SettingsPage from './components/SettingsPage'
 import JobTray from './components/JobTray'
@@ -44,6 +46,7 @@ function NavRail() {
   const items = [
     { id: 'library' as const, icon: FolderOpen, label: '工程库', hint: '浏览与新建工程' },
     { id: 'studio' as const, icon: Film, label: '剪辑台', hint: '预览 / 时间线 / AI 分析', disabled: !project },
+    { id: 'annotate' as const, icon: PenLine, label: '标注', hint: '人工标注回合，并用标注自动优化切分参数', disabled: !project },
     { id: 'exports' as const, icon: Download, label: '导出记录', hint: '查看已导出的成片' },
     { id: 'settings' as const, icon: Settings2, label: '设置', hint: '环境检测与缓存管理' },
   ]
@@ -93,7 +96,7 @@ function TitleBar() {
 
   return (
     <header className="flex h-[54px] shrink-0 items-center gap-3 border-b border-white/7 bg-ink-950/55 px-4 backdrop-blur-xl">
-      {view === 'studio' && project ? (
+      {(view === 'studio' || view === 'annotate') && project ? (
         <Button variant="ghost" size="sm" onClick={closeProject} className="-ml-1">
           <ChevronLeft size={14} />
           工程库
@@ -101,12 +104,12 @@ function TitleBar() {
       ) : (
         <Logo />
       )}
-      {view === 'studio' && project && (
+      {(view === 'studio' || view === 'annotate') && project && (
         <div className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink-200">
           <span className="text-ink-500">/</span> <span className="text-white">{project.name}</span>
         </div>
       )}
-      {view !== 'studio' && <div className="flex-1" />}
+      {view !== 'studio' && view !== 'annotate' && <div className="flex-1" />}
 
       {running.length > 0 && (
         <div className="flex items-center gap-2 rounded-full border border-court-500/30 bg-court-500/10 px-2.5 py-1">
@@ -270,6 +273,8 @@ export default function App() {
                   <LibraryPage />
                 ) : view === 'studio' && project ? (
                   <StudioPage />
+                ) : view === 'annotate' && project ? (
+                  <AnnotatePage />
                 ) : view === 'exports' ? (
                   <ExportsPage />
                 ) : view === 'settings' ? (

@@ -986,6 +986,12 @@ def _segment_rallies(
         max_rally=float(params.max_rally_seconds),
         pre_roll=float(params.pre_roll),
         post_roll=float(params.post_roll),
+        # 静默段尺度：人工标注校准出来的值优先，旧参数里没有时退回 SegmentOptions
+        # 的默认值（用 getattr 兜底，保证旧工程反序列化后仍能工作）。
+        min_quiet=float(getattr(params, "seg_min_quiet", 0.7)),
+        prominence_ratio=float(getattr(params, "seg_prominence", 0.18)),
+        min_rest=float(getattr(params, "seg_min_rest", 0.8)),
+        min_core=float(getattr(params, "seg_min_core", 1.0)),
     )
     #: 允许调用方（标注校准脚本 / 测试）覆盖静默段检测的参数。
     #: 这些参数不在 ``AnalysisParams`` 里（它们是切分算法的内部尺度），
