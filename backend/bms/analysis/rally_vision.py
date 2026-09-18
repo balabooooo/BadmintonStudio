@@ -178,6 +178,34 @@ def blend_with_activity(player_motion: np.ndarray, coverage: np.ndarray,
     return (cov * player_motion + (1.0 - cov) * activity).astype(np.float32)
 
 
+def audio_visual_evidence(
+    player_motion: np.ndarray,
+    hit_density: np.ndarray | None,
+    weight_hits: float = 0.7,
+) -> np.ndarray:
+    """把「球员在动」和「这一带在连续击球」乘成一条回合证据曲线。
+
+    单看球员运动区分度不够（球员捡球时也走，隔壁场地也在动，实测 AUC≈0.57）；
+    单看击球密度会被「隔壁场地恰好也连打几拍」骗到。两者**相乘**要求两件事
+    同时成立，正好对应「我们这场比赛正在对拉」：回合间任意一路塌下去，
+    证据就塌下去，谷底因此变清晰。
+
+    之所以用 ``(1-weight) + weight*hits`` 而不是直接相乘：直接相乘时只要击球
+    密度有一点波动就会把整段证据压没，短回合尤其容易被吃掉；留一个下限让
+    「球员确实在快速移动」本身也能支撑起候选，漏检的击球不至于让回合消失。
+
+    两路都先做鲁棒归一化，避免量纲差异。
+    """
+    if player_motion is None or player_motion.size == 0:
+        return hit_density if hit_density is not None else np.zeros(0, dtype=np.float32)
+    p = _robust_norm(player_motion)
+    if hit_density is None or hit_density.size != p.size or not np.any(hit_density):
+        return p
+    h = _robust_norm(hit_density)
+    w = float(np.clip(weight_hits, 0.0, 1.0))
+    return _robust_norm(p * ((1.0 - w) + w * h))
+
+
 # ------------------------------------------------------------------ 静默段检测
 
 
@@ -293,16 +321,23 @@ class SegmentSignals:
 class SegmentOptions:
     min_rally: float = 2.0
     max_rally: float = 120.0
-    min_quiet: float = 1.0
-    prominence_ratio: float = 0.30
+    #: 两个静默谷之间至少要隔多久才当作「两次停顿」。旧默认 1.0s 配上海量
+    #: 噪声会在一次对拉内部切出一堆假边界，所以这里不能取太小。
+    min_quiet: float = 0.7
+    #: 静默谷的显著度门限（相对 p95-p20）。旧默认 0.30 太高：多球场素材里
+    #: 球员捡球时也在走动，谷本来就浅，于是大半回合之间的停顿被判成「不是谷」，
+    #: 相邻回合被粘在一起。
+    prominence_ratio: float = 0.18
     #: 静默段里「站定」之后还要往前留多久（接发球准备动作）
     pre_roll: float = 1.0
     #: 回合结束后往后留多久（球落地后的收势）
     post_roll: float = 1.6
     #: 静默段短于这个长度就不算「回合结束」（避免把一次长停顿当成回合边界）
-    min_rest: float = 1.2
-    #: 允许的最短回合，比它短的候选丢掉
-    min_core: float = 2.5
+    min_rest: float = 0.8
+    #: 允许的最短回合，比它短的候选丢掉。旧默认 2.5s 在业余素材上有「刀刃
+    #: 效应」：实测有整段因为最长连续移动段 2.42s（差 0.08s）被否掉。
+    #: 业余回合里球员「站着看球」的瞬间很多，连续移动段本来就短。
+    min_core: float = 1.0
 
 
 @dataclass
@@ -492,6 +527,7 @@ def segment_visual(
     shuttle_presence: np.ndarray | None = None,
     shuttle_fps: float = 0.0,
     hit_times: np.ndarray | None = None,
+    hit_density: np.ndarray | None = None,
     opt: SegmentOptions | None = None,
 ) -> tuple[list[RawSegment], float]:
     """面向流水线的入口：用球员运动切分，并返回球员检测的有效覆盖率。
@@ -527,6 +563,10 @@ def segment_visual(
     if act is not None and np.any(act):
         act = _robust_norm(_smooth(act, max(1, int(fps * 1.2))))
         m = blend_with_activity(m, cov, act)
+    # 击球密度是这条素材上区分度最高的一路（见 `audio_visual_evidence`）。
+    # 把它乘进球员运动里，让「球员在动」和「这一带在连续击球」同时成立才算回合。
+    if hit_density is not None and hit_density.size == n:
+        m = audio_visual_evidence(m, hit_density)
     if not np.any(m):
         return [], coverage_ratio
 
@@ -678,6 +718,7 @@ __all__ = [
     "RawSegment",
     "SegmentOptions",
     "SegmentSignals",
+    "audio_visual_evidence",
     "blend_with_activity",
     "box_motion",
     "detection_coverage",

@@ -429,6 +429,7 @@ def run_analysis(
             duration=duration,
             player_sig=player_sig,
             shuttle_sig=shuttle_sig,
+            hits=hits,
         )
 
         # ---------------------------------------------------------- 7. 边界锚定
@@ -899,7 +900,8 @@ def _segments_to_intervals(segs: list[RV.RawSegment]) -> list[RA.RallyInterval]:
     return out
 
 
-def _seg_quality(segs: list[RV.RawSegment]) -> float:
+def _seg_quality(segs: list[RV.RawSegment], fps: float = 15.0,
+                 hit_density: np.ndarray | None = None) -> float:
     """给一套切分结果打一个「有多可信」的分数，用于 hybrid 模式下择优。
 
     奖励「回合之间真的有停顿」和「时长分布合理」，惩罚两件事：
@@ -907,6 +909,12 @@ def _seg_quality(segs: list[RV.RawSegment]) -> float:
     * **首尾相接**：前一个回合的结束正好等于后一个的开始。真实比赛里
       得分之后必然有捡球/换发球，出现首尾相接说明「回合之间」根本没被识别出来。
     * **时长过于整齐**：一堆几乎一样长的片段说明是机械等分出来的。
+
+    另外（``hit_density`` 可用时）奖励「回合内击球密集、回合间稀疏」的
+    对比度。没有它，择优会在两条**都不准**的路径里挑一条看着整齐的：
+    实测把松弛过的参数同时给了球员路径和活跃度路径之后，活跃度路径因为
+    段数少、间隔大而拿到更高分，结果真正的「球员运动 × 击球密度」证据路径
+    被丢掉（HANDOVER 第 10 节提醒过的「整体漂移」）。
     """
     if not segs:
         return 0.0
@@ -921,8 +929,27 @@ def _seg_quality(segs: list[RV.RawSegment]) -> float:
     spread_score = float(np.clip(cv / 0.45, 0.0, 1.0)) if cv < 0.45 else float(np.clip((1.2 - cv) / 0.6, 0.0, 1.0))
     dur_ok = float(np.clip(np.mean((durs >= 4.0) & (durs <= 90.0)), 0.0, 1.0))
     mean_score = float(np.mean([s.score for s in segs]))
-    return float(np.clip(0.45 * rest_ratio + 0.25 * spread_score + 0.15 * dur_ok + 0.15 * mean_score,
-                         0.0, 1.0))
+    q = float(np.clip(0.45 * rest_ratio + 0.25 * spread_score + 0.15 * dur_ok + 0.15 * mean_score,
+                      0.0, 1.0))
+    if hit_density is not None and hit_density.size and fps > 0:
+        # 击球证据的「F 值代理」：p = 段内平均击球密度，r = 被段覆盖的
+        # 击球密度总量占比。它直接度量「选择的这些段有没有把在连续打球的
+        # 时刻包住」，比段数 / 间隔这些形状指标更接近真正要的东西。
+        # 证据可用时以它为主：只靠形状指标会挑出「段数少、间隔大」的机械等分
+        # 结果（实测活跃度路径 5 段，形状分 0.86，但只覆盖了 19% 的击球证据）。
+        m = hit_density.size
+        mask = np.zeros(m, dtype=bool)
+        for s in segs:
+            a = max(0, min(m - 1, int(s.start * fps)))
+            b = max(a + 1, min(m, int(s.end * fps)))
+            mask[a:b] = True
+        total = float(hit_density.sum())
+        if mask.any() and total > 0.0:
+            p = float(hit_density[mask].mean())
+            r = float(hit_density[mask].sum() / total)
+            hit_f = (2.0 * p * r / (p + r)) if (p + r) > 0 else 0.0
+            q = 0.3 * q + 0.7 * float(np.clip(hit_f, 0.0, 1.0))
+    return float(np.clip(q, 0.0, 1.0))
 
 
 def _segment_rallies(
@@ -933,6 +960,8 @@ def _segment_rallies(
     shuttle_sig=None,
     player_motion: np.ndarray | None = None,
     player_coverage: np.ndarray | None = None,
+    hits: Any = None,
+    opt_override: RV.SegmentOptions | None = None,
 ) -> tuple[list[RA.RallyInterval], dict[str, Any]]:
     """按 ``params.segment_mode`` 选切分方式，返回 (区间, 诊断信息)。
 
@@ -958,10 +987,21 @@ def _segment_rallies(
         pre_roll=float(params.pre_roll),
         post_roll=float(params.post_roll),
     )
+    #: 允许调用方（标注校准脚本 / 测试）覆盖静默段检测的参数。
+    #: 这些参数不在 ``AnalysisParams`` 里（它们是切分算法的内部尺度），
+    #: 但用人工标注校准它们恰恰是最有价值的一件事。
+    if opt_override is not None:
+        opt = opt_override
     shuttle_presence = getattr(shuttle_sig, "presence", None)
     shuttle_fps = float(getattr(shuttle_sig, "fps", 0.0) or 0.0) if shuttle_sig is not None else 0.0
     boxes = getattr(player_sig, "frame_boxes", None) if player_sig is not None else None
     player_fps = float(getattr(player_sig, "fps", 0.0) or 0.0) if player_sig is not None else 0.0
+
+    # 击球密度：这条素材上区分度最高的一路证据。它同时用在两条路径里 ——
+    # 乘进球员运动（`audio_visual_evidence`）以及传给 `segment_visual`。
+    # 快速重切分（resegment）通过 `hits` 把它复原出来，不依赖重跑 AI。
+    hit_density = (RA.hit_density_signal(hits, fused.fps, fused.activity.size)
+                   if hits is not None and getattr(hits, "times", np.zeros(0)).size else None)
 
     mode = params.segment_mode
     trace: dict[str, Any] = {"mode": mode}
@@ -984,8 +1024,12 @@ def _segment_rallies(
                    if player_coverage is not None and player_coverage.size else None)
         coverage = float(np.mean(cov_arr > 0.5)) if cov_arr is not None else 0.0
         pm_arr = pm
+        # 切分用的是「球员运动 × 击球密度」；`pm_arr` 保留原始球员运动给
+        # `_merge_by_availability` 做「球员到底动没动」的判断（那里不该被
+        # 击球密度影响，否则漏检的击球会让「真停顿」被误判成「在打球」）。
+        ev = RV.audio_visual_evidence(pm, hit_density)
         vis = RV.segment_by_player_motion(RV.SegmentSignals(
-            fps=fused.fps, duration=duration, player_motion=pm,
+            fps=fused.fps, duration=duration, player_motion=ev,
             activity=fused.activity,
             shuttle=(RV._resample_to(shuttle_presence, shuttle_fps, fused.fps,
                                      fused.activity.size)
@@ -994,7 +1038,7 @@ def _segment_rallies(
         ), opt)
         if vis:
             vis = RV.verify_with_shuttle(vis, RV.SegmentSignals(
-                fps=fused.fps, duration=duration, player_motion=pm, has_players=True,
+                fps=fused.fps, duration=duration, player_motion=ev, has_players=True,
                 shuttle=(RV._resample_to(shuttle_presence, shuttle_fps, fused.fps,
                                          fused.activity.size)
                          if shuttle_presence is not None and shuttle_fps > 0 else None),
@@ -1005,7 +1049,7 @@ def _segment_rallies(
             player_boxes=boxes, player_fps=player_fps,
             activity=fused.activity,
             shuttle_presence=shuttle_presence, shuttle_fps=shuttle_fps,
-            hit_times=None, opt=opt,
+            hit_density=hit_density, opt=opt,
         )
         if boxes and player_fps > 0:
             # 只为了「择优」时判断球员动没动，不需要归一化（门限是相对的）
@@ -1035,15 +1079,23 @@ def _segment_rallies(
     # 球员真的停下来，最可靠）；球员检测失效的时间用活跃度切分补齐。
     # 这个判断必须是局部的：同一段素材里球员可能前半段检得到、后半段检不到，
     # 用一个全片平均覆盖率去做「全局二选一」会导致某一段整体漏掉。
-    if mode == "auto" and vis and act and (boxes or cov_arr is not None):
-        merged = _merge_by_availability(vis, act, boxes, player_fps, fused.fps, duration,
-                                        coverage=cov_arr, player_motion=pm_arr,
-                                        merge_trace=trace.setdefault("windows", {}))
+    #
+    # 注意这里**不覆盖** ``vis``：合并结果作为一个**并列候选**参与后面的择优。
+    # 旧实现直接 `vis = merged`，于是「合并」这个动作不可能被否掉；实测把
+    # 击球密度证据路径交给合并器之后，它会在窗口里把一个长候选拼回来
+    # （实测拼出一个 19s 的区间，把两个真实回合粘在一起），而 `_seg_quality`
+    # 因为只看段数/间隔反而觉得它「更整齐」。留成并列候选才能按证据择优。
+    merged_vis: list[RV.RawSegment] | None = None
+    if (mode == "auto" and vis and act and (boxes or cov_arr is not None)
+            and hit_density is None):
+        merged_vis = _merge_by_availability(
+            vis, act, boxes, player_fps, fused.fps, duration,
+            coverage=cov_arr, player_motion=pm_arr,
+            merge_trace=trace.setdefault("windows", {}))
         trace["merged_from"] = {"player_motion": len(vis), "activity_valleys": len(act)}
-        vis = merged
 
     legacy: list[RA.RallyInterval] = []
-    if not vis and not act:
+    if not vis and not merged_vis and not act:
         legacy = RA.segment(
             fused,
             gap_seconds=params.gap_seconds,
@@ -1056,7 +1108,8 @@ def _segment_rallies(
         return legacy, trace
 
     if mode == "hybrid" and vis and act:
-        qv, qa = _seg_quality(vis), _seg_quality(act)
+        qv, qa = (_seg_quality(vis, fused.fps, hit_density),
+                  _seg_quality(act, fused.fps, hit_density))
         trace["quality"] = {"player_motion": round(qv, 3), "activity_valleys": round(qa, 3)}
         if qa > qv + 0.05:
             trace.update(method="activity_valleys", count=len(act))
@@ -1064,14 +1117,21 @@ def _segment_rallies(
         trace.update(method="player_motion", count=len(vis))
         return _segments_to_intervals(vis), trace
 
-    if vis and act:
-        qv, qa = _seg_quality(vis), _seg_quality(act)
-        trace["quality"] = {"player_motion": round(qv, 3), "activity_valleys": round(qa, 3)}
-        chosen, name = (vis, "player_motion+activity") if qv >= qa else (act, "activity_valleys")
-    else:
-        chosen, name = (vis, "player_motion") if vis else (act, "activity_valleys")
-    trace.update(method=name, count=len(chosen))
-    return _segments_to_intervals(chosen), trace
+    # 三路候选并列择优：未合并的证据路径 / 按时间段合并后的路径 / 纯活跃度。
+    # 评判见 :func:`_seg_quality`（其中「击球证据对齐度」是「哪条路径真的对上了
+    # 『在连续打球』这件事」的客观依据）。
+    cands: list[tuple[list[RV.RawSegment], str]] = []
+    if vis:
+        cands.append((vis, "player_motion"))
+    if merged_vis:
+        cands.append((merged_vis, "player_motion+activity"))
+    if act:
+        cands.append((act, "activity_valleys"))
+    scored = [(_seg_quality(c, fused.fps, hit_density), c, name) for c, name in cands]
+    trace["quality"] = {name: round(q, 3) for q, _, name in scored}
+    best = max(scored, key=lambda t: t[0]) if scored else (0.0, [], "empty")
+    trace.update(method=best[2], count=len(best[1]))
+    return _segments_to_intervals(best[1]), trace
 
 
 def _merge_by_availability(
@@ -1314,6 +1374,7 @@ def resegment(
         fused=fused, params=params, duration=duration,
         player_sig=None, shuttle_sig=None,
         player_motion=player_motion, player_coverage=player_coverage,
+        hits=hits,
     )
     seg_method = str(seg_trace.get("method") or "")
 
@@ -1325,6 +1386,11 @@ def resegment(
             pre_roll=params.pre_roll,
             post_roll=params.post_roll,
             tail_seconds=params.hit_tail_seconds,
+            # 与 run_analysis 保持一致：球员切分的起点是「球员开始动」，
+            # 本身已含发球准备，不该再被推迟到第一拍。旧版 resegment 漏了这个
+            # 开关（默认 True），于是同一工程「快速重切分」会把起点整体后移，
+            # 和完整重跑给出的边界对不上。
+            trim_start=seg_method != "player_motion",
         )
     else:
         for iv in intervals:
