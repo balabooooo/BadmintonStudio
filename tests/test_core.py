@@ -855,6 +855,46 @@ def test_annotation_optimizer_runs() -> None:
           f"{out['best']['f1']} < {out['baseline']['f1']}")
 
 
+def test_api_filters_and_id_safety() -> None:
+    """接口层两处「静默变成匹配全部」的回归。
+
+    * 批量筛选前端发的是 camelCase，后端若只认 snake_case，除 tags 外的条件
+      会被全部忽略 —— 一次「批量排除」会命中整个工程；
+    * 工程/素材 id 会被拼进文件路径，非法字符必须被拒，否则能越出 data/projects。
+    """
+    print("\n批量筛选字段与 id 安全")
+    from bms.core import store as ST
+    from bms.core.models import Rally, RallyFeatures, RallyScores
+    from bms.main import _match_filter
+
+    r = Rally(duration=12.0, keep=False, starred=True, tags=["多拍"],
+              scores=RallyScores(total=77.0),
+              features=RallyFeatures(shot_count=9, confidence=0.8))
+    check("筛选：空条件匹配", _match_filter(r, {}))
+    check("筛选：camelCase minScore 生效", not _match_filter(r, {"minScore": 90}))
+    check("筛选：camelCase minScore 通过", _match_filter(r, {"minScore": 70}))
+    check("筛选：camelCase minDuration 生效", not _match_filter(r, {"minDuration": 20}))
+    check("筛选：camelCase minShots 生效", not _match_filter(r, {"minShots": 12}))
+    check("筛选：camelCase minConfidence 生效", not _match_filter(r, {"minConfidence": 0.95}))
+    check("筛选：starredOnly 生效", not _match_filter(Rally(starred=False), {"starredOnly": True}))
+    check("筛选：keepOnly 排除 keep=False", not _match_filter(r, {"keepOnly": True}))
+    check("筛选：snake_case 仍兼容", not _match_filter(r, {"min_score": 90}))
+
+    for bad in ("../x", "a/b", "a\\b", "..", "p_ok.analysis"):
+        try:
+            ST._path(bad)
+            check(f"拒绝非法工程 id {bad!r}", False)
+        except ValueError:
+            check(f"拒绝非法工程 id {bad!r}", True)
+    try:
+        ST._analysis_path("p_ok", "../x")
+        check("拒绝非法素材 id", False)
+    except ValueError:
+        check("拒绝非法素材 id", True)
+    check("合法 id 正常", ST._path("p_abc123").name == "p_abc123.json",
+          ST._path("p_abc123").name)
+
+
 def main() -> int:
     test_player_pipeline_contract()
     test_shuttle_pipeline_contract()
@@ -880,6 +920,7 @@ def main() -> int:
     test_merge_by_availability_windows()
     test_annotation_evidence_and_metrics()
     test_annotation_optimizer_runs()
+    test_api_filters_and_id_safety()
     print()
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：{FAILURES}")

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import time
@@ -20,13 +21,25 @@ from .models import AnalysisResult, MediaInfo, Project, ProjectSummary, Timeline
 
 _lock = threading.RLock()
 
+_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _safe_id(value: str) -> str:
+    """id 会被拼进文件路径，限制字符集以防读写删越出 PROJECTS_DIR。
+
+    路由层也会校验并返回 400，这里是兜底（脚本/其它调用方也会走这些函数）。
+    """
+    if not _ID_RE.fullmatch(value or ""):
+        raise ValueError(f"非法 id: {value!r}")
+    return value
+
 
 def _path(project_id: str) -> Path:
-    return PROJECTS_DIR / f"{project_id}.json"
+    return PROJECTS_DIR / f"{_safe_id(project_id)}.json"
 
 
 def _analysis_path(project_id: str, media_id: str) -> Path:
-    return PROJECTS_DIR / f"{project_id}.{media_id}.analysis.json"
+    return PROJECTS_DIR / f"{_safe_id(project_id)}.{_safe_id(media_id)}.analysis.json"
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -121,7 +134,10 @@ def save_analysis(project_id: str, media_id: str, res: AnalysisResult) -> None:
 
 
 def delete_analysis(project_id: str, media_id: str) -> None:
-    _analysis_path(project_id, media_id).unlink(missing_ok=True)
+    # 和写操作共用一把锁：Windows 上另一个线程正打开该文件时再删会抛
+    # PermissionError，删除与写入交错还可能丢掉边车文件。
+    with _lock:
+        _analysis_path(project_id, media_id).unlink(missing_ok=True)
 
 
 def delete_project(project_id: str) -> bool:

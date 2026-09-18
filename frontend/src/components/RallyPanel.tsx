@@ -658,12 +658,22 @@ export default function RallyPanel() {
       {/* 底部批量 */}
       <div className="flex shrink-0 items-center gap-2 border-t border-white/7 px-3 py-2">
         <Tooltip content="把筛选出的回合全部标记为保留">
-          <Button variant="ghost" size="sm" onClick={() => bulk({ keep: true }, { useFilter: true })}>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!visible.length}
+            onClick={() => bulk({ keep: true }, { useFilter: true })}
+          >
             <Eye size={12} /> 全部保留
           </Button>
         </Tooltip>
         <Tooltip content="把筛选出的回合全部排除">
-          <Button variant="ghost" size="sm" onClick={() => bulk({ keep: false }, { useFilter: true })}>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!visible.length}
+            onClick={() => bulk({ keep: false }, { useFilter: true })}
+          >
             <EyeOff size={12} /> 全部排除
           </Button>
         </Tooltip>
@@ -672,13 +682,16 @@ export default function RallyPanel() {
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => {
+            disabled={!all.length}
+            onClick={async () => {
               const sorted = [...all].sort((a, b) => b.scores.total - a.scores.total)
               const keepN = Math.ceil(sorted.length * 0.4)
               const ids = sorted.slice(0, keepN).map((r) => r.id)
-              bulk({ keep: true }, { ids })
+              // 两次批量写必须串行：并发调用各自会 openProject 刷新，可能互相
+              // 覆盖，导致其中一半更新丢失。
+              await bulk({ keep: true }, { ids })
               const rest = sorted.slice(keepN).map((r) => r.id)
-              if (rest.length) bulk({ keep: false }, { ids: rest })
+              if (rest.length) await bulk({ keep: false }, { ids: rest })
             }}
           >
             <TrendingUp size={12} /> 保留前 40%

@@ -225,6 +225,9 @@ export default function App() {
       const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
       const s = useStore.getState()
       if (typing) return
+      // 这些快捷键只服务于剪辑台。标注页有自己的保存/删除键，选中过片段后
+      // 在标注页按 S / Delete / 空格会把时间线片段悄悄切掉或删掉。
+      if (s.view !== 'studio') return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
         e.preventDefault()
         s.undo()
@@ -246,6 +249,7 @@ export default function App() {
         e.preventDefault()
         s.removeClip(s.selectedClipId)
       } else if (e.key.toLowerCase() === 's' && s.selectedClipId) {
+        e.preventDefault()
         // 源片模式下播放头读数是原片时间，必须换算，否则会切在完全不相干的位置
         if (s.previewMode === 'source') s.splitClipAtSourceTime(s.selectedClipId, s.currentTime)
         else s.splitClipAt(s.selectedClipId, s.currentTime)

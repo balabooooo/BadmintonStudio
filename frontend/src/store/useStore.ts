@@ -223,6 +223,14 @@ let toastSeq = 0
 const patchTimers = new Map<string, number>()
 const pendingPatches = new Map<string, Partial<Rally>>()
 
+/** setTimeline 的服务端写入防抖：拖片段/滑杆每个 pointermove 都会触发，
+ *  不防抖会每秒发几十个 POST 并让服务端反复写盘。 */
+let timelineSaveTimer: number | null = null
+let pendingTimeline: { pid: string; tl: Timeline } | null = null
+
+/** bootstrap 幂等：StrictMode 下 effect 会跑两次，重复连接 WS / 注册监听会翻倍 */
+let bootstrapStarted = false
+
 interface State {
   // ---------------- 会话
   env: EnvInfo | null
@@ -306,6 +314,8 @@ interface State {
   reorderTrack: () => void
   undo: () => void
   redo: () => void
+  /** 把当前时间线压入撤销栈：连续操作开始前调用一次，之后用 pushHistory=false 应用变更 */
+  pushHistory: () => void
   selectClip: (id: string | null) => void
 
   setPlaying: (p: boolean) => void
@@ -386,6 +396,8 @@ export const useStore = create<State>((set, get) => ({
 
   // ================================================================= 会话
   async bootstrap() {
+    if (bootstrapStarted) return
+    bootstrapStarted = true
     try {
       const env = await api.env()
       set({ env })
@@ -403,18 +415,21 @@ export const useStore = create<State>((set, get) => ({
       if (m.type === 'job') {
         set((s) => ({ jobs: { ...s.jobs, [m.job.id]: m.job } }))
         const j = m.job
-        if (j.status === 'done' && j.kind === 'analyze') {
-          const pid = get().project?.id
-          const mid = get().mediaId
-          if (pid && mid) {
-            api.getAnalysis(pid, mid).then((res) => {
-              set((s) => (s.project ? { project: { ...s.project, analyses: { ...s.project.analyses, [mid]: res } } } : {}))
-            })
-          }
-        }
+        // 分析结果由后端单独广播的 analysis 消息同步（它带着正确的 media_id）。
+        // 这里曾经用「当前选中的 mediaId」去拉结果：分析 A 时切到 B 会把 A 的结果
+        // 存到 B 上，拿到不完整对象后界面崩溃；也不该把未分析的 stub 存进去。
         if (j.status === 'done' && j.kind === 'prepare') {
           const pid = get().project?.id
-          if (pid) get().openProject(pid)
+          if (pid) {
+            // 只刷新工程/素材，不走 openProject：那会把播放位置、选中回合和
+            // 撤销历史全部重置，用户正在编辑时任务完成会被打断。
+            api.getProject(pid).then((p) => {
+              if (get().project?.id !== pid) return
+              const cur = get().mediaId
+              const mid = cur && p.media.some((x) => x.id === cur) ? cur : p.media[0]?.id ?? null
+              set({ project: p, mediaId: mid })
+            }).catch(() => undefined)
+          }
         }
       } else if (m.type === 'media') {
         set((s) => {
@@ -537,15 +552,22 @@ export const useStore = create<State>((set, get) => ({
     if (!p || !files.length) return
     set((s) => ({ busy: { ...s.busy, import: true } }))
     try {
+      let okCount = 0
+      let firstError = ''
       for (const f of files) {
-        await fetch(`/api/projects/${p.id}/media/upload`, {
+        const res = await fetch(`/api/projects/${p.id}/media/upload`, {
           method: 'POST',
           headers: { 'x-filename': encodeURIComponent(f.name) },
           body: f,
         })
+        // 不检查 res.ok 会把「上传失败」也报成导入成功，素材列表却什么都没多。
+        if (res.ok) okCount += 1
+        else if (!firstError) firstError = (await res.text().catch(() => '')) || `HTTP ${res.status}`
       }
       await get().openProject(p.id)
-      get().toast({ kind: 'success', title: `已导入 ${files.length} 个文件` })
+      if (okCount) get().toast({ kind: 'success', title: `已导入 ${okCount} 个文件` })
+      const failed = files.length - okCount
+      if (failed) get().toast({ kind: 'warn', title: `${failed} 个文件导入失败`, detail: firstError })
     } catch (e) {
       get().toast({ kind: 'error', title: '上传失败', detail: String(e) })
     } finally {
@@ -708,16 +730,26 @@ export const useStore = create<State>((set, get) => ({
     const mid = get().mediaId ?? undefined
     const body: any = { media_id: mid, patch }
     if (opts?.ids) {
+      if (!opts.ids.length) {
+        get().toast({ kind: 'warn', title: '没有可操作的回合' })
+        return
+      }
       body.ids = opts.ids
     } else if (opts?.useFilter) {
       // 关键：批量操作只能作用在「当前屏幕上看得见的回合」上。
       // 只发筛选条件的话，服务端拿到的是不完整的条件（客户端还按置信度/
       // 仅保留/关键词过滤过），会把用户手动排除掉的回合又复活。
-      body.ids = get()
+      const ids = get()
         .visibleRallies()
         .map((r) => r.id)
-    }
-    if (!body.ids && !opts?.useFilter) {
+      // 空列表必须当成「什么都不做」：后端把「未传 ids」和「空 ids」都理解为
+      // 按筛选匹配，空 ids 会被当成匹配全部，误伤整个工程。
+      if (!ids.length) {
+        get().toast({ kind: 'warn', title: '当前筛选没有可操作的回合' })
+        return
+      }
+      body.ids = ids
+    } else {
       get().toast({ kind: 'warn', title: '没有可操作的回合' })
       return
     }
@@ -791,7 +823,17 @@ export const useStore = create<State>((set, get) => ({
       return { project: { ...s.project, timeline: tl }, history: hist, future: [] }
     })
     const p = get().project
-    if (p) api.setTimeline(p.id, tl).catch(() => undefined)
+    if (!p) return
+    // 本地状态立刻更新，服务端写入做防抖：拖动片段/滑杆时 pointermove 很密集，
+    // 每次都 POST 会卡顿，也会让服务端反复整文件写盘。
+    pendingTimeline = { pid: p.id, tl }
+    if (timelineSaveTimer !== null) window.clearTimeout(timelineSaveTimer)
+    timelineSaveTimer = window.setTimeout(() => {
+      timelineSaveTimer = null
+      const job = pendingTimeline
+      pendingTimeline = null
+      if (job) api.setTimeline(job.pid, job.tl).catch(() => undefined)
+    }, 300)
   },
 
   addClipFromRally(rally) {
@@ -1003,6 +1045,10 @@ export const useStore = create<State>((set, get) => ({
     if (p) api.setTimeline(p.id, p.timeline).catch(() => undefined)
   },
 
+  pushHistory() {
+    set((s) => (s.project ? { history: [...s.history.slice(-49), s.project.timeline], future: [] } : {}))
+  },
+
   selectClip: (id) => set({ selectedClipId: id, selectedRallyId: null }),
 
   // ================================================================= 播放
@@ -1110,7 +1156,11 @@ export const useStore = create<State>((set, get) => ({
   currentAnalysis() {
     const s = get()
     if (!s.project || !s.mediaId) return null
-    return s.project.analyses[s.mediaId] ?? null
+    const a = s.project.analyses[s.mediaId]
+    // 后端在「尚未分析」时返回的是 {status:'none'} 这种不完整对象，
+    // 它不是 AnalysisResult。当成结果用会让下游 a.rallies 变成 undefined 并崩溃。
+    if (!a || !Array.isArray((a as { rallies?: unknown }).rallies)) return null
+    return a
   },
   currentCourtPoly() {
     const s = get()

@@ -19,17 +19,23 @@ export function timecode(sec: number, withFrames = true, fps = 30): string {
 export function humanDuration(sec: number): string {
   if (!isFinite(sec) || sec < 0) sec = 0
   if (sec < 60) return `${sec.toFixed(1)}秒`
-  const m = Math.floor(sec / 60)
-  const s = Math.round(sec % 60)
+  let m = Math.floor(sec / 60)
+  let s = Math.round(sec % 60)
+  // 四舍五入会把 119.7 的秒数进位成 60，直接拼会得到「1分60秒」
+  if (s === 60) {
+    s = 0
+    m += 1
+  }
   if (m < 60) return `${m}分${String(s).padStart(2, '0')}秒`
   const h = Math.floor(m / 60)
   return `${h}小时${String(m % 60).padStart(2, '0')}分`
 }
 
 export function bytes(n: number): string {
-  if (!n) return '0 B'
+  if (!n || n < 1) return '0 B'
   const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)))
+  // 0 < n < 1 时 log 为负，i 会变成 -1，输出「0.5 undefined」
+  const i = Math.max(0, Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024))))
   return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${u[i]}`
 }
 

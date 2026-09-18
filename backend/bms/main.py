@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import re
 import sys
 import time
 from pathlib import Path
@@ -219,7 +220,21 @@ def asset(request: Request, p: str = Query(...), cache: int = 3600):
 # ------------------------------------------------------------------ 工程
 
 
+_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _check_id(value: str, what: str = "id") -> str:
+    """工程/素材等 id 会被拼进文件路径，必须限制字符集。
+
+    否则 ``..\\..\\x`` 这类 id 会让读写删越出 data/projects 目录。
+    """
+    if not _ID_RE.fullmatch(value or ""):
+        raise HTTPException(400, f"{what} 非法")
+    return value
+
+
 def _must_project(pid: str) -> Project:
+    _check_id(pid, "工程 id")
     proj = ST.load_project(pid)
     if proj is None:
         raise HTTPException(404, "工程不存在")
@@ -257,11 +272,13 @@ def patch_project(pid: str, payload: dict = Body(...)) -> dict:
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: str) -> dict:
+    _check_id(pid, "工程 id")
     return {"ok": ST.delete_project(pid)}
 
 
 @app.post("/api/projects/{pid}/duplicate")
 def duplicate_project(pid: str, payload: dict = Body(default={})) -> dict:
+    _check_id(pid, "工程 id")
     p = ST.duplicate_project(pid, payload.get("name"))
     if p is None:
         raise HTTPException(404, "工程不存在")
@@ -306,12 +323,24 @@ async def upload_media(pid: str, request: Request) -> dict:
     dest = dest_dir / name
     if dest.exists():
         dest = dest_dir / f"{dest.stem}_{int(time.time())}{dest.suffix}"
+    # 先写 .part 再改名：中途断开或探测失败都不会在 uploads 里留下半个文件。
+    part = dest_dir / f"{dest.name}.part"
+    part.unlink(missing_ok=True)
     size = 0
-    with open(dest, "wb") as f:
-        async for chunk in request.stream():
-            f.write(chunk)
-            size += len(chunk)
-    info = M.probe_media(dest)
+    try:
+        with open(part, "wb") as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+                size += len(chunk)
+        part.replace(dest)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    try:
+        info = M.probe_media(dest)
+    except Exception as e:  # noqa: BLE001
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, f"无法识别的媒体文件：{type(e).__name__}") from e
     proj = ST.touch_media(proj, info)
     return {"project": proj.model_dump(mode="json"), "added": info.model_dump(mode="json"), "bytes": size}
 
@@ -319,6 +348,7 @@ async def upload_media(pid: str, request: Request) -> dict:
 @app.delete("/api/projects/{pid}/media/{mid}")
 def remove_media(pid: str, mid: str) -> dict:
     proj = _must_project(pid)
+    _check_id(mid, "素材 id")
     proj.media = [m for m in proj.media if m.id != mid]
     proj.analyses.pop(mid, None)
     ST.delete_analysis(pid, mid)
@@ -329,6 +359,7 @@ def remove_media(pid: str, mid: str) -> dict:
 
 
 def _media(proj: Project, mid: str) -> MediaInfo:
+    _check_id(mid, "素材 id")
     for m in proj.media:
         if m.id == mid:
             return m
@@ -423,7 +454,11 @@ def probe_path(path: str = Query(...)) -> dict:
     p = Path(path)
     if not p.is_file():
         raise HTTPException(404, "文件不存在")
-    info = M.probe_media(p)
+    try:
+        info = M.probe_media(p)
+    except Exception as e:  # noqa: BLE001
+        # 不是媒体文件时给一个明确的 4xx，而不是把异常冒成 500
+        raise HTTPException(400, f"无法识别的媒体文件：{type(e).__name__}") from e
     return info.model_dump(mode="json")
 
 
@@ -444,30 +479,32 @@ def analyze(pid: str, payload: dict = Body(...)) -> dict:
 
     from .analysis.pipeline import run_analysis
 
-    holder: dict[str, Any] = {}
-
     def wrapped(job):
-        try:
-            res = run_analysis(
-                m,
-                params,
-                on_progress=lambda p, s, msg: job.progress(p, s, msg),
-                cancel=job.cancelled,
-                weights_key=weights_key,
-                roi=roi_t,  # type: ignore[arg-type]
-            )
-            holder["result"] = res
-            return res.model_dump(mode="json")
-        finally:
-            res = holder.get("result")
-            if res is not None:
-                ST.save_analysis(pid, mid, res)
-                p2 = ST.load_project(pid)
-                if p2 is not None:
-                    p2.analyses[mid] = res
-                    ST.save_project(p2, write_analyses=False)
-                HUB.publish({"type": "analysis", "project_id": pid, "media_id": mid,
-                             "result": res.model_dump(mode="json")})
+        res = run_analysis(
+            m,
+            params,
+            on_progress=lambda p, s, msg: job.progress(p, s, msg),
+            cancel=job.cancelled,
+            weights_key=weights_key,
+            roi=roi_t,  # type: ignore[arg-type]
+        )
+        if res.status != "done":
+            # 取消/失败的结果 rallies 是空的，绝不能落盘：那会把上一次成功的
+            # 分析覆盖掉，用户点一次取消就丢掉整场分析。
+            if res.status == "cancelled":
+                return {}  # 让 Job._run 看到 job.cancelled() 后标记为已取消
+            raise RuntimeError(res.error or "分析失败")
+        ST.save_analysis(pid, mid, res)
+        # 分析过程会生成代理/音轨/封面，这些派生路径也要写回工程，
+        # 否则下次播放和分析又要重新生成一遍。
+        _persist_media(pid, m)
+        p2 = ST.load_project(pid)
+        if p2 is not None:
+            p2.analyses[mid] = res
+            ST.save_project(p2, write_analyses=False)
+        HUB.publish({"type": "analysis", "project_id": pid, "media_id": mid,
+                     "result": res.model_dump(mode="json")})
+        return res.model_dump(mode="json")
 
     job = JOBS.submit("analyze", f"分析 {m.name}", wrapped)
     return {"job_id": job.id}
@@ -624,6 +661,7 @@ def _remap_timeline(proj: Project, media_id: str, res) -> int:
 @app.get("/api/projects/{pid}/analysis/{mid}")
 def get_analysis(pid: str, mid: str) -> dict:
     proj = _must_project(pid)
+    _check_id(mid, "素材 id")
     res = proj.analyses.get(mid)
     if res is None:
         return {"status": "none"}
@@ -633,6 +671,7 @@ def get_analysis(pid: str, mid: str) -> dict:
 @app.delete("/api/projects/{pid}/analysis/{mid}")
 def clear_analysis(pid: str, mid: str) -> dict:
     proj = _must_project(pid)
+    _check_id(mid, "素材 id")
     proj.analyses.pop(mid, None)
     ST.delete_analysis(pid, mid)
     ST.save_project(proj, write_analyses=False)
@@ -668,16 +707,23 @@ def bulk_rallies(pid: str, payload: dict = Body(...)) -> dict:
     proj = _must_project(pid)
     mid = payload.get("media_id")
     patch = payload.get("patch") or {}
-    ids = set(payload.get("ids") or [])
     flt = payload.get("filter") or {}
+    has_ids = "ids" in payload
+    ids = {str(x) for x in (payload.get("ids") or [])}
+    # 显式传了 ids 就必须以它为准；空列表表示「什么都不做」。
+    # 旧代码把空 ids 和「没传 ids」都当成按 filter 匹配，而空 filter 匹配全部，
+    # 于是筛选结果为空时点「全部排除」会把整个工程的回合全改掉。
+    if has_ids and not ids:
+        return {"updated": 0}
     n = 0
     for key, res in proj.analyses.items():
         if mid and key != mid:
             continue
         for r in res.rallies:
-            if ids and r.id not in ids:
-                continue
-            if not ids and not _match_filter(r, flt):
+            if has_ids:
+                if r.id not in ids:
+                    continue
+            elif not _match_filter(r, flt):
                 continue
             for k, v in patch.items():
                 if hasattr(r, k):
@@ -699,9 +745,28 @@ def list_rallies(pid: str, media_id: str | None = None) -> dict:
     return {"rallies": out, "count": len(out)}
 
 
+_FILTER_ALIASES = {
+    "minScore": "min_score",
+    "maxScore": "max_score",
+    "minDuration": "min_duration",
+    "maxDuration": "max_duration",
+    "minShots": "min_shots",
+    "minConfidence": "min_confidence",
+    "starredOnly": "starred_only",
+}
+
+
 def _match_filter(r: Rally, flt: dict) -> bool:
     if not flt:
         return True
+    # 前端用的是 camelCase（minScore...），这里统一成 snake_case，
+    # 否则除了 tags 之外的筛选条件会被静默忽略，批量操作会命中全部回合。
+    flt = dict(flt)
+    for cam, snake in _FILTER_ALIASES.items():
+        if cam in flt and snake not in flt:
+            flt[snake] = flt[cam]
+    if flt.get("keepOnly") and not r.keep:
+        return False
     if "min_score" in flt and r.scores.total < float(flt["min_score"]):
         return False
     if "max_score" in flt and r.scores.total > float(flt["max_score"]):
@@ -711,6 +776,8 @@ def _match_filter(r: Rally, flt: dict) -> bool:
     if "max_duration" in flt and r.duration > float(flt["max_duration"]):
         return False
     if "min_shots" in flt and r.features.shot_count < int(flt["min_shots"]):
+        return False
+    if "min_confidence" in flt and r.features.confidence < float(flt["min_confidence"]):
         return False
     if flt.get("starred_only") and not r.starred:
         return False
@@ -730,7 +797,10 @@ def rescore(pid: str, payload: dict = Body(default={})) -> dict:
 
     proj = _must_project(pid)
     key = str(payload.get("weights") or "balanced")
-    w = SC.PRESETS.get(key, SC.PRESETS["balanced"])
+    if key not in SC.PRESETS:
+        # 静默退回 balanced 会让界面显示的口径和实际分数对不上
+        raise HTTPException(400, f"未知的评分口径：{key}")
+    w = SC.PRESETS[key]
     mid = payload.get("media_id")
     n = 0
     for k, res in proj.analyses.items():
@@ -851,8 +921,10 @@ def auto_cut(pid: str, payload: dict = Body(...)) -> dict:
                     continue
                 if not _match_filter(r, flt):
                     continue
-            a = float(pre) if pre is not None else r.clip_start
-            b = float(post) if post is not None else r.clip_end
+            # pre/post 是相对回合剪辑区间的**留白**，不是绝对时间。
+            # 当成绝对值会让所有片段都变成 [pre, post] 同一段。
+            a = r.clip_start - float(pre) if pre is not None else r.clip_start
+            b = r.clip_end + float(post) if post is not None else r.clip_end
             a = max(0.0, min(a, r.end))
             b = max(a + 0.2, b)
             picked.append((r, key, a, b))
@@ -902,7 +974,15 @@ def auto_cut(pid: str, payload: dict = Body(...)) -> dict:
 @app.post("/api/projects/{pid}/timeline")
 def set_timeline(pid: str, payload: dict = Body(...)) -> dict:
     proj = _must_project(pid)
-    tl = Timeline.model_validate(payload.get("timeline") or payload)
+    # 不接受空 body：`payload.get("timeline") or payload` 在 {} 时得到 {}，
+    # 会被 model_validate 补成空时间线并静默清掉所有片段。
+    if isinstance(payload.get("timeline"), dict):
+        raw = payload["timeline"]
+    elif "tracks" in payload or "fps" in payload:
+        raw = payload
+    else:
+        raise HTTPException(400, "缺少 timeline")
+    tl = Timeline.model_validate(raw)
     total = 0.0
     for t in tl.tracks:
         for c in t.clips:
@@ -1031,6 +1111,10 @@ def cache_clear(payload: dict = Body(default={})) -> dict:
     import shutil as _sh
 
     target = payload.get("target") or "all"
+    # 清缓存会 rmtree 掉正在被任务读写的代理/音轨，导致任务中途失败
+    active = [j for j in JOBS.list(limit=200) if j.status in ("queued", "running")]
+    if active:
+        raise HTTPException(409, "还有任务在运行，请等任务结束后再清理缓存")
     if target == "proxies":
         dirs = {"proxies": PROXIES_DIR}
     elif target == "thumbs":
@@ -1068,10 +1152,13 @@ def _mount_frontend() -> None:
         def _spa(full_path: str):
             if full_path.startswith(("api/", "ws")):
                 raise HTTPException(404, "Not found")
-            cand = FRONTEND_DIST / full_path
-            if cand.is_file():
+            base = FRONTEND_DIST.resolve()
+            # 直接 base / full_path 时，Windows 上绝对路径（如 C:/Windows/x）
+            # 或含 .. 的路径会越出 dist，等于把任意本地文件暴露出去。
+            cand = (base / full_path.lstrip("/\\")).resolve()
+            if cand.is_file() and cand.is_relative_to(base):
                 return FileResponse(cand)
-            return FileResponse(FRONTEND_DIST / "index.html")
+            return FileResponse(base / "index.html")
     else:
         @app.get("/")
         def _placeholder():

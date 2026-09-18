@@ -232,6 +232,7 @@ export function Slider({
   max,
   step = 1,
   onChange,
+  onStart,
   label,
   format,
   disabled,
@@ -242,6 +243,8 @@ export function Slider({
   max: number
   step?: number
   onChange: (v: number) => void
+  /** 开始拖动时触发一次，用于记录撤销快照（拖动过程中用 pushHistory=false） */
+  onStart?: () => void
   label: string
   format?: (v: number) => string
   disabled?: boolean
@@ -264,6 +267,7 @@ export function Slider({
         step={step}
         value={value}
         disabled={disabled}
+        onPointerDown={onStart}
         onChange={(e) => onChange(parseFloat(e.target.value))}
       />
     </div>

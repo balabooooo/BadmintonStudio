@@ -42,14 +42,20 @@ export default function ExportDialog({ open, onClose }: { open: boolean; onClose
     return ((mbps + 0.2) * 1e6 * duration) / 8
   }, [presets, selected, duration])
 
+  // 打开对话框（或工程名变化）时才重置文件名与预设列表。
+  // 不能把 selected 放进依赖：那样每次点不同的输出预设，用户手填的文件名
+  // 都会被悄悄重置回默认值。
   useEffect(() => {
     if (!open) return
-    api.exportPresets().then((list) => {
-      setPresets(list)
-      if (list.length && !list.some((p) => p.id === selected)) setSelected(list[0].id)
-    })
+    api.exportPresets().then(setPresets).catch(() => undefined)
     setName(`${project?.name ?? '成片'}_${new Date().toISOString().slice(0, 10)}`)
-  }, [open, project?.name, selected])
+  }, [open, project?.name])
+
+  // 预设列表就绪后校正一次非法选择，与文件名互不干扰
+  useEffect(() => {
+    if (!open || !presets.length) return
+    if (!presets.some((p) => p.id === selected)) setSelected(presets[0].id)
+  }, [open, presets, selected])
 
   const current = presets.find((p) => p.id === selected)
 
@@ -98,7 +104,7 @@ export default function ExportDialog({ open, onClose }: { open: boolean; onClose
                 <Button
                   variant="primary"
                   loading={busy || !!running}
-                  disabled={!clips.length || !!running}
+                  disabled={!clips.length || !!running || !current}
                   onClick={async () => {
                     if (!current) return
                     setBusy(true)

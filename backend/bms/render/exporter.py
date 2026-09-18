@@ -321,6 +321,9 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
     try:
         total = sum(max(0.05, (c.src_out - c.src_in) / max(c.speed, 1e-3)) for c in clips)
         done = 0.0
+        # 统一编码方案：`-c copy` 合并要求所有中间片段编码参数一致，
+        # 逐段回退会让某一段变成 libx264、另一段是 nvenc，最后合并直接失败。
+        chosen: tuple[str, list[str], str] | None = None
         for i, c in enumerate(clips):
             if cancel and cancel():
                 return False, "已取消"
@@ -331,6 +334,7 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
             if not src.is_file():
                 continue
             spd = max(0.1, min(8.0, float(c.speed)))
+            clip_dur = max(0.05, c.src_out - c.src_in)
             subj = _subject_path(proj, c.media_id, c.src_in, c.src_out) if preset.auto_reframe else None
             crop = _crop_expr_for_clip(preset, m.width or 1920, m.height or 1080, subj)
             base_vf: list[str] = []
@@ -340,34 +344,53 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
             if abs(spd - 1) > 1e-3:
                 base_vf.append(f"setpts=PTS/{spd:.4f}")
             base_vf.append(f"fps={preset.fps:g}")
+
+            # 每个片段都必须带音轨，且参数一致：以前这里是 `-an`，合并出来的成片
+            # 完全没有声音（稀疏高光走的正是这条路）。源没有音轨时补一段静音。
+            has_a = has_audio(m)
+            audio_in: list[str] = []
+            if has_a:
+                af: list[str] = []
+                if abs(spd - 1) > 1e-3:
+                    af.append(f"atempo={_atempo_chain(spd)}")
+                if abs(float(c.volume) - 1.0) > 1e-3:
+                    af.append(f"volume={float(c.volume):.3f}")
+                af.append("aresample=48000")
+                audio_args = ["-map", "0:v:0", "-map", "0:a:0?", "-af", ",".join(af)]
+            else:
+                audio_in = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+                audio_args = ["-map", "0:v:0", "-map", "1:a:0"]
+
             seg = tmp / f"{i:05d}.mp4"
             ok = False
             err = ""
-            for label, venc, vtail in plans:
+            for label, venc, vtail in ([chosen] if chosen else plans):
                 vf = ",".join(base_vf + [vtail])
                 # -progress pipe:1 不能省：这段命令用的是 -loglevel error，
                 # 没有它就不会有 out_time_us 输出，on_progress 永远不回调，
                 # 任务面板上的进度条会一直停在 4% 不动。
                 cmd = [ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin",
-                       "-ss", f"{c.src_in:.4f}", "-i", str(src),
-                       "-t", f"{max(0.05, c.src_out - c.src_in):.4f}",
-                       "-vf", vf, "-an"] + venc + \
-                      ["-r", f"{preset.fps:g}", "-loglevel", "error",
-                       "-progress", "pipe:1", "-nostats", str(seg)]
+                       "-ss", f"{c.src_in:.4f}", "-i", str(src)] + audio_in + [
+                       "-t", f"{clip_dur:.4f}",
+                       "-vf", vf] + audio_args + venc + \
+                      ["-r", f"{preset.fps:g}", "-c:a", "aac", "-b:a", preset.audio_bitrate,
+                       "-ac", "2", "-ar", "48000",
+                       "-loglevel", "error", "-progress", "pipe:1", "-nostats", str(seg)]
                 seg.unlink(missing_ok=True)
                 r = ff.run_with_progress(
-                    cmd, max(0.05, c.src_out - c.src_in),
-                    lambda p, lb=label: on(0.02 + 0.75 * (done + p * (c.src_out - c.src_in)) / total, f"分段渲染（{lb}）"),
+                    cmd, clip_dur,
+                    lambda p, lb=label: on(0.02 + 0.75 * (done + p * clip_dur) / total, f"分段渲染（{lb}）"),
                     cancel,
                 )
                 if r.ok and seg.is_file() and seg.stat().st_size > 1024:
                     ok = True
+                    chosen = (label, venc, vtail)
                     break
                 err = (r.stdout or "")[-1200:]
             if not ok:
                 return False, f"片段 {i} 渲染失败: {err}"
             segs.append(seg)
-            done += max(0.05, c.src_out - c.src_in)
+            done += clip_dur
 
         if not segs:
             return False, "没有可渲染的片段"

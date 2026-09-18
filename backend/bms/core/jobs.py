@@ -115,6 +115,9 @@ class JobManager:
         job.on_update = self._broadcast
         with self._lock:
             self._jobs[job.id] = job
+        # 长会话里任务表会无限增长，每个分析任务的 result 还是完整的分析结果
+        # （可能几 MB），必须定期清理已完成的任务。
+        self.prune()
         job.start()
         return job
 
@@ -124,7 +127,14 @@ class JobManager:
     def list(self, limit: int = 50) -> list[JobInfo]:
         with self._lock:
             items = sorted(self._jobs.values(), key=lambda j: j.info.created_at, reverse=True)
-        return [j.info for j in items[:limit]]
+        out: list[JobInfo] = []
+        for j in items[:limit]:
+            info = j.info.model_copy(deep=False)
+            # 分析结果可达数 MB，列表里不需要；导出结果要留着好让界面显示成片路径。
+            if info.kind != "export":
+                info.result = None
+            out.append(info)
+        return out
 
     def cancel(self, job_id: str) -> bool:
         job = self._jobs.get(job_id)

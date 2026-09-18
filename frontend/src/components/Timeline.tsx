@@ -53,6 +53,7 @@ export default function Timeline() {
   const clearTimeline = useStore((s) => s.clearTimeline)
   const addClipFromRally = useStore((s) => s.addClipFromRally)
   const setUserSeeking = useStore((s) => s.setUserSeeking)
+  const pushHistory = useStore((s) => s.pushHistory)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const railRef = useRef<HTMLDivElement>(null)
@@ -76,15 +77,36 @@ export default function Timeline() {
   const pxToTime = useCallback((px: number) => px / zoom, [zoom])
   const timeToPx = useCallback((t: number) => t * zoom, [zoom])
 
+  /** 跳到某个「原片时刻」：成片模式下换算成成片时间，不在成片里就切回源片 */
+  const seekSource = useCallback(
+    (src: number) => {
+      if (previewMode !== 'timeline') {
+        seek(src)
+        return
+      }
+      const c = clips.find((x) => src >= x.src_in && src <= x.src_out)
+      if (c) {
+        seek(c.tl_start + (src - c.src_in) / c.speed)
+        return
+      }
+      setPreviewMode('source')
+      seek(src)
+    },
+    [previewMode, clips, seek, setPreviewMode],
+  )
+
   const snapPoints = useMemo(() => {
     if (!snap) return []
-    const pts = [currentTime, 0]
-    if (analysis) analysis.rallies.forEach((r) => pts.push(r.start, r.end))
+    // 吸附点必须和正在拖动的坐标同一套：片段位置是「成片时间」，而回合
+    // start/end 是「原片时间」、源片模式下 currentTime 也是原片时间。
+    // 混在一起会让片段一经过回合边界就莫名其妙地跳一下。
+    const pts = [0]
+    if (previewMode === 'timeline') pts.push(currentTime)
     clips.forEach((c) => {
       pts.push(c.tl_start, c.tl_start + (c.src_out - c.src_in) / c.speed)
     })
     return pts
-  }, [snap, currentTime, analysis, clips])
+  }, [snap, currentTime, previewMode, clips])
 
   const applySnap = useCallback(
     (t: number, tolPx = 8) => {
@@ -159,13 +181,20 @@ export default function Timeline() {
     }
   }, [drag, onPointerMove, onPointerUp, setUserSeeking])
 
-  // Ctrl+滚轮缩放
-  const onWheel = (e: React.WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) {
+  // Ctrl+滚轮缩放。React 的 onWheel 走的是 passive 监听，preventDefault 无效，
+  // 页面会跟着一起缩放，所以改用原生监听 + { passive: false }。
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const handler = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return
       e.preventDefault()
-      setZoom(zoom * (e.deltaY < 0 ? 1.14 : 0.88))
+      const z = useStore.getState().zoom
+      setZoom(z * (e.deltaY < 0 ? 1.14 : 0.88))
     }
-  }
+    el.addEventListener('wheel', handler, { passive: false })
+    return () => el.removeEventListener('wheel', handler)
+  }, [setZoom])
 
   // 自动滚动跟随播放头。
   // 必须在拖动期间关闭：拖动时 currentTime 跟着鼠标变，一旦播放头靠近视口
@@ -385,7 +414,6 @@ export default function Timeline() {
           <div
             ref={scrollRef}
             className="h-full min-w-0 flex-1 overflow-x-auto overflow-y-auto"
-            onWheel={onWheel}
             onScroll={() => {
               // 时间线被拖得很矮时纵向也能滚，图标栏跟着一起滚，免得和轨道错位
               const el = scrollRef.current
@@ -441,7 +469,7 @@ export default function Timeline() {
                           }}
                           onClick={() => {
                             selectRally(r.id)
-                            seek(r.start)
+                            seekSource(r.start)
                           }}
                           onDoubleClick={() => addClipFromRally(r)}
                         >
@@ -492,6 +520,9 @@ export default function Timeline() {
                       if (e.button !== 0) return
                       e.stopPropagation()
                       selectClip(c.id)
+                      // 拖动前先存一次撤销快照：pointermove 期间用 pushHistory=false
+                      // 只改状态，这样一次拖动在撤销栈里只占一步。
+                      pushHistory()
                       const rect = scrollRef.current!.getBoundingClientRect()
                       const x = e.clientX - rect.left + scrollRef.current!.scrollLeft
                       const grab = x - left

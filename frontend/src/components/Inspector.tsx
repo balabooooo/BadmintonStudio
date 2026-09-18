@@ -16,7 +16,7 @@ function SignalChart({ height = 92 }: { height?: number }) {
   const selectedRallyId = useStore((s) => s.selectedRallyId)
   const [hover, setHover] = useState<number | null>(null)
 
-  const dur = media?.duration ?? 1
+  const dur = media?.duration || 1
 
   useEffect(() => {
     const cv = ref.current
@@ -62,10 +62,12 @@ function SignalChart({ height = 92 }: { height?: number }) {
     const grad = g.createLinearGradient(0, 0, 0, h)
     grad.addColorStop(0, 'rgb(56 224 162 / 0.95)')
     grad.addColorStop(1, 'rgb(56 224 162 / 0.06)')
+    // 单点曲线时分母为 0 会让坐标变 NaN，整条曲线画不出来
+    const denom = Math.max(1, act.length - 1)
     g.beginPath()
     g.moveTo(0, h)
     for (let i = 0; i < act.length; i++) {
-      const x = (i / (act.length - 1)) * w
+      const x = (i / denom) * w
       g.lineTo(x, yOf(act[i]))
     }
     g.lineTo(w, h)
@@ -74,7 +76,7 @@ function SignalChart({ height = 92 }: { height?: number }) {
     g.fill()
     g.beginPath()
     for (let i = 0; i < act.length; i++) {
-      const x = (i / (act.length - 1)) * w
+      const x = (i / denom) * w
       if (i === 0) g.moveTo(x, yOf(act[i]))
       else g.lineTo(x, yOf(act[i]))
     }
@@ -161,6 +163,7 @@ export default function Inspector() {
   const project = useStore((s) => s.project)
   const seek = useStore((s) => s.seek)
   const updateClip = useStore((s) => s.updateClip)
+  const pushHistory = useStore((s) => s.pushHistory)
   const removeClip = useStore((s) => s.removeClip)
   const splitClipAt = useStore((s) => s.splitClipAt)
   const splitClipAtSourceTime = useStore((s) => s.splitClipAtSourceTime)
@@ -517,7 +520,8 @@ export default function Inspector() {
                   min={0.25}
                   max={4}
                   step={0.05}
-                  onChange={(v) => updateClip(clip.id, { speed: Number(v.toFixed(2)) })}
+                  onStart={() => pushHistory()}
+                  onChange={(v) => updateClip(clip.id, { speed: Number(v.toFixed(2)) }, false)}
                   format={(v) => `${v.toFixed(2)}×`}
                   hint="改变速度会同时改变它在时间线上占的长度：2× 变一半，0.5× 变两倍"
                 />
@@ -527,7 +531,8 @@ export default function Inspector() {
                   min={0}
                   max={2}
                   step={0.05}
-                  onChange={(v) => updateClip(clip.id, { volume: Number(v.toFixed(2)) })}
+                  onStart={() => pushHistory()}
+                  onChange={(v) => updateClip(clip.id, { volume: Number(v.toFixed(2)) }, false)}
                   format={(v) => `${(v * 100).toFixed(0)}%`}
                 />
               </div>

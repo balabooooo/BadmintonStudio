@@ -27,7 +27,11 @@ router = APIRouter(prefix="/api/projects/{pid}/media/{mid}/annotation", tags=["a
 
 
 def _load(pid: str) -> Project:
-    proj = ST.load_project(pid)
+    try:
+        proj = ST.load_project(pid)
+    except ValueError as e:
+        # 非法 id 会被 store 拒绝（防路径穿越），这里是它对应的 HTTP 语义
+        raise HTTPException(400, str(e)) from e
     if proj is None:
         raise HTTPException(404, "工程不存在")
     return proj

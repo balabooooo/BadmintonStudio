@@ -188,10 +188,45 @@ export default function Player() {
     [clips],
   )
 
+  /** 成片模式下播放头走的是成片时间，这里换算回它对应的原片时间 */
+  const srcTime = useMemo(() => {
+    if (previewMode !== 'timeline') return currentTime
+    return mapTimeline(currentTime)?.src ?? 0
+  }, [previewMode, currentTime, mapTimeline])
+
+  /** 原片时间 -> 成片时间；该时刻不在成片里则返回 null */
+  const filmTimeOfSource = useCallback(
+    (src: number): number | null => {
+      for (const c of clips) {
+        if (src >= c.src_in && src <= c.src_out) {
+          return c.tl_start + (src - c.src_in) / c.speed
+        }
+      }
+      return null
+    },
+    [clips],
+  )
+
+  /** 跳到某个原片时刻：成片模式下换算成成片时间，不在成片里就切回源片 */
+  const goToSource = useCallback(
+    (src: number) => {
+      if (previewMode === 'timeline') {
+        const ft = filmTimeOfSource(src)
+        if (ft !== null) {
+          seek(ft)
+          return
+        }
+        setPreviewMode('source')
+      }
+      seek(src)
+    },
+    [previewMode, filmTimeOfSource, seek, setPreviewMode],
+  )
+
   const rallyAtTime = useMemo(() => {
     if (!analysis) return null
-    return analysis.rallies.find((r) => currentTime >= r.start && currentTime <= r.end) ?? null
-  }, [analysis, currentTime])
+    return analysis.rallies.find((r) => srcTime >= r.start && srcTime <= r.end) ?? null
+  }, [analysis, srcTime])
 
   const selectedRally = useMemo(
     () => analysis?.rallies.find((r) => r.id === selectedRallyId) ?? null,
@@ -229,9 +264,11 @@ export default function Player() {
   )
 
   // ------------------------------------------------ 同步 video 与状态
+  // 只在切换素材时重置 ready。切换「源片/成片预览」不会换 src，
+  // 若把 previewMode 也放进依赖，loadedmetadata 不再触发，遮罩会永远盖住画面。
   useEffect(() => {
     setReady(false)
-  }, [mediaId, previewMode])
+  }, [mediaId])
 
   useEffect(() => {
     const v = videoRef.current
@@ -323,17 +360,18 @@ export default function Player() {
   const jumpRally = (dir: 1 | -1) => {
     if (!analysis?.rallies.length) return
     const list = analysis.rallies
+    // 查找用原片时间：成片模式下 currentTime 是成片时间，不能直接和回合范围比
     if (dir === 1) {
-      const nxt = list.find((r) => r.start > currentTime + 0.05)
+      const nxt = list.find((r) => r.start > srcTime + 0.05)
       if (nxt) {
         selectRally(nxt.id)
-        seek(nxt.start)
+        goToSource(nxt.start)
       }
     } else {
-      const prev = [...list].reverse().find((r) => r.end < currentTime - 0.35)
+      const prev = [...list].reverse().find((r) => r.end < srcTime - 0.35)
       if (prev) {
         selectRally(prev.id)
-        seek(prev.start)
+        goToSource(prev.start)
       }
     }
   }
@@ -343,16 +381,16 @@ export default function Player() {
   useEffect(() => {
     if (!selectedRally || lastSelected.current === selectedRally.id) return
     lastSelected.current = selectedRally.id
-    seek(selectedRally.start)
-  }, [selectedRally, seek])
+    goToSource(selectedRally.start)
+  }, [selectedRally, goToSource])
 
   // 回合循环（默认关闭）
   useEffect(() => {
     if (!loop || !activeRally || !playing) return
-    if (currentTime > activeRally.end + 0.15) {
-      seek(activeRally.clip_start ?? activeRally.start)
+    if (srcTime > activeRally.end + 0.15) {
+      goToSource(activeRally.clip_start ?? activeRally.start)
     }
-  }, [currentTime, activeRally, loop, playing, seek])
+  }, [srcTime, activeRally, loop, playing, goToSource])
 
   /** 当前选中的片段在成片时间轴上的范围（用于给分割提示兜错） */
   const selectedClipRange = useMemo(() => {
