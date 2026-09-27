@@ -1567,11 +1567,6 @@ def resegment(
     # This is what lets the cross-court suppression slider take effect instantly: the stored raw
     # sequence is gated once here, never the already-gated one, so repeated resegments are idempotent.
     hits, regate_trace = regate_hits(sig, params)
-    shuttle_presence = None
-    shuttle_fps = 0.0
-    if sig.get("shuttle_presence"):
-        shuttle_presence = np.asarray(sig["shuttle_presence"], dtype=np.float32)
-        shuttle_fps = float((sig.get("shuttle_fps") or [10.0])[0])
 
     pm_full = sig.get("player_motion_full") or []
     cov_full = sig.get("player_coverage_full") or []

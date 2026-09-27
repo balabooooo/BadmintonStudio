@@ -17,7 +17,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 from ..config import TOOLS_DIR
 from ..i18n import tr

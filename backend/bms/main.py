@@ -21,7 +21,6 @@ from loguru import logger
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__
 from .config import (
     APP_DISPLAY_NAME,
     APP_VERSION,

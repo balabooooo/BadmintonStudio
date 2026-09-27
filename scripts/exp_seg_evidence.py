@@ -100,7 +100,6 @@ def main() -> int:
         per_clip[name] = dict(res=res, gt=gt, lo=lo, hi=hi, ctx=ctx, raw=raw, ev=ev)
 
     # Grid: evidence density weight x power x seg params (coarse)
-    best = None
     rows = []
     for w_ev, power, prom, core in itertools.product(
             [0.0, 0.4, 0.6, 0.8], [1.0, 2.0], [0.08, 0.10, 0.15], [1.2, 2.5]):

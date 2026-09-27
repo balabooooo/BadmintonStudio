@@ -12,7 +12,7 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - `backend/bms/` — Python package. `main.py` is one large FastAPI app holding all REST routes + WebSocket; `analysis/` is the AI pipeline; `api/` has the annotation + preset routers; `render/exporter.py` is the FFmpeg export path.
 - `frontend/` — React 19 + TS + Vite + Tailwind v4 + Zustand. Animation lib is `motion` (not `framer-motion`).
 - `desktop/app.py` — uvicorn thread + pywebview window (browser fallback).
-- `scripts/` — CLI diagnostics/analysis (`run_analysis.py`, `e2e_test.py`, `eval_segmentation.py`, `probe_video.py`, `fetch_speech_model.py`, ...).
+- `scripts/` — CLI diagnostics/analysis (`run_analysis.py`, `e2e_test.py`, `eval_segmentation.py`, `probe_video.py`, `fetch_speech_model.py`, `tune_clip25.py`, `eval_scoring_ab.py`, `transcribe_speech.py`, ...).
 - `data/` — gitignored runtime state (project JSON, caches, exports, annotations, scene presets). `models/*.pt`, `models/*.onnx`, `models/faster-whisper-*/` and `tools/` are also gitignored; **no binaries are committed** (YOLO auto-downloads or is placed in `models/`, the whisper model is fetched by script or auto-downloaded, a bundled ffmpeg lives at `tools/ffmpeg/bin`).
 - `tests/test_core.py` — the only test suite. No CI, no pre-commit, no Python linter/formatter/typecheck config.
 

@@ -12,17 +12,14 @@ The routes are mounted on the main service (:mod:`bms.main`); no separate proces
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import numpy as np
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import PlainTextResponse
 
-from .. import config as CFG
 from ..analysis import annotation as AN
 from ..core import store as ST
-from ..core.models import AnalysisParams, MediaInfo, Project
+from ..core.models import MediaInfo, Project
 from ..i18n import tr
 
 router = APIRouter(prefix="/api/projects/{pid}/media/{mid}/annotation", tags=["annotation"])

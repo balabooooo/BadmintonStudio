@@ -35,7 +35,6 @@ def main() -> int:
     data = json.loads(Path(args.json).read_text(encoding="utf-8"))
     sig = data.get("signals", {})
     dur = float((sig.get("duration") or [0])[0])
-    fps = float((sig.get("fps") or [15])[0])
     end = args.end or dur
     a0, a1 = args.start, end
 
@@ -77,7 +76,6 @@ def main() -> int:
     if has_players:
         ax = axes[i]; i += 1
         cnt = np.array(sig["active_count"]); spd = np.array(sig["active_speed"])
-        pf = float((sig.get("player_fps") or [fps])[0])
         tp = np.linspace(0, dur, cnt.size)
         ax.plot(tp, cnt, lw=0.9, color="#2a8", label="active_count")
         ax2 = ax.twinx()

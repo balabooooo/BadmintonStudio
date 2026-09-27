@@ -8,7 +8,6 @@ gym, vision suffers from crowd movement).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -81,7 +80,7 @@ def analyze_motion(
     prev_gray: np.ndarray | None = None
     prev_hist: np.ndarray | None = None
     window: np.ndarray | None = None
-    motion, court_motion, bright, sharp, shake, cuts = [], [], [], [], [], []
+    motion, bright, sharp, shake, cuts = [], [], [], [], []
     activity: np.ndarray | None = None
 
     idx = 0

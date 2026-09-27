@@ -27,6 +27,7 @@ never uploaded.
 - [Supported camera setups](#supported-camera-setups)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
+- [License](#license)
 
 ---
 
@@ -40,7 +41,7 @@ extremely time-consuming. This app automates it:
 | Remove dead time automatically | Multimodal activity detection (player movement + frame motion + hit sounds + shuttle trajectory) |
 | Keep only real rallies | Every rally is located beat-by-beat as "serve → receive → …" |
 | Cut each rally separately | Rally list + one-click timeline generation, one clip per rally |
-| Score by quality | Five dimensions — length / intensity / technique / excitement / picture quality — plus a total |
+| Score by quality | Six dimensions — length / intensity / technique / excitement / highlight / picture quality — plus a total |
 | Filter high-scoring clips | Score range, duration, shot count, tags, star rating; multi-criteria filter + "keep top N%" |
 | Media management | Multi-select bulk remove (removes from the project only, never touches the files on disk) |
 | Everyday editing | Multi-track timeline: drag, trim, split, speed change, snapping, undo/redo |
@@ -470,17 +471,19 @@ Scoring is a **explainable formula**, not a black box (`analysis/scoring.py`).
 | **Length** | Shot count and duration, with a saturation curve (so an overlong rally does not dominate) |
 | **Intensity** | Player speed, peak frame motion, overall tempo, **late-rally tempo** (a late acceleration adds points) |
 | **Technique** | Shuttle speed, hit power, shuttle persistence in frame |
-| **Excitement** | Length + intensity + late acceleration + long-rally weighting |
+| **Excitement** | Length + intensity + late-rally surge + long-rally weighting |
+| **Highlight** | Smash count, fast-exchange streak, tempo variance (only the Pro Highlights preset gives it weight) |
 | **Picture** | Sharpness, shake, subject large enough (only clear enough to be worth using) |
 
-Total = weighted sum × analysis-confidence discount.
+Total = weighted sum × analysis-confidence discount (+ optional voice-command bonus).
 
 ### Scoring profile presets
 
 | Preset | Emphasis | Use |
 | --- | --- | --- |
 | Balanced | All dimensions | Default |
-| Highlight reel | Intensity + technique | High-light edits |
+| Highlights | Intensity + technique | Short, fierce highlight edits |
+| Pro Highlights | Smash + fast-exchange streak + tempo variance | Professional highlight reels |
 | Long rallies | Shot count + duration | Finding grind-it-out points |
 | Technique | Shuttle speed + power | Reviewing technique |
 | Training review | Picture completeness | Teaching material |
@@ -489,9 +492,9 @@ Switching a preset **only re-scores, it never re-runs the AI analysis**, so it i
 
 ### Automatic tags
 
-After analysis, tags such as `super-long-rally / long-rally / fast-tempo / late-acceleration /
-high-intensity-running / fast-shuttle / long-rally / short-rally / high-score / low-confidence` are applied
-and can be used directly as filter criteria.
+After analysis, canonical tags such as `ultra_long_rally / many_shots / fast_tempo / late_acceleration /
+high_mobility / fast_shuttle / long_rally / short_rally / high_score / low_confidence / smash /
+confrontation / highlight` are applied and can be used directly as filter criteria.
 
 ---
 
@@ -616,6 +619,15 @@ $py = ".\.venv\Scripts\python.exe"
 
 # Pre-fetch the faster-whisper model used by voice-command scoring (optional; auto-downloads otherwise)
 & $py scripts\fetch_speech_model.py
+
+# Offline segmentation tuning / grid search against manual annotations (clip2 / clip5)
+& $py scripts\tune_clip25.py
+
+# Offline A/B scoring evaluation (balanced vs highlight_pro) on annotated rallies
+& $py scripts\eval_scoring_ab.py
+
+# Transcribe a clip's audio with faster-whisper to tune voice-command detection
+& $py scripts\transcribe_speech.py "D:\Videos\match.mp4" --around 638 --phrases 好球 漂亮
 ```
 
 The backend also ships OpenAPI docs: once the service is running, visit
@@ -650,8 +662,8 @@ BadmintonStudio/
 │  │  ├─ shuttle.py        Shuttle candidate detection + parabolic trajectory association
 │  │  ├─ rally.py          Multimodal fusion + hysteresis state machine + boundary snapping
 │  │  ├─ rally_vision.py   Player-motion quiet-segment segmentation (primary) + activity-valley segmentation (fallback)
-│  │  ├─ pose.py           Pose-assist hit attribution (deciding whether a hit sound is ours)
-│  │  ├─ scoring.py        Five-dimension scoring + tags + statistics
+│  │  ├─ pose.py           Pose-assist hit attribution + composite gate (local strength + pose evidence)
+│  │  ├─ scoring.py        Six-dimension scoring (incl. highlight) + tags + statistics
 │  │  ├─ speech.py         Optional voice-command scoring (faster-whisper + near-homophone match)
 │  │  ├─ annotation.py     Manual annotation I/O + annotation-driven parameter search
 │  │  └─ pipeline.py       Orchestrates the whole flow, produces AnalysisResult
@@ -663,6 +675,7 @@ BadmintonStudio/
 │     └─ lib/              API client, WebSocket, types, formatting
 ├─ desktop/app.py          pywebview desktop shell
 ├─ scripts/                Command-line tools and diagnostics
+├─ docs/                   Technical reports (segmentation/scoring optimization, UI redesign)
 ├─ data/                   Runtime data (projects, cache, exports, annotations, presets)
 └─ models/                 Model weights (not committed)
 ```
@@ -1047,3 +1060,9 @@ The suite covers the places where **silent failures are most likely**, not algor
 - Server-side attribution of the serving side depends on the two players being at **clearly different
   depths**. When they are close in depth, or under a high/overhead angle, it always stays `unknown` rather
   than guessing.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).

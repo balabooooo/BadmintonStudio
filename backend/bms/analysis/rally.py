@@ -397,7 +397,6 @@ def segment(
 
     out: list[RallyInterval] = []
     min_f = int(round(min_seconds * fps))
-    max_f = int(round(max_seconds * fps)) if max_seconds > 0 else 10**9
     target_f = int(round(target * fps))
     for s0, e0 in merged:
         if e0 - s0 < min_f:

@@ -700,12 +700,12 @@ def _merge_tracks(bufs: list[_TrackBuf], aspect: float) -> list[_TrackBuf]:
 
     merged: list[_TrackBuf] = []
     merged_meta: list[tuple[float, float, float, float, float, float]] = []
-    for tr, mt in zip(live, meta):
+    for trk, mt in zip(live, meta):
         target: _TrackBuf | None = None
         for idx, prev in enumerate(merged):
             pm = merged_meta[idx]
             # Gap in time too long -> skip
-            if pm[1] < tr.times[0] and tr.times[0] - pm[1] > MERGE_MAX_GAP:
+            if pm[1] < trk.times[0] and trk.times[0] - pm[1] > MERGE_MAX_GAP:
                 continue
             # Entirely later than the other in time -> cannot possibly connect (live is already sorted by start time)
             if pm[0] > mt[1]:
@@ -715,14 +715,14 @@ def _merge_tracks(bufs: list[_TrackBuf], aspect: float) -> list[_TrackBuf]:
             if (mt[2] - pm[4] > tol or pm[2] - mt[4] > tol or
                     mt[3] - pm[5] > tol or pm[3] - mt[5] > tol):
                 continue
-            if _junction_ok(prev, tr, aspect):
+            if _junction_ok(prev, trk, aspect):
                 target = prev
                 break
         if target is None:
-            merged.append(tr)
+            merged.append(trk)
             merged_meta.append(mt)
         else:
-            target.absorb(tr)
+            target.absorb(trk)
             i = merged.index(target)
             old = merged_meta[i]
             merged_meta[i] = (

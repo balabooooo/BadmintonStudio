@@ -14,3 +14,11 @@ tools/
 .pytest_cache/
 *.log
 Ultralytics/
+
+# OS-generated files and local env config
+.DS_Store
+Thumbs.db
+desktop.ini
+.env
+.env.*
+!.env.example

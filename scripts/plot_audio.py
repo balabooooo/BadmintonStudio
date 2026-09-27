@@ -35,7 +35,6 @@ def main() -> int:
     x, sr = AH.load_wav_mono(args.wav)
     a, b = int(args.start * sr), int(args.end * sr)
     seg = x[a:b]
-    dur = len(seg) / sr
 
     det = AH.detect_hits(args.wav, sensitivity=args.sensitivity)
     m = (det.times >= args.start) & (det.times < args.end)

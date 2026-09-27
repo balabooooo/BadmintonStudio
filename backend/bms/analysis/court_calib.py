@@ -350,7 +350,6 @@ def measure_court_band(frames: list[np.ndarray]) -> tuple[np.ndarray, dict[str, 
     band = slice(int(h * 0.88), h)
     hs = H[band].ravel()
     ss = S[band].ravel()
-    vs = V[band].ravel()
     sel0 = ss > 60
     if int(sel0.sum()) < 50:
         return np.zeros(h, dtype=bool), {"reason": tr("court.note.band_low_samples")}

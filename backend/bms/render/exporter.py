@@ -14,7 +14,6 @@ Strategy
 
 from __future__ import annotations
 
-import math
 import re
 import shutil
 import tempfile

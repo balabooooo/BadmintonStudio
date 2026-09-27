@@ -25,7 +25,6 @@ from bms.analysis import pipeline as P  # noqa: E402
 from bms.analysis import pose as POSE  # noqa: E402
 from bms.analysis import rally as RA  # noqa: E402
 from bms.analysis import rally_vision as RV  # noqa: E402
-from bms.analysis.audio_hits import HitDetection  # noqa: E402
 from bms.core.models import AnalysisResult  # noqa: E402
 
 CLIPS = [

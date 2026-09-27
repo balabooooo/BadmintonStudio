@@ -93,7 +93,6 @@ from __future__ import annotations
 
 import collections
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 
@@ -392,25 +391,25 @@ def _associate(
         cands = per_frame[f]
         used = [False] * len(cands)
         # Process the "longest-stalled" trajectories first, so new trajectories do not steal an old one's target
-        active.sort(key=lambda tr: tr[-1][0])
+        active.sort(key=lambda trk: trk[-1][0])
         still: list[list[tuple[int, float, float, float]]] = []
-        for tr in active:
-            gap = f - tr[-1][0]
+        for trk in active:
+            gap = f - trk[-1][0]
             if gap > max_gap + 1:          # gap too long, terminate the trajectory
-                if len(tr) >= min_points:
-                    done.append(tr)
+                if len(trk) >= min_points:
+                    done.append(trk)
                 continue
 
             # Extrapolate the predicted position using the velocity of the last two points
-            if len(tr) >= 2:
-                pf, px, py, _ = tr[-2]
-                lf, lx, ly, _ = tr[-1]
+            if len(trk) >= 2:
+                pf, px, py, _ = trk[-2]
+                lf, lx, ly, _ = trk[-1]
                 dt = max(1e-6, (lf - pf) / fps)
                 step = gap / fps
                 pred_x = lx + (lx - px) / dt * step
                 pred_y = ly + (ly - py) / dt * step
             else:
-                pred_x, pred_y = tr[-1][1], tr[-1][2]
+                pred_x, pred_y = trk[-1][1], trk[-1][2]
 
             # The search radius is determined by the speed upper bound, plus a 2 px floor to keep sub-pixel jitter from stalling it
             radius = max(2.0, max_speed * height * (gap / fps))
@@ -427,8 +426,8 @@ def _associate(
             if best >= 0:
                 used[best] = True
                 cx, cy, sc, _nv = cands[best]
-                tr.append((f, cx, cy, sc))
-            still.append(tr)
+                trk.append((f, cx, cy, sc))
+            still.append(trk)
         active = still
 
         # Unclaimed candidate points start new trajectories
@@ -436,9 +435,9 @@ def _associate(
             if not used[k]:
                 active.append([(f, cx, cy, sc)])
 
-    for tr in active:
-        if len(tr) >= min_points:
-            done.append(tr)
+    for trk in active:
+        if len(trk) >= min_points:
+            done.append(trk)
     return done
 
 
@@ -813,11 +812,11 @@ def _run(
     tracks: list[ShuttleTrack] = []
     tracked_by_frame: dict[int, list[tuple[float, float]]] = {}
     for chain in chains:
-        tr, _resid = _fit_track(chain, eff_fps, wh, ww, min_speed, max_speed,
-                                max_resid, min_points, min_span, min_accel)
-        if tr is None:
+        trk, _resid = _fit_track(chain, eff_fps, wh, ww, min_speed, max_speed,
+                                 max_resid, min_points, min_span, min_accel)
+        if trk is None:
             continue
-        tracks.append(tr)
+        tracks.append(trk)
         for p in chain:
             tracked_by_frame.setdefault(p[0], []).append((p[1] / ww, p[2] / wf_h))
 

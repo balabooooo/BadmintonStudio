@@ -35,7 +35,6 @@ dividing by body height makes it independent of how near or far the player is.
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable

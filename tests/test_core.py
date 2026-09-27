@@ -571,8 +571,6 @@ def test_split_by_hit_gaps() -> None:
     intervals had a 6.93-second gap, yet segmentation made no use of that information at all.
     """
     print("\n击球空档切分")
-    fps = 12.0
-    dur = 80.0
     # 0~29s dense hits (one shot every 0.6s), 29~35s gap, 35~50s dense again
     times = list(np.arange(0.5, 29.0, 0.6)) + list(np.arange(35.0, 50.0, 0.6))
     times = np.asarray(times, dtype=np.float64)
@@ -1008,7 +1006,6 @@ def test_annotation_optimizer_runs() -> None:
     n = int(dur * fps)
     act = np.full(n, 0.4, dtype=np.float32)
     pm = np.zeros(n, dtype=np.float32)
-    hits = np.zeros(n, dtype=np.float32)
     for a, b in ((10, 35), (60, 90)):
         pm[int(a * fps):int(b * fps)] = 1.0
         act[int(a * fps):int(b * fps)] = 0.9
