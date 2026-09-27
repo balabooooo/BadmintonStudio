@@ -21,6 +21,18 @@ APP_VERSION = "0.1.0"
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _resource_root() -> Path:
+    """Root for bundled read-only resources (frontend dist, model weights, tools).
+
+    In a PyInstaller onedir build the bundled data lives under ``sys._MEIPASS``
+    (the ``_internal`` folder), not next to the executable, so ``ROOT`` would
+    point one level too high.
+    """
+    if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
+        return Path(sys._MEIPASS)
+    return ROOT
+
+
 def _env_path(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
     if raw:
@@ -50,10 +62,10 @@ ANNOTATIONS_DIR = DATA_DIR / "annotations"
 #: Scene presets (segmentation params + court calibration + preview frame), reusable across projects
 PRESETS_DIR = DATA_DIR / "presets"
 
-MODELS_DIR = _env_path("BMS_MODELS_DIR", ROOT / "models")
-TOOLS_DIR = _env_path("BMS_TOOLS_DIR", ROOT / "tools")
+MODELS_DIR = _env_path("BMS_MODELS_DIR", _resource_root() / "models")
+TOOLS_DIR = _env_path("BMS_TOOLS_DIR", _resource_root() / "tools")
 
-FRONTEND_DIST = _env_path("BMS_FRONTEND_DIST", ROOT / "frontend" / "dist")
+FRONTEND_DIST = _env_path("BMS_FRONTEND_DIST", _resource_root() / "frontend" / "dist")
 
 # ---------------------------------------------------------------- Analysis parameter defaults
 

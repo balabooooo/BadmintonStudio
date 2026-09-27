@@ -5,6 +5,10 @@ __pycache__/
 .trae/
 node_modules/
 frontend/dist/
+# PyInstaller / release build artifacts
+/build/
+/dist/
+/packaging/.venv-cpu/
 data/
 models/*.pt
 models/*.onnx

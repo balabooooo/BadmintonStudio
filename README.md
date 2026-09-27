@@ -52,6 +52,27 @@ extremely time-consuming. This app automates it:
 
 ---
 
+## Download & install (portable, Windows)
+
+The fastest way to run the app is the prebuilt portable package from
+[GitHub Releases](https://github.com/balabooooo/BadmintonStudio/releases). No Python, Node.js or
+CUDA setup is required.
+
+1. Download `BadmintonStudio-<version>-win64.zip` from the latest release.
+2. Extract the archive to any folder (e.g. `D:\BadmintonStudio`).
+3. Double-click **`BadmintonStudio.exe`**.
+
+The package bundles a CPU-only PyTorch build so it runs on any Windows 10/11 machine; analysis
+therefore runs on the CPU. For GPU-accelerated analysis and NVENC export, install from source instead
+(see [Quick start](#quick-start)). The YOLO weights and ffmpeg are already included in the package, so
+the first analysis works offline.
+
+Runtime state (projects, caches, exports, logs) is written to `%LOCALAPPDATA%\BadmintonStudio`.
+
+> The portable build is produced with `pwsh -File packaging\build_release.ps1` (PyInstaller, one-folder).
+
+---
+
 ## Quick start
 
 ### Requirements
