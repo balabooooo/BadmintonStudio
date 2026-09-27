@@ -1,3 +1,5 @@
+import { getLang, isEn } from '../i18n'
+
 export function cn(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(' ')
 }
@@ -15,10 +17,11 @@ export function timecode(sec: number, withFrames = true, fps = 30): string {
   return withFrames ? `${base}.${String(f).padStart(2, '0')}` : base
 }
 
-/** 12.3s / 1分23秒 */
+/** 12.3s / 1分23秒（随界面语言切换） */
 export function humanDuration(sec: number): string {
   if (!isFinite(sec) || sec < 0) sec = 0
-  if (sec < 60) return `${sec.toFixed(1)}秒`
+  const en = isEn()
+  if (sec < 60) return en ? `${sec.toFixed(1)}s` : `${sec.toFixed(1)}秒`
   let m = Math.floor(sec / 60)
   let s = Math.round(sec % 60)
   // 四舍五入会把 119.7 的秒数进位成 60，直接拼会得到「1分60秒」
@@ -26,9 +29,9 @@ export function humanDuration(sec: number): string {
     s = 0
     m += 1
   }
-  if (m < 60) return `${m}分${String(s).padStart(2, '0')}秒`
+  if (m < 60) return en ? `${m}m${String(s).padStart(2, '0')}s` : `${m}分${String(s).padStart(2, '0')}秒`
   const h = Math.floor(m / 60)
-  return `${h}小时${String(m % 60).padStart(2, '0')}分`
+  return en ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${h}小时${String(m % 60).padStart(2, '0')}分`
 }
 
 export function bytes(n: number): string {
@@ -41,11 +44,12 @@ export function bytes(n: number): string {
 
 export function relTime(ms: number): string {
   const d = Date.now() - ms
-  if (d < 60_000) return '刚刚'
-  if (d < 3_600_000) return `${Math.floor(d / 60_000)} 分钟前`
-  if (d < 86_400_000) return `${Math.floor(d / 3_600_000)} 小时前`
-  if (d < 7 * 86_400_000) return `${Math.floor(d / 86_400_000)} 天前`
-  return new Date(ms).toLocaleDateString('zh-CN')
+  const en = isEn()
+  if (d < 60_000) return en ? 'just now' : '刚刚'
+  if (d < 3_600_000) return en ? `${Math.floor(d / 60_000)} min ago` : `${Math.floor(d / 60_000)} 分钟前`
+  if (d < 86_400_000) return en ? `${Math.floor(d / 3_600_000)} h ago` : `${Math.floor(d / 3_600_000)} 小时前`
+  if (d < 7 * 86_400_000) return en ? `${Math.floor(d / 86_400_000)} d ago` : `${Math.floor(d / 86_400_000)} 天前`
+  return new Date(ms).toLocaleDateString(getLang() === 'en' ? 'en-US' : 'zh-CN')
 }
 
 /** 分数 -> 颜色（红→黄→绿），用于评分徽章 */
@@ -80,17 +84,18 @@ export function scoreGrade(score: number): string {
   return 'D'
 }
 
+/** 稳定 tag 代码 -> 颜色（展示名见 i18n 的 tag.<code>）。 */
 export const TAG_COLORS: Record<string, string> = {
-  超长多拍: '#a874ff',
-  多拍: '#5c9dff',
-  快节奏: '#ffb020',
-  末段提速: '#ff8a3d',
-  高强度跑动: '#38e0a2',
-  高速球: '#16c98a',
-  长回合: '#3b7ff0',
-  短回合: '#6b7787',
-  高分: '#ffd12e',
-  低置信: '#ff5470',
+  ultra_long_rally: '#a874ff',
+  many_shots: '#5c9dff',
+  fast_tempo: '#ffb020',
+  late_acceleration: '#ff8a3d',
+  high_mobility: '#38e0a2',
+  fast_shuttle: '#16c98a',
+  long_rally: '#3b7ff0',
+  short_rally: '#6b7787',
+  high_score: '#ffd12e',
+  low_confidence: '#ff5470',
 }
 
 export function tagColor(tag: string): string {

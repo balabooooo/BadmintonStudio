@@ -3,7 +3,9 @@
 # (inherited through `python -m venv --system-site-packages`).
 
 # --- media I/O ---
-av>=13.0
+# 不再依赖 PyAV：它的原生扩展是未签名的，在开启「智能应用控制 / AppLocker」的
+# Windows 上会被操作系统直接拦截（DLL load failed）。媒体探测以 ffprobe 为主、
+# ffmpeg -i 为兜底，见 bms/core/media.py。装了 PyAV 也只当可选加速，不再列入依赖。
 imageio-ffmpeg>=0.5.1
 opencv-python>=4.10
 
@@ -18,5 +20,21 @@ websockets>=13.0
 pydantic>=2.9
 python-multipart>=0.0.12
 
+# --- observability ---
+# 统一日志（stderr + data/logs 轮转文件），并把 stdlib logging 桥接进来（uvicorn / ultralytics 等）。
+loguru>=0.7
+
+# --- desktop shell (optional; falls back to system browser if missing) ---
+# 原生窗口里 pywebview 能拿到拖入文件的完整本地路径，大文件可不经复制直接导入。
+pywebview>=5.0
+
 # --- AI detectors (optional, degrade gracefully if missing) ---
 ultralytics>=8.3
+# ByteTrack 的线性分配求解器（ultralytics 跟踪依赖；缺失时会尝试联网自动安装）
+lap>=0.5.12
+# 语音口令检测（可选）：用 faster-whisper 识别「好球」这类短语，并做近音容错匹配。
+# 缺依赖 / 缺模型会自动降级。模型不进版本库，首次使用会自动从 HuggingFace 下载，
+# 也可先运行 scripts/fetch_speech_model.py 预取到 models/。
+faster-whisper>=1.2
+# 近音匹配用（好 hǎo ↔ 到 dào / 倒 dǎo）；缺失时退回精确匹配。
+pypinyin>=0.53

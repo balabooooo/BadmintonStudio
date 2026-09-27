@@ -3,6 +3,7 @@ import type {
   AnalysisResult,
   AnnotationResponse,
   EnvInfo,
+  ExportItem,
   ExportPreset,
   JobInfo,
   MediaInfo,
@@ -11,8 +12,10 @@ import type {
   Project,
   ProjectSummary,
   Rally,
+  ScenePreset,
   Timeline,
 } from './types'
+import { getLang } from '../i18n'
 
 const BASE = ''
 
@@ -24,23 +27,40 @@ export class ApiError extends Error {
   }
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
-  })
-  if (!res.ok) {
-    let detail = res.statusText
-    try {
-      const j = await res.json()
-      detail = j.detail || JSON.stringify(j)
-    } catch {
-      /* ignore */
+/**
+ * `timeoutMs` 默认 60s：请求挂死时不该让按钮永远转圈。传 0 表示不限时
+ * （标注页的「优化参数」是同步长任务，可能跑好几分钟）。
+ */
+async function req<T>(path: string, init?: RequestInit, timeoutMs = 60_000): Promise<T> {
+  const ctrl = new AbortController()
+  let timer: number | undefined
+  if (timeoutMs > 0) timer = window.setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(BASE + path, {
+      ...init,
+      signal: init?.signal ?? ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'X-BMS-Lang': getLang(), ...(init?.headers || {}) },
+    })
+    if (!res.ok) {
+      let detail = res.statusText
+      try {
+        const j = await res.json()
+        detail = j.detail || JSON.stringify(j)
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
     }
-    throw new ApiError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
+    if (res.status === 204) return undefined as T
+    try {
+      return (await res.json()) as T
+    } catch {
+      // 2xx 但响应体不是 JSON（例如被代理拦截）时抛结构化错误，别让 SyntaxError 冒出去
+      throw new ApiError(res.status, 'Invalid JSON response')
+    }
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer)
   }
-  if (res.status === 204) return undefined as T
-  return (await res.json()) as T
 }
 
 export const api = {
@@ -64,8 +84,26 @@ export const api = {
       `/api/projects/${pid}/media`,
       { method: 'POST', body: JSON.stringify({ paths }) },
     ),
+  /** 调起 Windows 原生文件选择框（可多选），拿到本地路径后走 addMedia，避免复制大文件。 */
+  pickVideos: () =>
+    req<{ paths: string[]; cancelled: boolean }>('/api/dialog/videos', {
+      method: 'POST',
+      body: '{}',
+    }),
+  /** 调起 Windows 原生文件夹选择框，后端会递归展开其中的视频文件。 */
+  pickFolder: () =>
+    req<{ paths: string[]; cancelled: boolean }>('/api/dialog/folder', {
+      method: 'POST',
+      body: '{}',
+    }),
   removeMedia: (pid: string, mid: string) =>
     req<Project>(`/api/projects/${pid}/media/${mid}`, { method: 'DELETE' }),
+  /** 批量从工程移除素材（同时取消还在跑的预览任务） */
+  deleteMediaBulk: (pid: string, ids: string[]) =>
+    req<{ project: Project; removed: number }>(`/api/projects/${pid}/media/bulk-delete`, {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
   prepareMedia: (pid: string, mid: string) =>
     req<{ job_id: string }>(`/api/projects/${pid}/media/${mid}/prepare`, {
       method: 'POST',
@@ -92,6 +130,17 @@ export const api = {
     pid: string,
     body: { media_id: string; params?: Partial<AnalysisParams>; weights?: string; roi?: number[] },
   ) => req<{ job_id: string }>(`/api/projects/${pid}/analyze`, { method: 'POST', body: JSON.stringify(body) }),
+  /**
+   * 批量分析：一次提交多条素材，后端串行排队逐个跑。
+   * 不传 `media_ids` 表示工程内全部素材；场地标定由后端按素材各自读取。
+   */
+  analyzeBatch: (
+    pid: string,
+    body: { media_ids?: string[]; params?: Partial<AnalysisParams>; weights?: string },
+  ) => req<{ job_ids: string[]; count: number }>(`/api/projects/${pid}/analyze-batch`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
   getAnalysis: (pid: string, mid: string) => req<AnalysisResult>(`/api/projects/${pid}/analysis/${mid}`),
   /**
    * 人物框尺寸试测：取若干帧**只做检测**，秒级返回框高分布。
@@ -118,11 +167,15 @@ export const api = {
   ) => req<PlayerProbe>(`/api/projects/${pid}/player-probe`, {
     method: 'POST',
     body: JSON.stringify(body),
-  }),
+  }, 300_000),
   resegment: (
     pid: string,
     body: { media_id: string; params?: Partial<AnalysisParams>; weights?: string },
   ) => req<AnalysisResult>(`/api/projects/${pid}/resegment`, { method: 'POST', body: JSON.stringify(body) }),
+  rebuildHits: (
+    pid: string,
+    body: { media_id: string; params?: Partial<AnalysisParams>; weights?: string },
+  ) => req<AnalysisResult>(`/api/projects/${pid}/rebuild-hits`, { method: 'POST', body: JSON.stringify(body) }),
   clearAnalysis: (pid: string, mid: string) =>
     req<{ ok: boolean }>(`/api/projects/${pid}/analysis/${mid}`, { method: 'DELETE' }),
 
@@ -132,7 +185,12 @@ export const api = {
   saveAnnotation: (
     pid: string,
     mid: string,
-    body: { rallies: { start: number; end: number; note?: string; source?: string }[]; focus?: number[] | null; note?: string },
+    body: {
+      rallies: { start: number; end: number; note?: string; source?: string }[]
+      hits?: { t: number; ours: boolean }[]
+      focus?: number[] | null
+      note?: string
+    },
   ) =>
     req<{ ok: boolean; count: number; path: string; updated_at: string }>(
       `/api/projects/${pid}/media/${mid}/annotation`,
@@ -143,10 +201,11 @@ export const api = {
     mid: string,
     body: { params?: Partial<AnalysisParams> } = {},
   ) =>
-    req<OptimizeResult>(`/api/projects/${pid}/media/${mid}/annotation/optimize`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+    req<OptimizeResult>(
+      `/api/projects/${pid}/media/${mid}/annotation/optimize`,
+      { method: 'POST', body: JSON.stringify(body) },
+      0,
+    ),
   annotationCsvUrl: (pid: string, mid: string) =>
     `/api/projects/${pid}/media/${mid}/annotation/export.csv`,
 
@@ -157,10 +216,10 @@ export const api = {
     pid: string,
     body: { media_id?: string; ids?: string[]; filter?: Record<string, unknown>; patch: Record<string, unknown> },
   ) => req<{ updated: number }>(`/api/projects/${pid}/rallies/bulk`, { method: 'POST', body: JSON.stringify(body) }),
-  rescore: (pid: string, weights: string, media_id?: string) =>
-    req<{ rescored: number; weights: string }>(`/api/projects/${pid}/rallies/rescore`, {
+  rescore: (pid: string, weights: string, media_id?: string, cross_media?: boolean) =>
+    req<{ rescored: number; weights: string; cross_media?: boolean }>(`/api/projects/${pid}/rallies/rescore`, {
       method: 'POST',
-      body: JSON.stringify({ weights, media_id }),
+      body: JSON.stringify({ weights, media_id, cross_media }),
     }),
 
   // ---------------------------------------------------------------- 时间线
@@ -187,14 +246,45 @@ export const api = {
 
   // ---------------------------------------------------------------- 导出
   exportPresets: () => req<ExportPreset[]>('/api/export/presets'),
-  exportProject: (pid: string, body: { preset: Partial<ExportPreset>; name?: string }) =>
-    req<{ job_id: string; output: string }>(`/api/projects/${pid}/export`, {
+  exportProject: (
+    pid: string,
+    body: {
+      preset: Partial<ExportPreset>
+      name?: string
+      mode?: 'merge' | 'separate'
+      output_dir?: string
+    },
+  ) =>
+    req<{ job_id: string; output: string; mode: 'merge' | 'separate' }>(
+      `/api/projects/${pid}/export`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  listExports: () => req<ExportItem[]>('/api/exports'),
+  exportUrl: (id: string) => `/api/exports/by-id/${encodeURIComponent(id)}`,
+  revealExport: (id: string) =>
+    req<{ ok: boolean }>('/api/exports/reveal', { method: 'POST', body: JSON.stringify({ id }) }),
+  /** 原生文件夹选择框：返回空数组表示取消（非 Windows / 不可用时 501）。 */
+  pickExportDir: () =>
+    req<{ paths: string[]; cancelled: boolean }>('/api/dialog/export-dir', {
       method: 'POST',
-      body: JSON.stringify(body),
+      body: '{}',
     }),
-  listExports: () =>
-    req<{ name: string; path: string; size: number; mtime: number }[]>('/api/exports'),
-  exportUrl: (name: string) => `/api/exports/${encodeURIComponent(name)}`,
+
+  // ---------------------------------------------------------------- 场景预设
+  listPresets: () => req<ScenePreset[]>('/api/presets'),
+  createPreset: (body: {
+    project_id: string
+    media_id: string
+    name: string
+    note?: string
+    frame_time: number
+    params: Partial<AnalysisParams>
+    court_poly?: [number, number][] | null
+    fit?: Record<string, number | string>
+  }) => req<ScenePreset>('/api/presets', { method: 'POST', body: JSON.stringify(body) }),
+  patchPreset: (id: string, body: { name?: string; note?: string }) =>
+    req<ScenePreset>(`/api/presets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deletePreset: (id: string) => req<{ ok: boolean }>(`/api/presets/${id}`, { method: 'DELETE' }),
 
   // ---------------------------------------------------------------- 任务
   listJobs: () => req<JobInfo[]>('/api/jobs'),

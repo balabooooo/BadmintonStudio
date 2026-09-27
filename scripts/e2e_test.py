@@ -1,6 +1,6 @@
-"""端到端 API 冒烟测试：建工程 -> 导入 -> 分析 -> 自动剪辑 -> 导出。
+"""End-to-end API smoke test: create project -> import -> analyze -> auto-cut -> export.
 
-用法:
+Usage:
     python scripts/e2e_test.py "<video>" [--base http://127.0.0.1:8000] [--no-export]
 """
 

@@ -229,38 +229,43 @@ textarea {
 }
 
 /* ---------------------------------------------------------------- 表单 */
-input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 22px;
-  background: transparent;
-  cursor: pointer;
-  width: 100%;
-}
-input[type="range"]::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 999px;
-  background: rgb(255 255 255 / 0.12);
-}
-input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  margin-top: -5px;
-  border-radius: 50%;
-  background: var(--color-court-400);
-  border: 2px solid #0a0d12;
-  box-shadow: 0 0 0 1px rgb(22 201 138 / 0.5), 0 2px 8px rgb(0 0 0 / 0.6);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-input[type="range"]::-webkit-slider-thumb:hover {
-  transform: scale(1.18);
-  box-shadow: 0 0 0 4px rgb(22 201 138 / 0.2);
-}
-input[type="range"]:disabled::-webkit-slider-thumb {
-  background: var(--color-ink-500);
-  box-shadow: none;
+/* 放在 @layer base 里：这层样式是「无层」时优先级高于 Tailwind 的 utilities，
+   `width:100%` 会把 Player 音量条、时间线缩放条的 w-[..] 全部撑满，控件宽度
+   就不再受组件控制。放进 base 层后 utilities 才能覆盖它。 */
+@layer base {
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 22px;
+    background: transparent;
+    cursor: pointer;
+    width: 100%;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 999px;
+    background: rgb(255 255 255 / 0.12);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -5px;
+    border-radius: 50%;
+    background: var(--color-court-400);
+    border: 2px solid #0a0d12;
+    box-shadow: 0 0 0 1px rgb(22 201 138 / 0.5), 0 2px 8px rgb(0 0 0 / 0.6);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  input[type="range"]::-webkit-slider-thumb:hover {
+    transform: scale(1.18);
+    box-shadow: 0 0 0 4px rgb(22 201 138 / 0.2);
+  }
+  input[type="range"]:disabled::-webkit-slider-thumb {
+    background: var(--color-ink-500);
+    box-shadow: none;
+  }
 }
 
 .field {
@@ -280,6 +285,17 @@ input[type="range"]:disabled::-webkit-slider-thumb {
 }
 .field::placeholder {
   color: var(--color-ink-500);
+}
+
+/* 原生下拉在深色主题里默认弹白色浮层，导致选项文字看不清；
+   color-scheme + option 背景把弹层也压成深色。 */
+select.field {
+  color-scheme: dark;
+  cursor: pointer;
+}
+select.field option {
+  background-color: var(--color-ink-850);
+  color: var(--color-ink-100);
 }
 
 /* ---------------------------------------------------------------- 时间线 */

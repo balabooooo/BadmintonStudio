@@ -1,6 +1,6 @@
-"""验证脚本：音频击球检测 + 回合聚类。
+"""Verification script: audio hit detection + rally clustering.
 
-用法:
+Usage:
     python scripts/test_audio.py "<video path>" [--from 0] [--to 300]
 """
 
@@ -73,7 +73,7 @@ def main() -> int:
     if len(clusters) > 60:
         print(f"      ... 其余 {len(clusters) - 60} 个省略")
 
-    # 导出包络让前端/人工核对
+    # Export the envelope so the frontend / a human can verify it
     out_npz = CACHE_DIR / "_test_audio_signal.npz"
     np.savez_compressed(out_npz, env=det.envelope, thr=det.threshold, fps=det.env_fps,
                         hits=det.times + args.start, strength=det.strength, conf=det.confidence)

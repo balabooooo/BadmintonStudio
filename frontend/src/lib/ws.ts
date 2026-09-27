@@ -1,6 +1,7 @@
 /** WebSocket 客户端：断线自动重连 + 订阅分发。 */
 
 import type { JobInfo } from './types'
+import { getLang } from '../i18n'
 
 export type WsMessage =
   | { type: 'hello'; version: string }
@@ -23,7 +24,7 @@ class WsClient {
   connect() {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const url = `${proto}://${location.host}/ws`
+    const url = `${proto}://${location.host}/ws?lang=${encodeURIComponent(getLang())}`
     try {
       this.ws = new WebSocket(url)
     } catch {
@@ -61,6 +62,31 @@ class WsClient {
         /* ignore */
       }
     }
+  }
+
+  /** 语言切换后重新建立连接，让 URL 带上新的 lang 参数。 */
+  reconnect() {
+    const old = this.ws
+    this.ws = null
+    if (old) {
+      old.onclose = null
+      old.onerror = null
+      try {
+        old.close()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (this.timer) {
+      window.clearTimeout(this.timer)
+      this.timer = null
+    }
+    if (this.pingTimer) {
+      window.clearInterval(this.pingTimer)
+      this.pingTimer = null
+    }
+    this.retry = 0
+    this.connect()
   }
 
   private scheduleReconnect() {

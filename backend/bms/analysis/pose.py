@@ -1,33 +1,35 @@
-"""姿态辅助：从球员框里提关键点，做出「挥拍」这一路信号。
+"""Pose assistance: extract keypoints from player boxes to produce the "swing" signal.
 
-为什么需要它
-------------
-多球场球馆里音频击球是不可信的（实测 30 分钟素材 ``audio_reliability = 0.04``）：
-隔壁场地的击球声把「击球序列」填得很密，于是
+Why it is needed
+----------------
+In a multi-court gym, audio hits are unreliable (measured on 30 minutes of footage: ``audio_reliability = 0.04``):
+hit sounds from the neighboring court fill the "hit sequence" densely, therefore
 
-* :func:`bms.analysis.rally.split_by_hit_gaps` 找不到空档，切不开该切的；
-* :func:`bms.analysis.rally.refine_with_hits` 判不出「最后一拍之后没人打球了」，
-  不敢把终点收紧。
+* :func:`bms.analysis.rally.split_by_hit_gaps` cannot find gaps and fails to split what should be split;
+* :func:`bms.analysis.rally.refine_with_hits` cannot tell that "no one is playing after the last shot",
+  and dares not tighten the end point.
 
-实测结果就是 0~48.6 秒仍然被粘成一条「回合」。**音频本身提供不了「这一拍是不是
-我们打的」这个信息**，而姿态可以：我们的球员只在真的击球时会挥拍，隔壁场地的
-击球声在我们的画面上没有任何对应的动作。
+The measured result is that 0~48.6 seconds still get glued into a single "rally". **Audio alone cannot
+provide the information of "whether this shot is ours"**, but pose can: our players only swing when they
+actually hit, and the neighboring court's hit sounds have no corresponding motion in our frames.
 
-设计上的两个关键选择
---------------------
-1. **不重新检测、不重新跟踪。** 直接复用 ``PlayerSignal.frame_boxes``
-   （已经跟踪好、也已经挑出比赛球员）。既省一半算力，更重要的是避免了
-   「两套跟踪结果对不上」这类最难查的 bug。
-2. **把框裁出来放大再送姿态模型。** 实测素材里球员只有约 100 像素高，
-   整帧直接跑关键点会飘（腕、肘先丢）；裁成正方形窗放大到 192 之后关键点
-   稳定可用，而且顺带把隔壁场地的人挡在窗外。
-   窗口要**往上偏**并留出余量 —— 头顶击球时手腕会跑到框外。
+Two key design choices
+----------------------
+1. **Do not re-detect, do not re-track.** Directly reuse ``PlayerSignal.frame_boxes``
+   (already tracked and already filtered to match players). This saves half the compute and, more
+   importantly, avoids the hardest-to-debug bugs like "two tracking results disagree".
+2. **Crop the box, upscale it, then feed it to the pose model.** In the measured footage players are
+   only about 100 pixels tall, and running keypoints on the full frame is unstable (wrists and elbows
+   are lost first); after cropping to a square window and upscaling to 192, the keypoints become stably
+   usable, and it also conveniently keeps people from the neighboring court out of the window.
+   The window must be shifted **upward** with some margin — the wrist goes outside the box on an overhead hit.
 
-产出
-----
-:class:`PoseSignal` 里最重要的是 ``swing``：手腕**相对双肩中点**的位移速度
-除以身体高度。减掉双肩中点是为了去掉整体位移（球员跑动时手腕也会跟着动，
-那不是挥拍）；除以身体高度是为了和球员远近无关。
+Output
+------
+The most important part of :class:`PoseSignal` is ``swing``: the displacement speed of the wrist
+**relative to the midpoint of the two shoulders**, divided by body height. Subtracting the shoulder
+midpoint removes overall displacement (the wrist also moves when the player runs, which is not a swing);
+dividing by body height makes it independent of how near or far the player is.
 """
 
 from __future__ import annotations
@@ -40,37 +42,39 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ..i18n import tr
+
 EPS = 1e-9
 
-#: COCO 关键点序号
+#: COCO keypoint indices
 L_SHOULDER, R_SHOULDER = 5, 6
 L_WRIST, R_WRIST = 9, 10
 L_ANKLE, R_ANKLE = 15, 16
 
-#: 关键点置信度门限。低于它的关节视为「没测到」，不参与计算。
+#: Keypoint confidence threshold. Joints below it are treated as "not measured" and excluded from computation.
 KP_CONF = 0.35
 
 
-# ------------------------------------------------------------------ 数据结构
+# ------------------------------------------------------------------ Data structures
 
 
 @dataclass
 class PoseSignal:
-    """逐帧姿态信号（帧率与 ``PlayerSignal.frame_boxes`` 一致）。"""
+    """Per-frame pose signal (frame rate matches ``PlayerSignal.frame_boxes``)."""
 
     fps: float
     duration: float
-    #: 逐帧「挥拍强度」：手腕相对肩的位移速度 / 身体高度（单位：身体高/秒）
+    #: Per-frame "swing strength": wrist displacement speed relative to the shoulder / body height (unit: body-heights/second)
     swing: np.ndarray
-    #: 逐帧是否有可用姿态（0/1）
+    #: Whether a usable pose exists per frame (0/1)
     ok: np.ndarray
-    #: 逐帧挥拍手是否在肩线以上（0/1）—— 用来区分头顶球与下手球
+    #: Whether the swinging hand is above the shoulder line per frame (0/1) — used to distinguish overhead shots from underhand shots
     overhead: np.ndarray
-    #: 有可用姿态的帧占比
+    #: Fraction of frames with a usable pose
     coverage: float = 0.0
-    #: 挥拍强度的「静息水平」（用来判断某个峰够不够显著）
+    #: "Resting level" of swing strength (used to decide whether a peak is significant enough)
     quiet: float = 0.0
-    #: 诊断信息，直接进 stats 给用户看
+    #: Diagnostic info, fed directly into stats for the user
     trace: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -78,25 +82,26 @@ class PoseSignal:
         return int(self.swing.size)
 
 
-# ------------------------------------------------------------------ 裁剪
+# ------------------------------------------------------------------ Cropping
 
 
 def _crop_spec(box: tuple[float, float, float, float], w: int, h: int,
                margin: float, up_shift: float,
                normalized: bool = True) -> tuple[int, int, int, int]:
-    """由球员框算出正方形裁剪窗 ``(x0, y0, x1, y1)``（像素，已夹到画面内）。
+    """Compute a square crop window ``(x0, y0, x1, y1)`` (pixels, already clamped to the frame) from the player box.
 
-    ``PlayerSignal.frame_boxes`` 是**归一化**坐标（0~1），所以默认要按画面尺寸
-    还原成像素 —— 直接当像素用会得到一个 4×4 的窗口，姿态模型什么都检不出来。
+    ``PlayerSignal.frame_boxes`` uses **normalized** coordinates (0~1), so by default they must be
+    restored to pixels using the frame size — treating them directly as pixels yields a 4x4 window
+    and the pose model detects nothing.
     """
     x1, y1, x2, y2 = (float(v) for v in box[:4])
-    # 自适应兜底：即使调用方传的是像素坐标（画面内 x2/y2 必然 > 1），也不会算错
+    # Adaptive fallback: even if the caller passes pixel coordinates (x2/y2 within the frame are necessarily > 1), it will not miscalculate
     if normalized and max(abs(x1), abs(x2), abs(y1), abs(y2)) <= 1.5:
         x1, x2 = x1 * w, x2 * w
         y1, y2 = y1 * h, y2 * h
     bh = max(4.0, y2 - y1)
     cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0 - up_shift * bh          # 窗口整体上移
+    cy = (y1 + y2) / 2.0 - up_shift * bh          # shift the whole window upward
     side = bh * (1.0 + 2.0 * margin)
     a0 = int(round(cx - side / 2.0))
     b0 = int(round(cy - side / 2.0))
@@ -121,25 +126,27 @@ def analyze_pose(
     on_progress: Callable[[float, str], None] | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> PoseSignal | None:
-    """跑一遍姿态，返回 :class:`PoseSignal`；拿不到关键点时返回 ``None``。
+    """Run pose once and return :class:`PoseSignal`; return ``None`` when no keypoints are available.
 
     Args:
-        video_path: 视频路径（代理视频即可，球员框本来就来自它）。
-        frame_boxes: ``PlayerSignal.frame_boxes``，逐帧 ``(track_id, x1,y1,x2,y2)``
-            归一化坐标。
-        boxes_fps: ``frame_boxes`` 的帧率。
-        crop_size: 裁剪窗放大到的边长（正方形）。192 是实测的性价比点：
-            再小关键点开始丢，再大收益不明显而算力线性上升。
-        margin: 裁剪窗相对框高的外扩比例。
-        up_shift: 裁剪窗中心相对框中心上移的比例（头顶击球时手腕在框上方）。
-        smoothing: 挥拍信号的滑动平均时间（秒）。
-        cache_dir: 给了就把结果缓存成 npz（按视频/参数/权重哈希），
-            用户反复调切分参数时不必重跑姿态。
-        on_progress: ``callable(进度 0~1, 说明)``。
-        cancel: ``callable() -> bool``。
+        video_path: video path (the proxy video is fine; the player boxes come from it anyway).
+        frame_boxes: ``PlayerSignal.frame_boxes``, per-frame ``(track_id, x1,y1,x2,y2)``
+            normalized coordinates.
+        boxes_fps: frame rate of ``frame_boxes``.
+        crop_size: side length the crop window is upscaled to (square). 192 is the measured
+            sweet spot: smaller and keypoints start dropping, larger gives little benefit while
+            compute rises linearly.
+        margin: outward expansion ratio of the crop window relative to box height.
+        up_shift: ratio by which the crop-window center is shifted up relative to the box center
+            (the wrist is above the box on an overhead hit).
+        smoothing: moving-average time of the swing signal (seconds).
+        cache_dir: if given, cache the result as npz (hashed by video/params/weights), so the user
+            does not have to re-run pose when repeatedly tuning segmentation parameters.
+        on_progress: ``callable(progress 0~1, description)``.
+        cancel: ``callable() -> bool``.
 
     Returns:
-        PoseSignal，或 ``None``（没有球员框 / 没有 GPU / 权重缺失 / 全片没检出姿态）。
+        PoseSignal, or ``None`` (no player boxes / no GPU / missing weights / no pose detected in the whole clip).
     """
     n = len(frame_boxes)
     if n == 0 or boxes_fps <= 0:
@@ -156,7 +163,7 @@ def analyze_pose(
         if cached is not None:
             cached.trace["cached"] = True
             if on_progress:
-                on_progress(1.0, "姿态（缓存）")
+                on_progress(1.0, tr("pose.cached"))
             return cached
 
     weights = _resolve_weights(model_name)
@@ -183,12 +190,12 @@ def analyze_pose(
     if not cap.isOpened():
         return None
     src_fps = float(cap.get(cv2.CAP_PROP_FPS) or boxes_fps) or boxes_fps
-    step = max(1e-6, boxes_fps / max(src_fps, 1e-6))    # 源帧 -> 采样帧的步长
+    step = max(1e-6, boxes_fps / max(src_fps, 1e-6))    # source-frame -> sampled-frame step
 
-    # 逐帧裁出来的小图按「批」送 GPU。单帧只有 2~4 个人，
-    # 一帧一送会让 GPU 空转（实测批处理能快 3 倍以上）。
+    # The per-frame cropped patches are sent to the GPU in "batches". A single frame has only
+    # 2~4 people, so sending one frame at a time leaves the GPU idle (batching measured over 3x faster).
     batch_patches: list[np.ndarray] = []
-    batch_slots: list[tuple[int, int]] = []             # (帧号, 该帧第几个人)
+    batch_slots: list[tuple[int, int]] = []             # (frame index, which person in that frame)
     kp_store: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
     def _flush() -> None:
@@ -217,12 +224,12 @@ def analyze_pose(
     kept = 0
     total = int(n)
     misses = 0
-    pos = np.full((n, 4), np.nan, dtype=np.float32)     # 双肩中点 x,y + 两只手腕 x,y
+    pos = np.full((n, 4), np.nan, dtype=np.float32)     # shoulder-midpoint x,y + both wrists x,y
     body = np.full(n, np.nan, dtype=np.float32)
     for i in range(n):
         if cancel and cancel():
             break
-        # 跳到该采样帧对应的源帧
+        # Skip to the source frame corresponding to this sampled frame
         target = int(round(i / max(step, 1e-6)))
         while read_idx < target:
             if not cap.grab():
@@ -231,9 +238,10 @@ def analyze_pose(
         ok_read, frame = cap.read()
         read_idx += 1
         if not ok_read or frame is None:
-            # 偶发解码失败不该让整段姿态作废，但连续失败就说明到片尾了。
-            # 注意：**不要**把 frame_boxes[i] 清空 —— 那是调用方的列表
-            # （PlayerSignal.frame_boxes），改它会污染调用方后续的使用。
+            # An occasional decode failure should not invalidate the whole pose pass, but
+            # consecutive failures mean we have reached the end of the clip.
+            # Note: do **not** clear frame_boxes[i] — that is the caller's list
+            # (PlayerSignal.frame_boxes), and modifying it would pollute the caller's later use.
             misses += 1
             if misses > 30:
                 break
@@ -256,19 +264,19 @@ def analyze_pose(
             patch = cv2.resize(patch, (crop_size, crop_size), interpolation=interp)
             batch_patches.append(patch)
             batch_slots.append((i, fi))
-            # 把裁剪窗的几何记在槽位边上：关键点要映射回画面坐标
+            # Record the crop-window geometry alongside the slot: keypoints must be mapped back to frame coordinates
             kp_store.setdefault(("spec", i, fi), (np.asarray([x0, y0], dtype=np.float32),
                                                   np.asarray([(x1 - x0) / crop_size], dtype=np.float32)))
             fi += 1
             if len(batch_patches) >= 32:
                 _flush()
         if (i % 60) == 0 and on_progress:
-            on_progress(min(0.99, i / max(total, 1)), "姿态分析")
+            on_progress(min(0.99, i / max(total, 1)), tr("pose.analyzing"))
     _flush()
     cap.release()
 
-    # ---- 关键点 -> 挥拍信号 ----
-    # 每帧把「该帧所有人里最快的那个手腕」作为这一帧的挥拍强度。
+    # ---- Keypoints -> swing signal ----
+    # For each frame, use the "fastest wrist among all people in that frame" as that frame's swing strength.
     for i in range(n):
         for fi in range(max_players_per_frame):
             key = (i, fi)
@@ -285,7 +293,7 @@ def analyze_pose(
             if len(sh) < 1:
                 continue
             mid = np.mean(np.asarray(sh, dtype=np.float64), axis=0)
-            # 身体高度：肩到踝。没有踝就退回「肩到画面下方」的粗估
+            # Body height: shoulder to ankle. Without ankles, fall back to a rough estimate of "shoulder to bottom of frame"
             ys = [kp[j, 1] for j in (L_ANKLE, R_ANKLE) if kc[j] > KP_CONF]
             if ys:
                 bh = float(max(ys)) - float(mid[1])
@@ -293,7 +301,7 @@ def analyze_pose(
                 bh = float(mid[1]) * 0.9
             if bh < 0.02 * h:
                 continue
-            # 取置信度更高的那只手腕
+            # Take the wrist with the higher confidence
             cand = [(kc[j], j) for j in (L_WRIST, R_WRIST) if kc[j] > KP_CONF]
             if not cand:
                 continue
@@ -308,7 +316,7 @@ def analyze_pose(
             if not np.isfinite(pos[i, 2]):
                 pos[i, 2], pos[i, 3] = px, py
             else:
-                # 同一帧有多个人：留「离肩更远的那个手腕」= 挥得更开的那个人
+                # Multiple people in the same frame: keep "the wrist farther from the shoulder" = the one swinging wider
                 d_old = np.hypot(pos[i, 2] - pos[i, 0], pos[i, 3] - pos[i, 1])
                 d_new = np.hypot(px - pos[i, 0], py - pos[i, 1])
                 if d_new > d_old:
@@ -321,7 +329,7 @@ def analyze_pose(
     if coverage < 0.05:
         return None
 
-    # 手腕相对肩的位移速度（画面高度归一），再除以身体高度
+    # Wrist displacement speed relative to the shoulder (normalized by frame height), then divided by body height
     rel = np.stack([pos[:, 2] - pos[:, 0], pos[:, 3] - pos[:, 1]], axis=1)
     good = np.isfinite(rel).all(axis=1)
     if good.sum() < 4:
@@ -331,14 +339,14 @@ def analyze_pose(
         rel[:, j] = np.interp(idx, idx[good], rel[good, j])
     d = np.hypot(np.diff(rel[:, 0]), np.diff(rel[:, 1]))
     d = np.concatenate([[0.0], d]) * boxes_fps
-    # 逐帧位移除以「该帧的身体高度」——近处的人身体高、位移也大，比值才是可比的
+    # Per-frame displacement divided by "that frame's body height" — a nearer person has a taller body and larger displacement, so only the ratio is comparable
     bh = np.where(np.isfinite(body) & (body > 1.0), body, np.nan)
     if np.isfinite(bh).sum() > 2:
         bh = np.interp(idx, idx[np.isfinite(bh)], bh[np.isfinite(bh)])
     else:
         bh = np.full(n, max(1.0, 0.2 * h), dtype=np.float64)
     swing = (d / np.maximum(bh, 1e-6)).astype(np.float32)
-    # 单帧跳变过大基本是关键点抖动，丢掉
+    # An excessively large single-frame jump is basically keypoint jitter, so drop it
     swing = np.clip(swing, 0.0, 6.0)
     win = max(1, int(round(smoothing * boxes_fps)))
     if win > 1:
@@ -360,11 +368,11 @@ def analyze_pose(
     if cache_path is not None:
         _save_cache(cache_path, sig)
     if on_progress:
-        on_progress(1.0, "姿态分析")
+        on_progress(1.0, tr("pose.analyzing"))
     return sig
 
 
-# ------------------------------------------------------------------ 击球归属
+# ------------------------------------------------------------------ Hit attribution
 
 
 def swing_peaks(
@@ -372,15 +380,16 @@ def swing_peaks(
     min_distance: float = 0.26,
     prominence_ratio: float = 0.35,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """在挥拍信号上找「挥拍瞬间」，返回 ``(峰所在帧下标, 显著度 0~1)``。
+    """Find "swing moments" on the swing signal; return ``(frame index of the peak, prominence 0~1)``.
 
-    为什么要找峰而不是直接取「窗口内的最大值」：对拉时每 1.0~1.5 秒就有一拍，
-    而击球时刻本身有 ±0.05 秒的精度。如果在 ±0.35 秒的窗口里取最大值，
-    这个窗口已经覆盖了半个拍间隔 —— **几乎每个击球附近都能找到一点手腕运动**，
-    证据分就失去了区分度（实测 p50 高达 0.72，门控等于没做）。
+    Why find peaks instead of directly taking "the maximum within a window": during a rally there is
+    a shot every 1.0~1.5 seconds, while the hit time itself has ±0.05 second precision. If you take
+    the maximum within a ±0.35 second window, that window already covers half a shot interval —
+    **some wrist motion can be found near almost every hit**, and the evidence score loses its
+    discriminative power (measured p50 as high as 0.72, the gating might as well not exist).
 
-    峰则把「挥拍」变成了稀疏事件：90 秒里只有几十个，而击球有一百多个，
-    于是「一个峰只能解释一个击球」这件事本身就成了最强的约束。
+    Peaks, by contrast, turn "swings" into sparse events: only a few dozen in 90 seconds, while there
+    are over a hundred hits, so "one peak can explain only one hit" becomes the strongest constraint.
     """
     if pose is None or pose.n < 8:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
@@ -406,14 +415,15 @@ def hit_swing_evidence(
     window: float = 0.30,
     one_to_one: bool = True,
 ) -> np.ndarray:
-    """每个音频击球在 ±``window`` 秒内匹配到的挥拍证据（0~1）。
+    """Swing evidence (0~1) matched by each audio hit within ±``window`` seconds.
 
-    ``one_to_one=True`` 时**一个挥拍峰只解释一个击球**：同一个峰附近若有多个
-    击球候选（同一声被重复检出、或者隔壁场地的声音恰好撞上），只保留离峰最近
-    （并列时取更强的）那个，其余判为 0。这条约束是这套门控有效的主要原因。
+    With ``one_to_one=True``, **one swing peak explains only one hit**: if there are multiple hit
+    candidates near the same peak (the same sound detected repeatedly, or a neighboring-court sound
+    happening to coincide), only the one closest to the peak is kept (on a tie, the stronger one),
+    and the rest are set to 0. This constraint is the main reason this gating works.
 
-    证据分还乘上一个「离峰多近」的权重：贴着峰的那一拍拿满分，
-    偏离 0.3 秒的只能拿一半。
+    The evidence score is further multiplied by a "how close to the peak" weight: the shot right at
+    the peak gets full marks, and one 0.3 seconds off gets only half.
     """
     if pose is None or times is None or len(times) == 0:
         return np.zeros(0, dtype=np.float32)
@@ -425,7 +435,7 @@ def hit_swing_evidence(
     order = np.argsort(peak_t)
     peak_t, prom = peak_t[order], prom[order]
 
-    # 每个击球先找最近的峰
+    # For each hit, first find the nearest peak
     pos = np.searchsorted(peak_t, np.asarray(times, dtype=np.float64))
     best_j = np.full(len(times), -1, dtype=np.int64)
     best_dt = np.full(len(times), np.inf, dtype=np.float64)
@@ -437,7 +447,7 @@ def hit_swing_evidence(
                     best_dt[k], best_j[k] = dt, j
     ok = (best_j >= 0) & (best_dt <= window)
     if one_to_one and np.any(ok):
-        # 同一个峰上的多个候选，只留最近的一个（并列时留强度更高的）
+        # For multiple candidates on the same peak, keep only the nearest one (on a tie, keep the stronger)
         strengths = (np.asarray(strengths, dtype=np.float64)
                      if strengths is not None and len(strengths) == len(times)
                      else np.zeros(len(times)))
@@ -445,13 +455,97 @@ def hit_swing_evidence(
             group = np.nonzero(ok & (best_j == j))[0]
             if group.size <= 1:
                 continue
-            key = best_dt[group] - 1e-3 * strengths[group]     # 近优先，其次强度
+            key = best_dt[group] - 1e-3 * strengths[group]     # proximity first, then strength
             keep = int(group[int(np.argmin(key))])
             for k in group:
                 if k != keep:
                     ok[k] = False
     ev[ok] = prom[best_j[ok]] * (1.0 - 0.5 * (best_dt[ok] / max(window, EPS)))
     return np.clip(ev, 0.0, 1.0).astype(np.float32)
+
+
+def local_strength_pct(times: np.ndarray, strength: np.ndarray,
+                       half_win: float = 15.0) -> np.ndarray:
+    """Local percentile of each hit's strength among hits within ±``half_win`` seconds.
+
+    AGC-robust "our court is nearer the mic" cue. On the measured multi-court footage this is the
+    most discriminative single feature (AUC 0.79 on clip2 vs pose evidence 0.54), because our hits
+    are consistently stronger than the neighboring court's.
+
+    One degenerate case is neutralized: when every hit in the neighborhood has (nearly) the same
+    strength — synthetic or heavily normalized audio — the cue carries no attribution information,
+    so it yields 0 and the composite gate degrades to pure pose evidence instead of letting the
+    strength branch rescue pose-less hits. An isolated hit (no local competition) keeps the legacy
+    neutral-high 1.0 so recall is preserved.
+    """
+    n = times.size
+    out = np.zeros(n, dtype=np.float32)
+    if n == 0:
+        return out
+    order = np.argsort(times)
+    ts, ss = times[order], strength[order]
+    for i in range(n):
+        lo = np.searchsorted(ts, ts[i] - half_win)
+        hi = np.searchsorted(ts, ts[i] + half_win, side="right")
+        nb = ss[lo:hi]
+        if nb.size <= 1:
+            out[order[i]] = 1.0 if nb.size else 0.5
+            continue
+        if float(nb.max() - nb.min()) < 1e-6:
+            continue
+        out[order[i]] = float(np.mean(nb <= ss[i]))
+    return out
+
+
+def composite_gate(
+    hits,
+    pose: PoseSignal | None,
+    threshold: float = 0.45,
+    w_pose: float = 1.0,
+    w_str: float = 0.6,
+    min_keep_ratio: float = 0.12,
+    max_keep_ratio: float = 0.97,
+    window: float = 0.35,
+    one_to_one: bool = True,
+    force: bool = False,
+):
+    """Composite hit attribution gate: pose swing evidence OR local strength percentile.
+
+    The two cues are complementary:
+    * pose evidence says "someone in our frame really swung at this moment";
+    * local strength percentile says "this sound is among the loudest in its neighborhood",
+      which on a fixed camera/mic setup means "our court, not the neighboring one".
+
+    Taking the max of the two (rather than the product) keeps recall high: a real hit that the pose
+    gate missed (occlusion, player too small) can still be rescued by its strength, and a real hit
+    that is soft (a drop shot) can still be rescued by a visible swing.
+    """
+    trace: dict[str, Any] = {}
+    if hits is None or hits.times.size == 0:
+        return None, trace
+    ev = np.zeros(hits.times.size, dtype=np.float32)
+    if pose is not None and pose.coverage >= 0.35:
+        ev = hit_swing_evidence(pose, hits.times, strengths=hits.strength,
+                                window=window, one_to_one=one_to_one)
+    sp = local_strength_pct(hits.times, hits.strength)
+    score = np.maximum(w_pose * ev, w_str * sp)
+    trace["evidence_p50"] = round(float(np.percentile(ev, 50)), 3)
+    trace["strength_p50"] = round(float(np.percentile(sp, 50)), 3)
+    if pose is not None:
+        trace["peaks"] = int(swing_peaks(pose)[0].size)
+    mask = score >= threshold
+    ratio = float(np.mean(mask)) if mask.size else 0.0
+    trace["keep_ratio"] = round(ratio, 3)
+    if ratio < min_keep_ratio or ratio > max_keep_ratio:
+        if not force:
+            trace["gate_skipped"] = tr(
+                "pose.gate_bad_ratio",
+                ratio=ratio, min_ratio=min_keep_ratio, max_ratio=max_keep_ratio)
+            return None, trace
+        trace["forced"] = True
+    trace["kept"] = int(np.count_nonzero(mask))
+    trace["dropped"] = int(mask.size - np.count_nonzero(mask))
+    return mask, trace
 
 
 def gate_hits(
@@ -461,43 +555,57 @@ def gate_hits(
     min_keep_ratio: float = 0.12,
     max_keep_ratio: float = 0.97,
     window: float = 0.35,
+    one_to_one: bool = True,
+    force: bool = False,
 ):
-    """按姿态证据把音频击球筛成「我们这场比赛打的」。
+    """Filter audio hits into "those hit in our match" based on pose evidence.
 
-    返回 ``(mask, trace)``：``mask`` 是布尔数组（True = 保留）。
+    Returns ``(mask, trace)``: ``mask`` is a boolean array (True = keep).
 
-    **它只在证据足够时动手**，任何一条不满足就原样放行 —— 姿态这条路本身也可能
-    失效（球员太小、严重遮挡、非比赛素材），而此时「照旧用全部击球」总比
-    「用一半击球把回合切碎」好：
+    **It only acts when there is enough evidence**; if any condition is not met it passes everything
+    through unchanged — the pose path itself can also fail (player too small, severe occlusion,
+    non-match footage), and in that case "use all hits as before" is always better than
+    "chop rallies apart with half the hits":
 
-    * 姿态覆盖率太低（< 0.35）→ 放行；
-    * 保留比例落在 [12%, 97%] 之外 → 说明门限完全没起作用（全留）或者
-      把大部分击球都判掉了（多半是姿态信号本身有问题）→ 放行。
+    * pose coverage too low (< 0.35) -> pass through;
+    * keep ratio outside [12%, 97%] -> means the threshold did nothing (kept all) or rejected most
+      hits (most likely the pose signal itself is problematic) -> pass through.
+
+    ``force=True`` overrides both guards (the user explicitly insists on filtering). The trace then
+    carries ``forced=True`` so the UI can show that the safety net was bypassed.
     """
     trace: dict[str, Any] = {}
     if hits is None or hits.times.size == 0 or pose is None:
         return None, trace
+    forced_guard = False
     if pose.coverage < 0.35:
-        trace["gate_skipped"] = f"姿态覆盖率仅 {pose.coverage:.2f}，未启用击球归属"
-        return None, trace
-    ev = hit_swing_evidence(pose, hits.times, strengths=hits.strength, window=window)
+        if not force:
+            trace["gate_skipped"] = tr("pose.gate_low_coverage", coverage=pose.coverage)
+            return None, trace
+        forced_guard = True
+    ev = hit_swing_evidence(pose, hits.times, strengths=hits.strength,
+                            window=window, one_to_one=one_to_one)
     mask = ev >= threshold
     ratio = float(np.mean(mask)) if mask.size else 0.0
     trace["evidence_p50"] = round(float(np.percentile(ev, 50)), 3)
     trace["peaks"] = int(swing_peaks(pose)[0].size)
     trace["keep_ratio"] = round(ratio, 3)
     if ratio < min_keep_ratio or ratio > max_keep_ratio:
-        trace["gate_skipped"] = (
-            f"保留比例 {ratio:.2f} 超出 [{min_keep_ratio:.2f}, {max_keep_ratio:.2f}]，"
-            "判定姿态证据不可用，本条未生效")
-        return None, trace
+        if not force:
+            trace["gate_skipped"] = tr(
+                "pose.gate_bad_ratio",
+                ratio=ratio, min_ratio=min_keep_ratio, max_ratio=max_keep_ratio)
+            return None, trace
+        forced_guard = True
+    if forced_guard:
+        trace["forced"] = True
     trace["kept"] = int(np.count_nonzero(mask))
     trace["dropped"] = int(mask.size - np.count_nonzero(mask))
     return mask, trace
 
 
 def filter_hits(hits, mask: np.ndarray):
-    """按 ``mask`` 过滤 :class:`~bms.analysis.audio_hits.HitDetection`。"""
+    """Filter :class:`~bms.analysis.audio_hits.HitDetection` by ``mask``."""
     if mask is None or hits is None or hits.times.size == 0:
         return hits
     from .audio_hits import HitDetection
@@ -513,15 +621,16 @@ def filter_hits(hits, mask: np.ndarray):
     )
 
 
-# ------------------------------------------------------------------ 缓存
+# ------------------------------------------------------------------ Cache
 
 
 def _boxes_signature(frame_boxes: list) -> str:
-    """给逐帧球员框算一个便宜的指纹，用来做缓存键。
+    """Compute a cheap fingerprint of the per-frame player boxes to use as a cache key.
 
-    必须带上它：姿态结果是从**球员框**裁出来的，换了尺寸筛选 / 机位之后框会变，
-    而视频没变。只按视频哈希的话会命中一份过期缓存，用户会看到「改了参数但
-    结果一点没变」这种最难查的问题。抽样就够 —— 每 37 帧取一帧。
+    It must be included: the pose result is cropped from the **player boxes**, so changing the size
+    filter / camera setup changes the boxes while the video stays the same. Hashing only by video
+    would hit a stale cache, causing users to see the hardest-to-debug problem of "changed parameters
+    but the result did not change at all". Sampling is enough — take one frame every 37 frames.
     """
     h = hashlib.sha1()
     n = len(frame_boxes)
@@ -582,7 +691,7 @@ def _save_cache(path: Path, sig: PoseSignal) -> None:
         pass
 
 
-# ------------------------------------------------------------------ 环境
+# ------------------------------------------------------------------ Environment
 
 
 def _data_paths() -> tuple[Path, Path]:
@@ -596,7 +705,7 @@ def _data_paths() -> tuple[Path, Path]:
 
 
 def default_cache_dir() -> Path | None:
-    """默认的姿态缓存目录（``data/cache/pose``）。"""
+    """Default pose cache directory (``data/cache/pose``)."""
     try:
         from ..config import CACHE_DIR  # type: ignore
 
@@ -606,7 +715,7 @@ def default_cache_dir() -> Path | None:
 
 
 def _resolve_weights(model_name: str) -> str | None:
-    """优先用仓库 ``models/`` 下的本地权重；没有就交给 ultralytics 自己下载。"""
+    """Prefer local weights under the repo's ``models/``; if absent, let ultralytics download them itself."""
     _, models_dir = _data_paths()
     p = Path(model_name)
     if p.is_absolute() and p.exists():

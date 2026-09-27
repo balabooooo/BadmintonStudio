@@ -1,11 +1,12 @@
-"""音频击球检测。
+"""Audio hit detection.
 
-羽毛球回合的本质是「一串球拍击球声」。球拍击球在中高频段（约 2–8 kHz）
-表现为极短（< 15 ms）的宽带瞬态，与场馆里的低频人声、环境噪声区分明显。
-本模块用「高频带谱通量 + 自适应阈值 + 峰值拾取」检测每一次触球，
-再按静音间隔聚类成回合。
+The essence of a badminton rally is "a string of racket hit sounds". Racket hits in the
+mid-high frequency band (about 2-8 kHz) appear as extremely short (< 15 ms) broadband
+transients, clearly distinguishable from the low-frequency voices and ambient noise in the
+venue. This module uses "high-band spectral flux + adaptive threshold + peak picking" to
+detect every touch, then clusters hits into rallies by silence gaps.
 
-只依赖 numpy / scipy / 标准库 wave，因此不需要 librosa / numba。
+It only depends on numpy / scipy / the standard-library wave, so librosa / numba are not needed.
 """
 
 from __future__ import annotations
@@ -18,31 +19,50 @@ import numpy as np
 from scipy import signal as sps
 from scipy.ndimage import maximum_filter1d, median_filter
 
-# ------------------------------------------------------------------ 常量
+from ..i18n import tr
 
-HOP = 64               # STFT 跳步（样点）@16k -> 4 ms
+# ------------------------------------------------------------------ Constants
+
+HOP = 64               # STFT hop (samples) @16k -> 4 ms
 NFFT = 512
-HIGH_BAND = (1800.0, 7800.0)   # 球拍击球的主能量带
-LOW_BAND = (80.0, 900.0)       # 人声 / 脚步 / 场馆噪声
-MIN_HIT_GAP = 0.055            # 两次独立击球最短间隔（秒）
+HIGH_BAND = (1800.0, 7800.0)   # main energy band of racket hits
+LOW_BAND = (80.0, 900.0)       # voices / footsteps / venue noise
+MIN_HIT_GAP = 0.055            # minimum gap between two independent hits (seconds)
 
 
 @dataclass
 class HitDetection:
-    times: np.ndarray                     # 击球时刻（秒）
-    strength: np.ndarray                  # 归一化强度 0~1
-    confidence: np.ndarray                # 击球置信度 0~1
-    envelope: np.ndarray                  # 击球响应包络（用于前端画波形）
-    env_fps: float                        # 包络每秒采样数
+    times: np.ndarray                     # hit times (seconds)
+    strength: np.ndarray                  # normalized strength 0~1
+    confidence: np.ndarray                # hit confidence 0~1
+    envelope: np.ndarray                  # hit response envelope (used by the frontend to draw the waveform)
+    env_fps: float                        # envelope samples per second
     threshold: np.ndarray = field(default_factory=lambda: np.zeros(0))
     noise_floor_db: float = -60.0
 
 
-# ------------------------------------------------------------------ 读音频
+@dataclass
+class HitEnvelope:
+    """Everything derivable from the WAV ahead of thresholding (the expensive STFT pass).
+
+    Holding this lets the annotation optimizer re-detect hits over a ``hit_sensitivity`` grid cheaply:
+    the threshold / peak-picking step is milliseconds, while the STFT is only computed once.
+    """
+
+    flux: np.ndarray
+    env_fps: float
+    env_smooth: np.ndarray
+    low_ds: np.ndarray
+    hi_env: np.ndarray
+    sr: int
+    noise_floor_db: float = -60.0
+
+
+# ------------------------------------------------------------------ Reading audio
 
 
 def load_wav_mono(path: str | Path) -> tuple[np.ndarray, int]:
-    """读取 PCM WAV 为 float32 单声道（用标准库，无需额外依赖）。"""
+    """Read a PCM WAV as float32 mono (using the standard library, no extra dependency)."""
     with wave.open(str(path), "rb") as w:
         sr = w.getframerate()
         n = w.getnframes()
@@ -56,13 +76,13 @@ def load_wav_mono(path: str | Path) -> tuple[np.ndarray, int]:
     elif sw == 1:
         data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
     else:
-        raise ValueError(f"不支持的位深: {sw * 8} bit")
+        raise ValueError(tr("analysis.audio.unsupported_bit_depth", bits=sw * 8))
     if ch > 1:
         data = data.reshape(-1, ch).mean(axis=1)
     return np.ascontiguousarray(data, dtype=np.float32), sr
 
 
-# ------------------------------------------------------------------ 检测
+# ------------------------------------------------------------------ Detection
 
 
 def _bandpass_env(x: np.ndarray, sr: int, lo: float, hi: float, smooth_ms: float = 8.0) -> np.ndarray:
@@ -83,23 +103,23 @@ def _spectral_flux(x: np.ndarray, sr: int, lo: float, hi: float) -> tuple[np.nda
     f, t, Z = sps.stft(x, fs=sr, nperseg=NFFT, noverlap=NFFT - HOP, window="hann", padded=False)
     mag = np.abs(Z)
     band = (f >= lo) & (f <= hi)
-    # 对频带内做能量加权，抑制窄带纯音
+    # Weight energy within the band to suppress narrow-band pure tones
     m = mag[band]
     flat = np.exp(np.mean(np.log(m + 1e-10), axis=0)) / (np.mean(m, axis=0) + 1e-10)
     d = np.diff(m, axis=1, prepend=m[:, :1])
     flux = np.maximum(d, 0).sum(axis=0)
-    flux = flux * (0.35 + 0.65 * np.clip(flat * 4.0, 0, 1))  # 越接近噪声型越像击球
+    flux = flux * (0.35 + 0.65 * np.clip(flat * 4.0, 0, 1))  # the closer to noise-like, the more it looks like a hit
     hop_s = HOP / sr
     return flux.astype(np.float32), flat.astype(np.float32), max(1, int(round(1.0 / hop_s)))
 
 
 def _adaptive_threshold(env: np.ndarray, fps: float, sensitivity: float) -> np.ndarray:
-    """基于长窗中位数 + 局部 MAD 的鲁棒自适应阈值。
+    """Robust adaptive threshold based on a long-window median + local MAD.
 
-    灵敏度映射到 k：
-      0.0 -> k≈6.2（只留最响亮的击球）
-      0.5 -> k≈4.4（默认）
-      1.0 -> k≈2.6（连轻挑也抓，代价是噪声变多）
+    Sensitivity maps to k:
+      0.0 -> k≈6.2 (keep only the loudest hits)
+      0.5 -> k≈4.4 (default)
+      1.0 -> k≈2.6 (catch even light touches, at the cost of more noise)
     """
     win = max(5, int(round(fps * 2.5)) | 1)
     med = median_filter(env, size=win, mode="nearest")
@@ -108,30 +128,46 @@ def _adaptive_threshold(env: np.ndarray, fps: float, sensitivity: float) -> np.n
     return med + k * (mad * 1.4826 + 1e-6)
 
 
-def detect_hits(
-    wav_path: str | Path,
-    sensitivity: float = 0.5,
-    max_hits: int = 60000,
-) -> HitDetection:
+def build_hit_envelope(wav_path: str | Path) -> HitEnvelope | None:
+    """Compute the expensive per-frame envelope once (STFT / band energies), before thresholding.
+
+    Returns ``None`` when the audio is too short to analyze, so callers can short-circuit.
+    """
     x, sr = load_wav_mono(wav_path)
     if x.size < sr // 4:
-        return HitDetection(
-            times=np.zeros(0), strength=np.zeros(0), confidence=np.zeros(0),
-            envelope=np.zeros(0), env_fps=1.0,
-        )
-
-    # 去直流 + 轻降噪
+        return None
+    # Remove DC + light denoising
     x = x - float(np.mean(x))
     sos_hp = sps.butter(2, 60.0 / (sr / 2), btype="highpass", output="sos")
     x = sps.sosfiltfilt(sos_hp, x)
-
-    flux, flatness, env_fps = _spectral_flux(x, sr, *HIGH_BAND)
+    flux, _flatness, env_fps = _spectral_flux(x, sr, *HIGH_BAND)
     env_smooth = maximum_filter1d(flux, size=3)
-    thr = _adaptive_threshold(env_smooth, env_fps, sensitivity)
-
-    # 低带能量：用于排除「人声喊叫 / 脚步 / 拖地」这类低频为主的伪触发
+    # Low-band energy: reject false triggers dominated by "shouts / footsteps / scraping"
     low_env = _bandpass_env(x, sr, *LOW_BAND, smooth_ms=60.0)
     low_ds = _resample_to(low_env, sr, env_fps)
+    # Raw high-band envelope for sub-frame onset refinement
+    hi_env = _bandpass_env(x, sr, *HIGH_BAND, smooth_ms=3.0)
+    return HitEnvelope(
+        flux=flux.astype(np.float32), env_fps=env_fps,
+        env_smooth=np.asarray(env_smooth, dtype=np.float32),
+        low_ds=np.asarray(low_ds, dtype=np.float32),
+        hi_env=hi_env, sr=sr,
+        noise_floor_db=float(20 * np.log10(np.median(np.abs(x)) + 1e-12)),
+    )
+
+
+def pick_hits(env: HitEnvelope, sensitivity: float = 0.5,
+              max_hits: int = 60000) -> HitDetection:
+    """Threshold / peak-pick a precomputed :class:`HitEnvelope` into hits (cheap, re-runnable)."""
+    env_smooth = env.env_smooth
+    env_fps = env.env_fps
+    thr = _adaptive_threshold(env_smooth, env_fps, sensitivity)
+    if env_smooth.size == 0:
+        return HitDetection(
+            times=np.zeros(0), strength=np.zeros(0), confidence=np.zeros(0),
+            envelope=env.flux, env_fps=env_fps, threshold=thr,
+            noise_floor_db=env.noise_floor_db,
+        )
 
     distance = max(1, int(round(MIN_HIT_GAP * env_fps)))
     peaks, props = sps.find_peaks(
@@ -140,13 +176,15 @@ def detect_hits(
     if peaks.size == 0:
         return HitDetection(
             times=np.zeros(0), strength=np.zeros(0), confidence=np.zeros(0),
-            envelope=flux, env_fps=env_fps, threshold=thr,
+            envelope=env.flux, env_fps=env_fps, threshold=thr,
+            noise_floor_db=env.noise_floor_db,
         )
 
     heights = props["peak_heights"]
-    # ---- 置信度：高频瞬态强度 vs 低频背景，以及尖锐度
-    lo_ref = np.percentile(low_ds, 60) + 1e-9
-    low_at = low_ds[np.clip(peaks, 0, low_ds.size - 1)]
+    # ---- Confidence: high-frequency transient strength vs low-frequency background, plus sharpness
+    low_ds = env.low_ds
+    lo_ref = np.percentile(low_ds, 60) + 1e-9 if low_ds.size else 1e-9
+    low_at = low_ds[np.clip(peaks, 0, low_ds.size - 1)] if low_ds.size else np.zeros(peaks.size)
     sharp = np.zeros(peaks.size, dtype=np.float32)
     w = max(1, int(round(0.02 * env_fps)))
     for i, p in enumerate(peaks):
@@ -156,18 +194,17 @@ def detect_hits(
         sharp[i] = float(env_smooth[p]) / base
     sharp_n = np.clip((sharp - 1.4) / 3.6, 0.0, 1.0)
     snr = np.clip(heights / (thr[peaks] + 1e-9), 0.0, 4.0) / 4.0
-    low_pen = np.clip(low_at / (lo_ref * 6.0), 0.0, 1.0)
+    low_pen = np.clip(low_at / (lo_ref * 6.0), 0.0, 1.0) if low_ds.size else np.zeros(peaks.size)
     conf = np.clip(0.45 * snr + 0.40 * sharp_n + 0.15 * (1.0 - low_pen), 0.0, 1.0).astype(np.float32)
 
-    # 强度归一（分位数，抗离群）
+    # Strength normalization (quantiles, outlier-resistant)
     h = heights.astype(np.float32)
     p5, p95 = np.percentile(h, 5), np.percentile(h, 97)
     strength = np.clip((h - p5) / max(p95 - p5, 1e-9), 0.0, 1.0).astype(np.float32)
 
-    # ---- 亚帧精修：向原始高频包络的上升沿对齐
-    hi_env = _bandpass_env(x, sr, *HIGH_BAND, smooth_ms=3.0)
+    # ---- Sub-frame refinement: align to the rising edge of the raw high-frequency envelope
     times = peaks.astype(np.float64) / env_fps
-    times = _refine_onsets(hi_env, sr, times)
+    times = _refine_onsets(env.hi_env, env.sr, times)
 
     order = np.argsort(times)
     times, strength, conf = times[order], strength[order], conf[order]
@@ -177,9 +214,23 @@ def detect_hits(
 
     return HitDetection(
         times=times, strength=strength, confidence=conf,
-        envelope=flux.astype(np.float32), env_fps=env_fps, threshold=thr.astype(np.float32),
-        noise_floor_db=float(20 * np.log10(np.median(np.abs(x)) + 1e-12)),
+        envelope=env.flux.astype(np.float32), env_fps=env_fps,
+        threshold=thr.astype(np.float32), noise_floor_db=env.noise_floor_db,
     )
+
+
+def detect_hits(
+    wav_path: str | Path,
+    sensitivity: float = 0.5,
+    max_hits: int = 60000,
+) -> HitDetection:
+    env = build_hit_envelope(wav_path)
+    if env is None:
+        return HitDetection(
+            times=np.zeros(0), strength=np.zeros(0), confidence=np.zeros(0),
+            envelope=np.zeros(0), env_fps=1.0,
+        )
+    return pick_hits(env, sensitivity=sensitivity, max_hits=max_hits)
 
 
 def _resample_to(env: np.ndarray, src_rate: float, dst_rate: float) -> np.ndarray:
@@ -191,7 +242,7 @@ def _resample_to(env: np.ndarray, src_rate: float, dst_rate: float) -> np.ndarra
 
 
 def _refine_onsets(env: np.ndarray, sr: int, times: np.ndarray) -> np.ndarray:
-    """把峰值时刻对齐到该瞬态的起始上升点。"""
+    """Align peak times to the initial rising point of that transient."""
     if times.size == 0:
         return times
     out = times.copy()
@@ -204,23 +255,23 @@ def _refine_onsets(env: np.ndarray, sr: int, times: np.ndarray) -> np.ndarray:
             continue
         seg = env[a:b]
         peak = int(np.argmax(seg)) + a
-        # 从峰值向前找局部极小 -> 视作起始
+        # Walk forward from the peak to find the local minimum -> treat as the onset
         j = peak
         floor = env[peak] * 0.18
         while j > a and env[j] > floor:
             j -= 1
         out[i] = j / sr
-    return np.maximum.accumulate(out)  # 保证单调
+    return np.maximum.accumulate(out)  # ensure monotonicity
 
 
-# ------------------------------------------------------------------ 回合聚类
+# ------------------------------------------------------------------ Rally clustering
 
 
 @dataclass
 class HitCluster:
     start: float
     end: float
-    hits: list[int]  # 索引
+    hits: list[int]  # indices
 
     @property
     def duration(self) -> float:
@@ -234,7 +285,7 @@ def cluster_rallies(
     min_hits: int = 2,
     max_seconds: float = 120.0,
 ) -> list[HitCluster]:
-    """把击球时刻按静音间隔聚类为回合候选。"""
+    """Cluster hit times into rally candidates by silence gaps."""
     t = det.times
     if t.size == 0:
         return []
@@ -261,7 +312,7 @@ def cluster_rallies(
 
 
 def _split_long(c: HitCluster, det: HitDetection, max_seconds: float, gap_seconds: float) -> list[HitCluster]:
-    """超长簇按内部最大间隔递归切分，避免把两个回合粘在一起。"""
+    """Recursively split over-long clusters at the largest internal gap, to avoid gluing two rallies together."""
     if c.duration <= max_seconds or len(c.hits) < 4:
         return [c]
     t = det.times
@@ -283,4 +334,5 @@ def _split_long(c: HitCluster, det: HitDetection, max_seconds: float, gap_second
     ]
 
 
-__all__ = ["HitDetection", "HitCluster", "load_wav_mono", "detect_hits", "cluster_rallies"]
+__all__ = ["HitDetection", "HitEnvelope", "HitCluster", "load_wav_mono", "build_hit_envelope",
+           "pick_hits", "detect_hits", "cluster_rallies"]

@@ -1,6 +1,6 @@
-"""把分析结果画成诊断图：信号、阈值、回合区间、评分。
+"""Plot analysis results as diagnostic charts: signals, thresholds, rally intervals, scores.
 
-用法:
+Usage:
     python scripts/plot_analysis.py [json] [--from 0] [--to 300] [--out x.png]
 """
 
@@ -102,7 +102,7 @@ def main() -> int:
         plt.colorbar(sc, ax=ax, pad=0.01, label="conf")
     ax.set_ylabel("hits"); ax.set_ylim(0, 1.05); ax.grid(alpha=0.2); ax.set_xlabel("seconds")
 
-    # 回合区间高亮 + 分数
+    # Highlight rally intervals + scores
     rallies = data.get("rallies", [])
     for ax in axes:
         for r in rallies:

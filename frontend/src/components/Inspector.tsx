@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Star, Eye, EyeOff, Plus, Check, Trash2, Scissors, Gauge, Timer, Target } from 'lucide-react'
+import { Activity, Star, Eye, EyeOff, Plus, Check, Trash2, Scissors, Gauge, Timer, Target, Mic } from 'lucide-react'
 import { cn, humanDuration, scoreColor, scoreGrade, tagColor, timecode } from '../lib/format'
 import { Badge, Button, ScoreBar, ScoreRing, SectionTitle, Segmented, Slider, Tooltip } from './ui'
-import { useStore } from '../store/useStore'
+import { useStore, WEIGHT_PRESETS_MAP, FILM_COVERED_RATIO, rallyFilmCoverage } from '../store/useStore'
+import { useT } from '../i18n/useT'
+import { tagLabel } from '../i18n/domain'
 
 /* ------------------------------------------------------------------ 信号图 */
 
 function SignalChart({ height = 92 }: { height?: number }) {
+  const tr = useT()
   const ref = useRef<HTMLCanvasElement>(null)
   const analysis = useStore((s) => s.currentAnalysis())
   const media = useStore((s) => s.currentMedia())
@@ -125,7 +128,7 @@ function SignalChart({ height = 92 }: { height?: number }) {
         }}
       />
       <div className="mt-1 flex items-center justify-between text-[10px] text-ink-500">
-        <span>AI 活跃度曲线（绿色区域为识别出的回合，颜色=评分）</span>
+        <span>{tr('inspector.signalChartCaption')}</span>
         <span className="mono">{timecode(dur, false)}</span>
       </div>
     </div>
@@ -134,30 +137,28 @@ function SignalChart({ height = 92 }: { height?: number }) {
 
 /* ------------------------------------------------------------------ 检查器 */
 
-const WEIGHT_LABEL: Record<string, string> = {
-  balanced: '均衡',
-  highlight: '精彩集锦',
-  long_rally: '多拍回合',
-  technique: '技术动作',
-  training: '训练复盘',
-}
-
 /** 把后端的模块状态字典翻译成一句人话。 */
-function traceLabel(trace: any, offText: string): string {
+function traceLabel(
+  trace: any,
+  offText: string,
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
   if (!trace || typeof trace !== 'object') return offText
-  if (trace.disabled) return '未启用'
-  if (trace.error) return '出错'
-  if (trace.skipped) return '已忽略'
-  if (typeof trace.tracks === 'number') return `${trace.tracks} 条轨迹`
-  if (typeof trace.count === 'number') return `${trace.count} 次击球`
-  if (Array.isArray(trace.active_ids)) return `${trace.active_ids.length} 个 ID`
-  return '已启用'
+  if (trace.disabled) return tr('inspector.trace.disabled')
+  if (trace.error) return tr('inspector.trace.error')
+  if (trace.skipped) return tr('inspector.trace.skipped')
+  if (typeof trace.tracks === 'number') return tr('inspector.trace.tracks', { n: trace.tracks })
+  if (typeof trace.count === 'number') return tr('inspector.trace.hits', { n: trace.count })
+  if (Array.isArray(trace.active_ids)) return tr('inspector.trace.activeIds', { n: trace.active_ids.length })
+  return tr('inspector.trace.enabled')
 }
 
 export default function Inspector() {
+  const tr = useT()
   const analysis = useStore((s) => s.currentAnalysis())
   const selectedRallyId = useStore((s) => s.selectedRallyId)
   const selectedClipId = useStore((s) => s.selectedClipId)
+  const mediaId = useStore((s) => s.mediaId)
   const patchRally = useStore((s) => s.patchRally)
   const addClip = useStore((s) => s.addClipFromRally)
   const project = useStore((s) => s.project)
@@ -186,11 +187,22 @@ export default function Inspector() {
     () => project?.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === selectedClipId) ?? null,
     [project, selectedClipId],
   )
-  /** 这个回合是不是已经在成片轨里了（一个回合只加入一次） */
-  const inFilm = useMemo(
-    () => (rally ? project?.timeline.tracks.some((t) => t.clips.some((c) => c.rally_id === rally.id)) ?? false : false),
-    [project, rally],
-  )
+  /** 这个回合在成片里是否已经被覆盖（与 RallyPanel 同口径：按原片时间范围算覆盖率） */
+  const inFilm = useMemo(() => {
+    if (!rally) return false
+    const clips = project?.timeline.tracks.flatMap((t) => t.clips) ?? []
+    return rallyFilmCoverage(clips, rally, mediaId ?? undefined).ratio >= FILM_COVERED_RATIO
+  }, [project, rally, mediaId])
+
+  const weightValue = analysis?.stats?.weights as string | undefined
+  const weightPreset = WEIGHT_PRESETS_MAP.find((w) => w.value === weightValue)
+  const weightLabel = weightPreset ? tr(weightPreset.labelKey) : weightValue || tr('weight.balanced.label')
+  const traceOffLabels = [tr('inspector.trace.off'), tr('inspector.trace.disabled')]
+
+  // 切换工程时解除页签锁定，让页签重新跟随选择走。
+  useEffect(() => {
+    pinnedTab.current = false
+  }, [project?.id])
 
   useEffect(() => {
     if (pinnedTab.current) return
@@ -206,13 +218,13 @@ export default function Inspector() {
           value={tab}
           onChange={pickTab}
           options={[
-            { value: 'rally', label: '回合' },
-            { value: 'clip', label: '片段' },
-            { value: 'info', label: '信号' },
+            { value: 'rally', label: tr('inspector.tab.rally') },
+            { value: 'clip', label: tr('inspector.tab.clip') },
+            { value: 'info', label: tr('inspector.tab.info') },
           ]}
         />
         <div className="mt-1.5 text-[10px] leading-relaxed text-ink-500">
-          页签不会因为你切换回合、片段而自动跳走。
+          {tr('inspector.tabsHint')}
         </div>
       </div>
 
@@ -223,14 +235,14 @@ export default function Inspector() {
               <div className="flex items-center gap-3">
                 <ScoreRing score={rally.scores.total} size={58} color={scoreColor(rally.scores.total)} label={scoreGrade(rally.scores.total)} />
                 <div className="min-w-0 flex-1">
-                  <div className="text-[14px] font-semibold text-white">回合 #{rally.index}</div>
+                  <div className="text-[14px] font-semibold text-white">{tr('inspector.rallyTitle', { index: rally.index })}</div>
                   <div className="mono mt-0.5 text-[11px] text-ink-400">
                     {timecode(rally.start, false)} → {timecode(rally.end, false)}
                   </div>
                   <div className="mt-1 flex flex-wrap gap-1">
                     {rally.tags.map((t) => (
                       <Badge key={t} color={tagColor(t)}>
-                        {t}
+                        {tagLabel(t)}
                       </Badge>
                     ))}
                   </div>
@@ -245,11 +257,11 @@ export default function Inspector() {
                   onClick={() => patchRally(rally.id, { starred: !rally.starred })}
                 >
                   <Star size={12} fill={rally.starred ? 'currentColor' : 'none'} />
-                  {rally.starred ? '已标记' : '标记'}
+                  {rally.starred ? tr('inspector.starred') : tr('inspector.star')}
                 </Button>
                 <Button variant="ghost" size="sm" className="flex-1" onClick={() => patchRally(rally.id, { keep: !rally.keep })}>
                   {rally.keep ? <Eye size={12} /> : <EyeOff size={12} />}
-                  {rally.keep ? '保留' : '已排除'}
+                  {rally.keep ? tr('inspector.keep') : tr('inspector.excluded')}
                 </Button>
                 <Tooltip
                   width={300}
@@ -257,19 +269,17 @@ export default function Inspector() {
                   content={
                     inFilm ? (
                       <span>
-                        <b className="text-court-300">这个回合已经在成片里了</b>
+                        <b className="text-court-300">{tr('inspector.alreadyInFilmTitle')}</b>
                         {'\n\n'}
-                        每个回合只加入一次，重复点不会再加一段。
-                        点一下会跳到成片里的那一段，想改长度就拖它的两端。
+                        {tr('inspector.alreadyInFilmDesc')}
                       </span>
                     ) : (
                       <span>
-                        <b className="text-court-300">加入成片</b>
+                        <b className="text-court-300">{tr('inspector.addToFilmTitle')}</b>
                         {'\n\n'}
-                        把这个回合按「剪辑区间」追加到下面的<b>成片轨</b>末尾。
-                        导出时输出的就是成片轨里的内容，所以「加入成片」= 决定这一段要不要出现在成片里。
+                        {tr('inspector.addToFilmDesc')}
                         {'\n\n'}
-                        只想先看看、不动成片的话，单击回合卡片或时间线上方的色块就行，那是纯定位预览。
+                        {tr('inspector.addToFilmDesc2')}
                       </span>
                     )
                   }
@@ -281,38 +291,33 @@ export default function Inspector() {
                     onClick={() => addClip(rally)}
                   >
                     {inFilm ? <Check size={12} /> : <Plus size={12} />}
-                    {inFilm ? '已在成片' : '加入成片'}
+                    {inFilm ? tr('inspector.inFilm') : tr('inspector.addToFilm')}
                   </Button>
                 </Tooltip>
               </div>
 
               <div>
                 <SectionTitle>
-                  评分构成
+                  {tr('inspector.scoreBreakdownTitle')}
                 </SectionTitle>
                 <div className="mb-1.5 text-[10.5px] leading-relaxed text-ink-500">
-                  鼠标移到每一项可看它是怎么算的
+                  {tr('inspector.scoreBreakdownHint')}
                 </div>
                 <div className="space-y-2.5">
                   {(
                     [
-                      ['长度', rally.scores.length,
-                        '看拍数与时长。\n用饱和曲线：8 拍和 20 拍差别很大，但 40 拍和 52 拍差别不大，\n避免「越长越占榜首」。'],
-                      ['强度', rally.scores.intensity,
-                        '看球员跑动速度、画面运动峰值、整体节奏，\n以及回合最后 1/3 的节奏（末段提速会加分）。'],
-                      ['技术', rally.scores.technique,
-                        '看球速、击球力度、羽毛球在画面中出现的持续性。\n没开羽毛球跟踪时这一项主要由击球力度决定。'],
-                      ['精彩', rally.scores.excitement,
-                        '长度 × 强度 × 末段提速 × 多拍的综合。\n做集锦时优先看这一项。'],
-                      ['画面', rally.scores.production,
-                        '看清晰度、镜头抖动、主体在画面里够不够大。\n画面太糊或主体太小的片段不值得留。'],
+                      ['weight.dim.length', rally.scores.length, tr('inspector.dim.lengthHint')],
+                      ['weight.dim.intensity', rally.scores.intensity, tr('inspector.dim.intensityHint')],
+                      ['weight.dim.technique', rally.scores.technique, tr('inspector.dim.techniqueHint')],
+                      ['weight.dim.excitement', rally.scores.excitement, tr('inspector.dim.excitementHint')],
+                      ['weight.dim.production', rally.scores.production, tr('inspector.dim.productionHint')],
                     ] as const
                   ).map(([k, v, hint]) => (
                     <Tooltip key={k} content={hint} side="left" width={280} block>
                       <div className="w-full cursor-help">
                         <div className="mb-1 flex justify-between text-[11px]">
                           <span className="text-ink-300 underline decoration-dotted decoration-ink-600 underline-offset-2">
-                            {k}
+                            {tr(k)}
                           </span>
                           <span className="mono" style={{ color: scoreColor(v) }}>
                             {v.toFixed(0)}
@@ -328,28 +333,31 @@ export default function Inspector() {
                   width={300}
                   content={
                     <span>
-                      总分 = 上面五项按当前评分口径加权求和，
-                      再乘一个「分析置信度」折扣。
+                      {tr('inspector.totalFormula1')}
                       {'\n\n'}
-                      置信度反映这一段的信号有多干净：球员跟踪稳、运动曲线清晰就高；
-                      来回都检不到人就低。想换算法就点左侧「评分口径」。
+                      {tr('inspector.totalFormula2')}
+                      {'\n\n'}
+                      {tr('inspector.totalFormula3')}
                     </span>
                   }
                 >
                   <div className="mt-2 cursor-help text-[10.5px] text-ink-500 underline decoration-dotted underline-offset-2">
-                    总分 {rally.scores.total.toFixed(1)} 是怎么来的 ⓘ
+                    {tr('inspector.totalHow', { score: rally.scores.total.toFixed(1) })}
                   </div>
                 </Tooltip>
               </div>
 
               <div>
-                <SectionTitle>客观数据</SectionTitle>
+                <SectionTitle>{tr('inspector.objectiveTitle')}</SectionTitle>
                 <div className="grid grid-cols-2 gap-1.5">
                   {[
-                    ['时长', `${rally.duration.toFixed(2)}s`, Timer],
-                    ['拍数', `${rally.features.shot_count}`, Target],
-                    ['节奏', `${rally.features.tempo.toFixed(2)}/s`, Gauge],
-                    ['置信度', `${(rally.features.confidence * 100).toFixed(0)}%`, Activity],
+                    [tr('inspector.metric.duration'), `${rally.duration.toFixed(2)}s`, Timer],
+                    [tr('inspector.metric.shots'), `${rally.features.shot_count}`, Target],
+                    [tr('inspector.metric.tempo'), `${rally.features.tempo.toFixed(2)}/s`, Gauge],
+                    [tr('inspector.metric.confidence'), `${(rally.features.confidence * 100).toFixed(0)}%`, Activity],
+                    ...(rally.features.speech_bonus > 0
+                      ? [[tr('inspector.metric.speechBonus'), tr('inspector.metric.speechBonusValue', { n: rally.features.speech_bonus, phrases: (rally.features.speech_phrases || []).join(tr('common.listSeparator')) }), Mic]]
+                      : []),
                   ].map(([k, v, Icon]: any) => (
                     <div key={k} className="panel-flat flex items-center gap-2 px-2.5 py-2">
                       <Icon size={13} className="text-ink-500" />
@@ -364,12 +372,12 @@ export default function Inspector() {
 
               {rally.shots.length > 0 && (
                 <div>
-                  <SectionTitle right={<span className="text-[10.5px] text-ink-500">点击定位</span>}>
-                    逐拍时间轴
+                  <SectionTitle right={<span className="text-[10.5px] text-ink-500">{tr('inspector.clickToSeek')}</span>}>
+                    {tr('inspector.shotTimelineTitle')}
                   </SectionTitle>
                   <div className="flex flex-wrap gap-1">
                     {rally.shots.map((s, i) => (
-                      <Tooltip key={i} content={`第 ${i + 1} 拍 · ${s.time.toFixed(2)}s · 置信 ${(s.confidence * 100).toFixed(0)}%`}>
+                      <Tooltip key={i} content={tr('inspector.shotTooltip', { n: i + 1, time: s.time.toFixed(2), conf: (s.confidence * 100).toFixed(0) })}>
                         <button
                           onClick={() => seek(s.time)}
                           className={cn(
@@ -381,51 +389,50 @@ export default function Inspector() {
                                 : 'bg-white/7 text-ink-300 hover:bg-white/14',
                           )}
                         >
-                          {i === 0 ? '发' : i === 1 ? '接' : i + 1}
+                          {i === 0 ? tr('inspector.serve') : i === 1 ? tr('inspector.receive') : i + 1}
                         </button>
                       </Tooltip>
                     ))}
                   </div>
                   <div className="mt-1.5 text-[10.5px] text-ink-500">
-                    发球 {rally.serve_time ? `${rally.serve_time.toFixed(2)}s` : '—'} · 接发球{' '}
-                    {rally.receive_time ? `${rally.receive_time.toFixed(2)}s` : '—'}
+                    {tr('inspector.serveTime', { time: rally.serve_time ? `${rally.serve_time.toFixed(2)}s` : '—' })} ·{' '}
+                    {tr('inspector.receiveTime', { time: rally.receive_time ? `${rally.receive_time.toFixed(2)}s` : '—' })}
                   </div>
                 </div>
               )}
 
               <div>
-                <SectionTitle>剪辑区间</SectionTitle>
+                <SectionTitle>{tr('inspector.clipRangeTitle')}</SectionTitle>
                 <div className="mb-1.5 text-[10.5px] leading-relaxed text-ink-500">
-                  这是从<b className="text-ink-300">原片</b>上裁下来的范围（原片时间）。
-                  用「按筛选自动剪辑」生成时间线时，用的就是这里的入点/出点。
+                  {tr('inspector.clipRangeHint1')}
                   <br />
-                  已经放进时间线的片段，请在下方的「片段」里调。
+                  {tr('inspector.clipRangeHint2')}
                 </div>
                 <div className="space-y-2">
                   <Slider
-                    label="入点"
+                    label={tr('inspector.inPoint')}
                     value={rally.clip_start}
                     min={0}
-                    max={Math.max(0.1, rally.end)}
+                    max={Math.max(0.1, rally.clip_end - 0.05)}
                     step={0.05}
-                    onChange={(v) => patchRally(rally.id, { clip_start: v })}
+                    onChange={(v) => patchRally(rally.id, { clip_start: Math.max(0, Math.min(v, rally.clip_end - 0.05)) })}
                     format={(v) => timecode(v, false)}
                   />
                   <Slider
-                    label="出点"
+                    label={tr('inspector.outPoint')}
                     value={rally.clip_end}
-                    min={Math.min(rally.start, rally.clip_start)}
+                    min={Math.max(0, rally.clip_start + 0.05)}
                     max={(analysis?.stats?.duration as number) ?? rally.clip_end + 30}
                     step={0.05}
-                    onChange={(v) => patchRally(rally.id, { clip_end: v })}
+                    onChange={(v) => patchRally(rally.id, { clip_end: Math.max(v, rally.clip_start + 0.05) })}
                     format={(v) => timecode(v, false)}
                   />
                   <div className="flex gap-1.5 pt-0.5">
                     {(
                       [
-                        ['紧', 0.2, 0.4, '去掉准备与收尾，只留干净的交锋'],
-                        ['标准', 0.8, 1.2, '保留一点发球准备与死球收尾'],
-                        ['宽松', 1.8, 2.6, '前后各多留一段，适合看节奏'],
+                        [tr('inspector.presetTight'), 0.2, 0.4, tr('inspector.presetTightHint')],
+                        [tr('inspector.presetStandard'), 0.8, 1.2, tr('inspector.presetStandardHint')],
+                        [tr('inspector.presetLoose'), 1.8, 2.6, tr('inspector.presetLooseHint')],
                       ] as const
                     ).map(([label, pre, post, hint]) => (
                       <Tooltip key={label} content={hint} width={220}>
@@ -450,19 +457,19 @@ export default function Inspector() {
               </div>
 
               <div>
-                <SectionTitle>备注</SectionTitle>
+                <SectionTitle>{tr('inspector.noteTitle')}</SectionTitle>
                 <textarea
                   value={rally.note}
                   onChange={(e) => patchRally(rally.id, { note: e.target.value })}
                   rows={2}
-                  placeholder="记录这一回合的战术观察…"
+                  placeholder={tr('inspector.notePlaceholder')}
                   className="field text-[12px]"
                 />
               </div>
             </div>
           ) : (
             <div className="px-2 py-10 text-center text-[12px] text-ink-500">
-              在左侧回合列表或时间线上点选一个回合
+              {tr('inspector.emptyRally')}
             </div>
           ))}
 
@@ -470,26 +477,25 @@ export default function Inspector() {
           (clip ? (
             <div className="space-y-4">
               <div className="rounded-xl border border-flux-400/25 bg-flux-400/[0.06] px-3 py-2.5">
-                <div className="text-[11.5px] font-medium text-flux-400">这是时间线上的一个片段</div>
+                <div className="text-[11.5px] font-medium text-flux-400">{tr('inspector.clipCardTitle')}</div>
                 <div className="mt-1 text-[10.5px] leading-relaxed text-ink-400">
-                  它引用原片的一段，并决定<b className="text-ink-200">在成片里出现在第几秒、有多长、多快</b>。
-                  改速度会改变它在时间线上占的长度（2× 就占一半），这是正常的。
+                  {tr('inspector.clipCardDesc1')}
                   <br />
-                  想改「取原片哪一段」请用上面的「回合 → 剪辑区间」。
+                  {tr('inspector.clipCardDesc2')}
                 </div>
               </div>
 
               <div>
-                <div className="text-[13.5px] font-semibold text-white">{clip.label || '片段'}</div>
+                <div className="text-[13.5px] font-semibold text-white">{clip.label || tr('inspector.tab.clip')}</div>
                 <div className="mono mt-0.5 text-[11px] text-ink-400">
-                  原片 {timecode(clip.src_in, false)} → {timecode(clip.src_out, false)}
+                  {tr('inspector.clipSource', { from: timecode(clip.src_in, false), to: timecode(clip.src_out, false) })}
                   {' · '}
-                  素材时长 {(clip.src_out - clip.src_in).toFixed(2)}s
+                  {tr('inspector.clipMaterialDuration', { duration: (clip.src_out - clip.src_in).toFixed(2) })}
                 </div>
                 <div className="mono mt-0.5 text-[11px] text-ink-500">
-                  成片位置 {timecode(clip.tl_start, false)} → {timecode(clip.tl_start + (clip.src_out - clip.src_in) / clip.speed, false)}
+                  {tr('inspector.clipTimelinePos', { from: timecode(clip.tl_start, false), to: timecode(clip.tl_start + (clip.src_out - clip.src_in) / clip.speed, false) })}
                   {' · '}
-                  占 {( (clip.src_out - clip.src_in) / clip.speed).toFixed(2)}s
+                  {tr('inspector.clipOccupies', { duration: ((clip.src_out - clip.src_in) / clip.speed).toFixed(2) })}
                 </div>
               </div>
 
@@ -505,17 +511,17 @@ export default function Inspector() {
                   }
                 >
                   <Scissors size={12} />
-                  分割
+                  {tr('inspector.split')}
                 </Button>
                 <Button variant="ghost" size="sm" className="flex-1" onClick={() => removeClip(clip.id)}>
                   <Trash2 size={12} className="text-rose-hot/80" />
-                  删除
+                  {tr('common.delete')}
                 </Button>
               </div>
 
               <div className="space-y-2.5">
                 <Slider
-                  label="播放速度"
+                  label={tr('inspector.playbackSpeed')}
                   value={clip.speed}
                   min={0.25}
                   max={4}
@@ -523,10 +529,10 @@ export default function Inspector() {
                   onStart={() => pushHistory()}
                   onChange={(v) => updateClip(clip.id, { speed: Number(v.toFixed(2)) }, false)}
                   format={(v) => `${v.toFixed(2)}×`}
-                  hint="改变速度会同时改变它在时间线上占的长度：2× 变一半，0.5× 变两倍"
+                  hint={tr('inspector.playbackSpeedHint')}
                 />
                 <Slider
-                  label="音量"
+                  label={tr('inspector.volume')}
                   value={clip.volume}
                   min={0}
                   max={2}
@@ -538,14 +544,14 @@ export default function Inspector() {
               </div>
 
               <div>
-                <div className="mb-1.5 text-[10.5px] text-ink-500">快捷变速</div>
+                <div className="mb-1.5 text-[10.5px] text-ink-500">{tr('inspector.speedPresets')}</div>
                 <div className="flex flex-wrap gap-1.5">
                   {[
-                    [0.35, '0.35× 超慢放'],
-                    [0.5, '0.5× 慢放'],
-                    [1, '原速'],
-                    [1.5, '1.5×'],
-                    [2, '2× 快放'],
+                    [0.35, tr('inspector.speed.superSlow')],
+                    [0.5, tr('inspector.speed.slow')],
+                    [1, tr('inspector.speed.normal')],
+                    [1.5, tr('inspector.speed.fast15')],
+                    [2, tr('inspector.speed.fast2')],
                   ].map(([s, label]) => (
                     <button
                       key={label as string}
@@ -562,47 +568,43 @@ export default function Inspector() {
                   ))}
                 </div>
                 <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
-                  想改位置直接在上方时间线里拖动片段即可，这里不再重复给一个「起点」输入框。
+                  {tr('inspector.dragHint')}
                 </div>
               </div>
             </div>
           ) : (
-            <div className="px-2 py-10 text-center text-[12px] text-ink-500">在时间线上点选一个片段</div>
+            <div className="px-2 py-10 text-center text-[12px] text-ink-500">{tr('inspector.emptyClip')}</div>
           ))}
 
         {tab === 'info' && (
           <div className="space-y-4">
             <div>
               <SectionTitle>
-                <Activity size={12} /> AI 活跃度曲线
+                <Activity size={12} /> {tr('inspector.signalChartTitle')}
               </SectionTitle>
               <SignalChart />
               <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
-                这是 AI 判断「现在有没有在打球」的综合曲线，由几路信号加权而成：
+                {tr('inspector.signalInfo1')}
                 <br />
-                <b className="text-ink-300">球员跑动</b>（最可靠）、
-                <b className="text-ink-300">画面运动</b>、
-                <b className="text-ink-300">击球声</b>、
-                <b className="text-ink-300">羽毛球出现</b>。
+                {tr('inspector.signalInfo2')}
                 <br />
-                每路信号会自己算可信度：比如杂音大的球馆里，击球声那一路会被自动压到接近 0，
-                改由球员跑动主导。
+                {tr('inspector.signalInfo3')}
                 <br />
-                绿色区域 = AI 切出来的回合，颜色深浅代表评分；点击可跳转。
+                {tr('inspector.signalInfo4')}
               </div>
             </div>
 
             <div>
-              <SectionTitle>这次分析用了什么</SectionTitle>
+              <SectionTitle>{tr('inspector.analysisInputsTitle')}</SectionTitle>
               <div className="space-y-1.5">
                 {[
-                  ['球员跑动', traceLabel(analysis?.stats?.player_trace, '关'),
-                    '球员检测与多目标跟踪'],
-                  ['击球声', traceLabel(analysis?.stats?.hit_trace, '关'),
-                    '球拍触球的中高频瞬态'],
-                  ['画面运动', '已启用', '帧间运动能量与场地热区'],
-                  ['羽毛球轨迹', traceLabel(analysis?.stats?.shuttle_trace, '未启用'),
-                    '默认关闭，长视频很慢'],
+                  [tr('inspector.signal.player'), traceLabel(analysis?.stats?.player_trace, tr('inspector.trace.off'), tr),
+                    tr('inspector.signal.playerDesc')],
+                  [tr('inspector.signal.hit'), traceLabel(analysis?.stats?.hit_trace, tr('inspector.trace.off'), tr),
+                    tr('inspector.signal.hitDesc')],
+                  [tr('inspector.signal.motion'), tr('common.enabled'), tr('inspector.signal.motionDesc')],
+                  [tr('inspector.signal.shuttle'), traceLabel(analysis?.stats?.shuttle_trace, tr('inspector.trace.disabled'), tr),
+                    tr('inspector.signal.shuttleDesc')],
                 ].map(([name, status, desc]) => (
                   <div key={name as string} className="panel-flat flex items-center gap-2 px-2.5 py-2">
                     <div className="min-w-0 flex-1">
@@ -612,7 +614,7 @@ export default function Inspector() {
                     <span
                       className={cn(
                         'shrink-0 rounded px-1.5 py-[2px] text-[10px]',
-                        String(status).includes('关') || String(status).includes('未启用')
+                        traceOffLabels.some((x) => String(status).includes(x))
                           ? 'bg-white/6 text-ink-400'
                           : 'bg-court-500/15 text-court-300',
                       )}
@@ -626,18 +628,18 @@ export default function Inspector() {
 
             {analysis?.stats && (
               <div>
-                <SectionTitle>分析统计</SectionTitle>
+                <SectionTitle>{tr('inspector.statsTitle')}</SectionTitle>
                 <div className="space-y-1.5 text-[11.5px]">
                   {[
-                    ['识别回合数', `${analysis.stats.count}`],
-                    ['有效时长', humanDuration(analysis.stats.active_duration || 0)],
-                    ['素材总长', humanDuration(analysis.stats.duration || 0)],
-                    ['有效占比', `${(((analysis.stats.active_duration || 0) / Math.max(1, analysis.stats.duration || 1)) * 100).toFixed(1)}%`],
-                    ['平均拍数', `${(analysis.stats.avg_shots || 0).toFixed(1)}`],
-                    ['最多拍数', `${analysis.stats.max_shots || 0}`],
-                    ['平均分', `${(analysis.stats.avg_score || 0).toFixed(1)}`],
-                    ['高分回合', `${analysis.stats.high_score_count || 0} (≥70)`],
-                    ['评分口径', WEIGHT_LABEL[analysis.stats.weights as string] || analysis.stats.weights || '均衡'],
+                    [tr('inspector.stat.rallyCount'), `${analysis.stats.count}`],
+                    [tr('inspector.stat.activeDuration'), humanDuration(analysis.stats.active_duration || 0)],
+                    [tr('inspector.stat.totalDuration'), humanDuration(analysis.stats.duration || 0)],
+                    [tr('inspector.stat.activeRatio'), `${(((analysis.stats.active_duration || 0) / Math.max(1, analysis.stats.duration || 1)) * 100).toFixed(1)}%`],
+                    [tr('inspector.stat.avgShots'), `${(analysis.stats.avg_shots || 0).toFixed(1)}`],
+                    [tr('inspector.stat.maxShots'), `${analysis.stats.max_shots || 0}`],
+                    [tr('inspector.stat.avgScore'), `${(analysis.stats.avg_score || 0).toFixed(1)}`],
+                    [tr('inspector.stat.highScore'), `${analysis.stats.high_score_count || 0}${tr('inspector.stat.highScoreSuffix')}`],
+                    [tr('inspector.stat.weights'), weightLabel],
                   ].map(([k, v]) => (
                     <div key={k as string} className="flex items-center justify-between gap-3">
                       <span className="text-ink-400">{k}</span>

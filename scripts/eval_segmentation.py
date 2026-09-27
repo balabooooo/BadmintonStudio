@@ -1,28 +1,31 @@
-"""用人工标注评估回合切分（离线，不需要重跑 AI）。
+"""Evaluate rally segmentation using manual annotations (offline, no need to rerun AI).
 
-这是 HANDOVER 第 8.6 节要的东西：先有一份人工标注，切分调参才有依据。
+This is what HANDOVER section 8.6 calls for: without a set of manual annotations
+there is no basis for tuning segmentation parameters.
 
-标注格式（``data/annotations/*.anno.json``）::
+Annotation format (``data/annotations/*.anno.json``)::
 
     {
       "duration": 1800.4, "fps": 30.0,
-      "focus": [0, 300],                 # 标注覆盖的时间窗（秒）
+      "focus": [0, 300],                 # time window covered by the annotation (seconds)
       "rallies": [{"start": 5.6, "end": 10.4}, ...]
     }
 
-分析结果用 ``data/projects/*.analysis.json``（含 signals/rallies/params）。
-脚本会：
+Analysis results use ``data/projects/*.analysis.json`` (containing signals/rallies/params).
+The script will:
 
-1. 把标注与分析结果都限制在 ``focus`` 时间窗内（标注只覆盖了一段素材时，
-   拿整段素材的回合去对比会低估精度）；
-2. 用 IoU 贪心匹配算 Precision / Recall / F1（默认 IoU ≥ 0.5）；
-3. 打印每个漏检（FN）/ 误检（FP）的时间位置，便于定位；
-4. ``--sweep`` 时在线扫 ``SegmentOptions``（静默段尺度），报告最优组合。
+1. Restrict both the annotations and the analysis results to the ``focus`` time window
+   (if the annotation only covers part of a clip, comparing against rallies from the
+   whole clip underestimates precision);
+2. Compute Precision / Recall / F1 with greedy IoU matching (default IoU >= 0.5);
+3. Print the time position of every missed (FN) / false (FP) detection for easier triage;
+4. With ``--sweep``, scan ``SegmentOptions`` (quiet-span scale) online and report the
+   best combination.
 
-跑法::
+Usage::
 
     .venv\\Scripts\\python.exe scripts\\eval_segmentation.py
-    .venv\\Scripts\\python.exe scripts\\eval_segmentation.py --json <分析json> --sweep
+    .venv\\Scripts\\python.exe scripts\\eval_segmentation.py --json <analysis json> --sweep
 """
 
 from __future__ import annotations
@@ -110,7 +113,7 @@ def _as_intervals(res: AnalysisResult, lo: float, hi: float) -> list[tuple[float
 
 
 def _post_process(intervals, hits, fused, params, method: str):
-    """镜像 run_analysis / resegment 的边界锚定与去重收尾。"""
+    """Mirror the boundary anchoring and dedup cleanup of run_analysis / resegment."""
     if hits is not None and hits.times.size:
         intervals = RA.refine_with_hits(
             intervals, hits,

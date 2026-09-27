@@ -1,15 +1,15 @@
-"""回合质量评分。
+"""Rally quality scoring.
 
-评分是「把客观特征映射到 0~100 的可解释分数」，不是黑箱。
-每个分项都由可读的公式给出，权重可通过界面上的预设切换。
+Scoring means "mapping objective features to an interpretable 0~100 score", not a black box.
+Each sub-score is given by a readable formula, and the weights can be switched via presets in the UI.
 
-分项
-----
-- **length 长度**：多拍、时长。
-- **intensity 强度**：球员移动速度、画面运动峰值、末段节奏。
-- **technique 技术含量**：球速、击球力度、是否有起跳。
-- **excitement 精彩度**：长度 + 强度 + 末段提速 + 杀球数量的综合。
-- **production 画面质量**：清晰度、抖动、主体是否够大（够清楚才值得用）。
+Sub-scores
+----------
+- **length**: number of shots, duration.
+- **intensity**: player movement speed, peak frame motion, late-rally tempo.
+- **technique**: shuttle speed, hit force, whether there is a jump.
+- **excitement**: combination of length + intensity + late-rally surge + number of smashes.
+- **production**: sharpness, shake, whether the subject is large enough (only clear enough footage is worth using).
 """
 
 from __future__ import annotations
@@ -31,38 +31,88 @@ class ScoreWeights:
     technique: float = 0.20
     excitement: float = 0.20
     production: float = 0.08
-    #: 长度分饱和阈值（拍数）
+    #: Saturation threshold for the length score (shot count)
     shot_saturate: float = 24.0
-    #: 时长饱和阈值（秒）
+    #: Saturation threshold for duration (seconds)
     dur_saturate: float = 22.0
+    #: Weight of the new "highlight" sub-score (smash / confrontation / late-rally variance).
+    #: 0 disables it (old behavior); positive values blend it into the total.
+    highlight: float = 0.0
 
 
 PRESETS: dict[str, ScoreWeights] = {
-    "balanced": ScoreWeights("balanced", "均衡"),
+    "balanced": ScoreWeights("balanced", "balanced"),
     "highlight": ScoreWeights(
-        "highlight", "精彩集锦",
+        "highlight", "highlight",
         length=0.16, intensity=0.34, technique=0.26, excitement=0.20, production=0.04,
         shot_saturate=18.0, dur_saturate=18.0,
     ),
+    "highlight_pro": ScoreWeights(
+        "highlight_pro", "highlight_pro",
+        length=0.10, intensity=0.22, technique=0.22, excitement=0.24, production=0.02,
+        highlight=0.20,
+        shot_saturate=14.0, dur_saturate=14.0,
+    ),
     "long_rally": ScoreWeights(
-        "long_rally", "多拍回合",
+        "long_rally", "long_rally",
         length=0.42, intensity=0.20, technique=0.14, excitement=0.18, production=0.06,
         shot_saturate=40.0, dur_saturate=35.0,
     ),
     "technique": ScoreWeights(
-        "technique", "技术动作",
+        "technique", "technique",
         length=0.14, intensity=0.18, technique=0.42, excitement=0.18, production=0.08,
         shot_saturate=20.0, dur_saturate=20.0,
     ),
     "training": ScoreWeights(
-        "training", "训练复盘",
+        "training", "training",
         length=0.30, intensity=0.26, technique=0.18, excitement=0.10, production=0.16,
         shot_saturate=30.0, dur_saturate=30.0,
     ),
 }
 
-#: 各特征在「全体回合」中的相对位置被换算成分位数分数，
-#: 这样同一批素材里的回合能互相比较（相对评分），而不是被绝对阈值卡死。
+#: Canonical rally tag codes. Stored in analysis JSON and used by the frontend for
+#: filtering; display names are translated in the UI (``tag.<code>``).
+TAG_ULTRA_LONG = "ultra_long_rally"
+TAG_MANY_SHOTS = "many_shots"
+TAG_FAST_TEMPO = "fast_tempo"
+TAG_LATE_ACCEL = "late_acceleration"
+TAG_HIGH_MOBILITY = "high_mobility"
+TAG_FAST_SHUTTLE = "fast_shuttle"
+TAG_LONG_RALLY = "long_rally"
+TAG_SHORT_RALLY = "short_rally"
+TAG_HIGH_SCORE = "high_score"
+TAG_LOW_CONFIDENCE = "low_confidence"
+TAG_HIGHLIGHT = "highlight"
+TAG_SMASH = "smash"
+TAG_CONFRONTATION = "confrontation"
+
+#: Legacy Chinese tag values (from older project files) -> canonical codes.
+TAG_LEGACY_MAP: dict[str, str] = {
+    "超长多拍": TAG_ULTRA_LONG,
+    "多拍": TAG_MANY_SHOTS,
+    "快节奏": TAG_FAST_TEMPO,
+    "末段提速": TAG_LATE_ACCEL,
+    "高强度跑动": TAG_HIGH_MOBILITY,
+    "高速球": TAG_FAST_SHUTTLE,
+    "长回合": TAG_LONG_RALLY,
+    "短回合": TAG_SHORT_RALLY,
+    "高分": TAG_HIGH_SCORE,
+    "低置信": TAG_LOW_CONFIDENCE,
+}
+
+
+def migrate_tags(tags: list[str] | None) -> list[str]:
+    """Map legacy Chinese tags to canonical codes, preserving order and uniqueness."""
+    out: list[str] = []
+    for t in tags or []:
+        code = TAG_LEGACY_MAP.get(t, t)
+        if code and code not in out:
+            out.append(code)
+    return out
+
+#: The relative position of each feature within "all rallies" is converted into a percentile score,
+#: so rallies from the same batch of footage can be compared with each other (relative scoring) instead
+#: of being pinned by absolute thresholds.
 _RELATIVE_FEATURES = {
     "duration": 1.0,
     "shot_count": 1.0,
@@ -82,7 +132,7 @@ _RELATIVE_FEATURES = {
 
 
 def _pct_rank(values: np.ndarray) -> np.ndarray:
-    """把一组数值映射到 0~1 的百分位（并列取平均）。"""
+    """Map a set of values to 0~1 percentiles (ties are averaged)."""
     n = values.size
     if n == 0:
         return values
@@ -91,7 +141,7 @@ def _pct_rank(values: np.ndarray) -> np.ndarray:
     order = np.argsort(values, kind="mergesort")
     ranks = np.empty(n, dtype=np.float32)
     ranks[order] = np.arange(n, dtype=np.float32)
-    # 并列平均
+    # Average over ties
     s = values[order]
     i = 0
     while i < n:
@@ -109,18 +159,18 @@ def score_rallies(
     weights: ScoreWeights | None = None,
     quality: list[dict[str, float]] | None = None,
 ) -> list[dict[str, float]]:
-    """对一批回合打分。
+    """Score a batch of rallies.
 
-    参数
-    ----
-    features : 每个回合的特征字典（来自 :func:`rally.attach_features`）
-    weights  : 评分权重预设
-    quality  : 每个回合的画面质量特征（sharpness / shake / subject_size），可选
+    Parameters
+    ----------
+    features : feature dict for each rally (from :func:`rally.attach_features`)
+    weights  : scoring weight preset
+    quality  : optional frame-quality features for each rally (sharpness / shake / subject_size)
 
-    返回
-    ----
-    与输入等长的评分字典列表，键为 ``total/length/intensity/technique/excitement/production``
-    以及 ``tags`` 所需的中间量。
+    Returns
+    -------
+    A list of score dicts as long as the input, with keys ``total/length/intensity/technique/excitement/production``
+    plus the intermediate quantities needed for ``tags``.
     """
     w = weights or PRESETS["balanced"]
     n = len(features)
@@ -145,12 +195,12 @@ def score_rallies(
     spres = col("shuttle_presence")
     conf = col("confidence", 0.5)
 
-    # --- 长度分：拍数与时长，用饱和曲线（不是线性，避免超长回合独占榜首）
+    # --- Length score: shot count and duration, using a saturation curve (not linear, so over-long rallies do not dominate the top)
     len_shots = 1.0 - np.exp(-shots / max(w.shot_saturate * 0.55, 1.0))
     len_dur = 1.0 - np.exp(-dur / max(w.dur_saturate * 0.55, 1.0))
     length = 100.0 * np.clip(0.62 * len_shots + 0.38 * len_dur, 0, 1)
 
-    # --- 强度分：球员速度为主，画面运动与末段节奏为辅
+    # --- Intensity score: player speed is primary, frame motion and late-rally tempo are secondary
     spd_ref = np.percentile(pspd_mean, 85) + EPS
     spd_score = np.clip(pspd_mean / spd_ref, 0, 1.2) / 1.2
     mpeak_score = np.clip(mpeak / (np.percentile(mpeak, 85) + EPS), 0, 1.2) / 1.2
@@ -162,7 +212,7 @@ def score_rallies(
         0.38 * spd_score + 0.22 * mpeak_score + 0.18 * tem_score + 0.22 * ft_score, 0, 1
     )
 
-    # --- 技术分：球速、击球力度、出现羽毛球的持续性
+    # --- Technique score: shuttle speed, hit force, continuity of shuttle presence
     s_ref = np.percentile(sspd, 85) + EPS
     s_score = np.clip(sspd / s_ref, 0, 1.2) / 1.2
     h_ref = np.percentile(hstr, 85) + EPS
@@ -175,7 +225,7 @@ def score_rallies(
     else:
         technique = 100.0 * np.clip(0.55 * h_score + 0.45 * p_score, 0, 1)
 
-    # --- 精彩度：长 + 猛 + 末段提速 + 杀球
+    # --- Excitement: long + fierce + late-rally surge + smashes
     length_surge = np.clip((shots - 6.0) / 14.0, 0, 1)
     finish_surge = np.clip((finish_tempo - np.percentile(finish_tempo, 50)) /
                            (np.percentile(finish_tempo, 90) - np.percentile(finish_tempo, 50) + EPS), 0, 1)
@@ -184,7 +234,18 @@ def score_rallies(
         0.20 * finish_surge + 0.20 * length_surge, 0, 1
     )
 
-    # --- 画面质量
+    # --- Highlight sub-score: smash count, confrontation streak, late-rally variance
+    smash = col("smash_proxy")
+    streak = col("confrontation_streak", 1.0)
+    tvar = col("tempo_variance")
+    smash_score = np.clip(smash / max(np.percentile(smash, 90), 1.0), 0, 1)
+    streak_score = np.clip(streak / max(np.percentile(streak, 90), 1.0), 0, 1)
+    tvar_score = np.clip(tvar / max(np.percentile(tvar, 90), 1.0), 0, 1)
+    highlight = 100.0 * np.clip(
+        0.40 * smash_score + 0.35 * streak_score + 0.25 * tvar_score, 0, 1
+    )
+
+    # --- Frame quality
     if quality and len(quality) == n:
         sharp = np.array([float(q.get("sharpness", 0.5)) for q in quality], dtype=np.float32)
         shake = np.array([float(q.get("shake", 0.5)) for q in quality], dtype=np.float32)
@@ -196,13 +257,18 @@ def score_rallies(
     else:
         production = np.full(n, 70.0, dtype=np.float32)
 
-    # --- 分析置信度作为总分的置信折扣
+    # --- Analysis confidence used as a confidence discount on the total score
     conf_adj = 0.75 + 0.25 * np.clip(conf, 0, 1)
 
     total = (
         w.length * length + w.intensity * intensity + w.technique * technique +
-        w.excitement * excitement + w.production * production
+        w.excitement * excitement + w.production * production + w.highlight * highlight
     ) * conf_adj
+
+    # --- Voice command bonus: rallies that hit shouts like "good shot" get a fixed extra score.
+    # This is an **absolute bonus** (not sub-score weighting), added after the confidence discount, with the total capped at 100.
+    # When it is 0 the result is exactly the same as with the feature disabled.
+    total = total + col("speech_bonus")
 
     out: list[dict[str, float]] = []
     for i in range(n):
@@ -215,6 +281,7 @@ def score_rallies(
             "technique": round(float(np.clip(technique[i], 0, 100)), 1),
             "excitement": round(float(np.clip(excitement[i], 0, 100)), 1),
             "production": round(float(np.clip(production[i], 0, 100)), 1),
+            "highlight": round(float(np.clip(highlight[i], 0, 100)), 1),
         })
         out[-1]["tags"] = tags  # type: ignore[assignment]
     return out
@@ -224,30 +291,40 @@ def _tags(f: dict[str, float], dur: float, shots: float, tempo: float, finish_te
           pspd_max: float, mpeak: float, total: float) -> list[str]:
     tags: list[str] = []
     if shots >= 20:
-        tags.append("超长多拍")
+        tags.append(TAG_ULTRA_LONG)
     elif shots >= 12:
-        tags.append("多拍")
+        tags.append(TAG_MANY_SHOTS)
     if tempo >= 1.5:
-        tags.append("快节奏")
+        tags.append(TAG_FAST_TEMPO)
     if finish_tempo >= 1.8 and shots >= 6:
-        tags.append("末段提速")
+        tags.append(TAG_LATE_ACCEL)
     if mpeak >= 0.72:
-        tags.append("高强度跑动")
+        tags.append(TAG_HIGH_MOBILITY)
     if f.get("shuttle_speed_p90", 0) > 0 and f.get("shuttle_speed_p90", 0) >= 0.55:
-        tags.append("高速球")
+        tags.append(TAG_FAST_SHUTTLE)
     if dur >= 25:
-        tags.append("长回合")
+        tags.append(TAG_LONG_RALLY)
     elif dur <= 5.5:
-        tags.append("短回合")
+        tags.append(TAG_SHORT_RALLY)
     if total >= 75:
-        tags.append("高分")
+        tags.append(TAG_HIGH_SCORE)
     if f.get("confidence", 1.0) < 0.35:
-        tags.append("低置信")
+        tags.append(TAG_LOW_CONFIDENCE)
+    if f.get("smash_proxy", 0) >= 2:
+        tags.append(TAG_SMASH)
+    if f.get("confrontation_streak", 1) >= 6:
+        tags.append(TAG_CONFRONTATION)
+    if total >= 70 and (f.get("smash_proxy", 0) >= 1 or f.get("confrontation_streak", 1) >= 4):
+        tags.append(TAG_HIGHLIGHT)
+    # Matched phrases are used directly as tags (e.g. "good shot"), so users can see at a glance where the bonus comes from
+    for p in f.get("speech_phrases") or []:
+        if isinstance(p, str) and p and p not in tags:
+            tags.append(p)
     return tags
 
 
 def derive_stats(features: list[dict[str, float]], scores: list[dict[str, float]]) -> dict[str, Any]:
-    """给整个分析结果生成汇总统计。"""
+    """Generate summary statistics for the whole analysis result."""
     if not features:
         return {"count": 0}
     dur = np.array([f.get("duration", 0.0) for f in features], dtype=np.float32)
@@ -273,7 +350,7 @@ def derive_stats(features: list[dict[str, float]], scores: list[dict[str, float]
 
 
 def auto_threshold(scores: list[dict[str, float]], keep_ratio: float = 0.4) -> float:
-    """按「保留比例」反推一个总分阈值，供「只保留前 40% 精彩回合」这类操作。"""
+    """Derive a total-score threshold from a "keep ratio", for operations like "keep only the top 40% rallies"."""
     if not scores:
         return 0.0
     tot = np.array([s["total"] for s in scores], dtype=np.float32)

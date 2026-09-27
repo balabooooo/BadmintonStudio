@@ -29,6 +29,10 @@ export interface RallyFeatures {
   closeness: number | null
   clutch: boolean
   confidence: number
+  /** 语音口令加分：命中配置短语后加在总分上的固定分（0 表示没命中） */
+  speech_bonus: number
+  /** 本回合命中的口令短语（最多 2 个） */
+  speech_phrases: string[]
 }
 
 export interface RallyScores {
@@ -91,10 +95,28 @@ export interface AnalysisParams {
   use_players: boolean
   /** 姿态辅助：给音频击球做「是不是我们这场比赛打的」归属判定 */
   use_pose: boolean
+  /** 击球归属门控阈值 0~1：越大越严格（剔除更多邻场击球声），即时可调 */
+  pose_gate_threshold: number
+  /** 挥拍峰能解释击球的时间窗（秒） */
+  pose_gate_window: number
+  /** 一次挥拍只能解释一次击球（去除恰好同期的邻场击球） */
+  pose_gate_one_to_one: boolean
+  /** 保留率超出安全区间时仍强制应用门控 */
+  pose_gate_force: boolean
   use_shuttle: boolean
   use_scoreboard: boolean
   shuttle_fps: number
   shuttle_budget_seconds: number
+  /** 语音口令加分：识别「好球」这类短口令并给命中回合加分 */
+  use_speech: boolean
+  /** 要检测的口令短语，最多 2 个、每个最多 3 字 */
+  speech_phrases: string[]
+  /** 每命中一个短语加多少分（总分封顶 100） */
+  speech_bonus_points: number
+  /** faster-whisper 模型规格：越大越准、越慢、下载越大 */
+  speech_model: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+  /** 近音容错：把「到球/倒球」这类听错也算命中「好球」（需要 pypinyin），并对回合区间做短窗复核提高召回 */
+  speech_fuzzy: boolean
   court_orientation: 'auto' | 'landscape' | 'portrait'
   /** 机位：auto = 自动识别 */
   viewpoint: Viewpoint
@@ -137,6 +159,12 @@ export interface AnnotationRally {
   source?: string
 }
 
+/** 击球级标注：t = 击球时刻（秒），ours = true 我方 / false 邻场 */
+export interface AnnotationHit {
+  t: number
+  ours: boolean
+}
+
 /** 自动切分草稿（当前分析结果的回合，用于半自动标注） */
 export interface AnnotationDraft {
   start: number
@@ -153,9 +181,27 @@ export interface AnnotationResponse {
   fps: number
   path: string
   rallies: AnnotationRally[]
+  hits: AnnotationHit[]
   focus: number[] | null
   note: string
   auto: AnnotationDraft[]
+  /** 音频包络（用于击球标注的波形显示） */
+  envelope: number[]
+  envelope_fps: number
+  /** 门控后的击球时刻（当前结果） */
+  hit_times: number[]
+  /** 门控前的原始击球时刻（用于重新标注/重门控） */
+  hit_times_raw: number[]
+}
+
+/** 击球归属门控的判定指标 */
+export interface HitMetric {
+  tp: number
+  fp: number
+  fn: number
+  precision: number
+  recall: number
+  f1: number
 }
 
 /** 一次参数评估的指标 */
@@ -169,6 +215,15 @@ export interface SegmentMetric {
   recall: number
   f1: number
   params: Record<string, number>
+  /** 有击球级标注时，该组参数下的击球归属指标 */
+  hit?: HitMetric
+}
+
+/** 分阶段搜索中单个阶段的结果 */
+export interface OptimizeStage {
+  search_fields: string[]
+  tried: number
+  best: SegmentMetric | null
 }
 
 export interface OptimizeResult {
@@ -180,6 +235,9 @@ export interface OptimizeResult {
   results: SegmentMetric[]
   tried: number
   search_fields: string[]
+  /** 分阶段搜索：segment / gate / sensitivity */
+  stages?: Record<string, OptimizeStage>
+  hit_label_count?: number
   suggest: Record<string, number>
 }
 
@@ -375,6 +433,8 @@ export interface JobInfo {
   id: string
   kind: string
   title: string
+  /** 该任务服务的素材 id（prepare 任务用），界面据此把进度贴到对应卡片 */
+  media_id?: string | null
   status: 'queued' | 'running' | 'done' | 'error' | 'cancelled'
   progress: number
   stage: string
@@ -383,6 +443,28 @@ export interface JobInfo {
   result: any
   created_at: number
   updated_at: number
+}
+
+/** 场景预设：一次标注/优化得到的切分参数 + 场地标定 + 保存时的预览帧。 */
+export interface ScenePreset {
+  id: string
+  name: string
+  note: string
+  created_at: number
+  source: {
+    project_id: string
+    project_name: string
+    media_id: string
+    media_name: string
+    frame_time: number
+  }
+  params: Partial<AnalysisParams>
+  court_poly: [number, number][] | null
+  aspect: number
+  /** 预览帧的绝对路径；用 api.assetUrl 取图 */
+  preview: string
+  /** 标定来源与拟合质量（标注优化写入），仅用于展示 */
+  fit?: Record<string, number | string>
 }
 
 export interface ExportPreset {
@@ -407,9 +489,31 @@ export interface EnvInfo {
   platform: string
   ffmpeg: string
   ffmpeg_error: string | null
+  /** 媒体探测链路：pyav / ffprobe / ffmpeg，以及各自的可用性 */
+  probe?: {
+    active: string
+    pyav?: boolean
+    pyav_error?: string | null
+    ffprobe?: string | null
+    ffmpeg?: string
+    error?: string
+  }
   caps: Record<string, boolean>
   gpu: { available: boolean; name?: string | null; torch?: string; capability?: number[] }
   data_dir: string
   models_dir: string
   cache_dir: string
+  /** 默认导出目录（data/exports），自定义导出时的初始值 */
+  export_dir: string
+}
+
+/** 导出记录条目（来自后端登记表，路径可能在任意自定义目录） */
+export interface ExportItem {
+  id: string
+  name: string
+  path: string
+  size: number
+  mtime: number
+  group?: string
+  mode?: 'merge' | 'separate'
 }

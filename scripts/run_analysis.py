@@ -1,6 +1,6 @@
-"""命令行跑完整分析流水线，便于不开界面时调参。
+"""Run the full analysis pipeline from the command line, handy for tuning without the UI.
 
-用法:
+Usage:
     python scripts/run_analysis.py "<video>" [--no-players] [--no-shuttle] [--weights balanced]
 """
 
@@ -21,6 +21,7 @@ from bms.analysis.pipeline import run_analysis  # noqa: E402
 from bms.config import ensure_dirs  # noqa: E402
 from bms.core.media import probe_media  # noqa: E402
 from bms.core.models import AnalysisParams  # noqa: E402
+from bms.logging_setup import setup_logging  # noqa: E402
 
 
 def main() -> int:
@@ -46,6 +47,7 @@ def main() -> int:
     args = ap.parse_args()
 
     ensure_dirs()
+    setup_logging()
     info = probe_media(args.video)
     if args.proxy:
         info.proxy_path = args.proxy
@@ -95,7 +97,7 @@ def main() -> int:
     w = res.signals.get("weights")
     print(f"融合权重 [players, motion, audio, shuttle, roi] = {w}")
 
-    # ---- 切分与机位诊断（这是「切得准不准」最该看的两块信息）
+    # ---- Segmentation and camera diagnostics (the two things most worth checking for segmentation accuracy)
     seg = (st or {}).get("segmentation") or {}
     print(f"\n切分: 方式={seg.get('method')}  模式={seg.get('mode')}  数量={seg.get('count')}"
           f"  球员检测覆盖={seg.get('player_coverage')}"

@@ -1,22 +1,32 @@
-"""工程持久化：每个工程一个 JSON 文件，放在 data/projects 下。
+"""Project persistence: one JSON file per project, stored under data/projects.
 
-选择 JSON 而不是数据库，是为了让工程文件可读、可手工修、可随素材一起备份。
+JSON was chosen over a database so project files stay readable, hand-editable, and easy to
+back up together with the media.
 
-分析结果单独存 ``<project>.<media>.analysis.json`` 边车文件：里面有几千点的
-信号曲线和上百个回合的逐拍信息，塞进主文件会让每次「改个评分区间」都写几十 MB。
-主文件只保留素材、时间线和界面状态。
+Analysis results are stored separately in a ``<project>.<media>.analysis.json`` sidecar file:
+it holds signal curves with thousands of points and per-shot information for hundreds of
+rallies, and packing it into the main file would make every "tweak a scoring range" write tens
+of MB. The main file keeps only media, timeline, and UI state.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
+from typing import Any, Callable
+
+from loguru import logger
+from pydantic import ValidationError
 
 from ..config import PROJECTS_DIR, ensure_dirs
+from ..i18n import tr
+from ..analysis.scoring import migrate_tags
 from .models import AnalysisResult, MediaInfo, Project, ProjectSummary, Timeline, Track, now_ms
 
 _lock = threading.RLock()
@@ -25,12 +35,14 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _safe_id(value: str) -> str:
-    """id 会被拼进文件路径，限制字符集以防读写删越出 PROJECTS_DIR。
+    """The id is concatenated into file paths; restrict the character set so reads/writes/deletes
+    cannot escape PROJECTS_DIR.
 
-    路由层也会校验并返回 400，这里是兜底（脚本/其它调用方也会走这些函数）。
+    The routing layer also validates and returns 400; this is the fallback (scripts and other
+    callers go through these functions too).
     """
     if not _ID_RE.fullmatch(value or ""):
-        raise ValueError(f"非法 id: {value!r}")
+        raise ValueError(tr("store.invalid_id", value=value))
     return value
 
 
@@ -43,9 +55,14 @@ def _analysis_path(project_id: str, media_id: str) -> Path:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
+    # Unique temp name + ``os.replace``: atomic, and two concurrent writers of the same path cannot
+    # clobber each other's half-written file (a fixed ``.tmp`` name could).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def list_projects() -> list[ProjectSummary]:
@@ -53,7 +70,7 @@ def list_projects() -> list[ProjectSummary]:
     out: list[ProjectSummary] = []
     for f in PROJECTS_DIR.glob("p_*.json"):
         if f.name.count(".") > 1:
-            continue  # 跳过边车文件
+            continue  # skip sidecar files
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             p = Project.model_validate(data)
@@ -83,10 +100,10 @@ def list_projects() -> list[ProjectSummary]:
     return out
 
 
-def create_project(name: str = "未命名工程") -> Project:
+def create_project(name: str | None = None) -> Project:
     ensure_dirs()
-    p = Project(name=name)
-    p.timeline = Timeline(tracks=[Track(name="视频轨 1", kind="video")])
+    p = Project(name=name or tr("project.untitled"))
+    p.timeline = Timeline(tracks=[Track(name=tr("timeline.track_default", n=1), kind="video")])
     save_project(p)
     return p
 
@@ -96,19 +113,53 @@ def load_project(project_id: str) -> Project | None:
     if not f.is_file():
         return None
     with _lock:
-        data = json.loads(f.read_text(encoding="utf-8"))
-    p = Project.model_validate(data)
-    # 载入边车分析结果
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            # A corrupt main file used to bubble up as a 500 on every route that touches the project;
+            # treat it as missing (routes already turn None into a 404) and leave a trace in the log.
+            logger.warning("project {} is corrupt ({}); treating as missing", project_id, e)
+            return None
+    try:
+        p = Project.model_validate(data)
+    except ValidationError as e:
+        logger.warning("project {} has an invalid schema ({}); treating as missing", project_id, e)
+        return None
+    # Load sidecar analysis results
     for m in p.media:
-        af = _analysis_path(project_id, m.id)
-        if af.is_file():
-            try:
-                p.analyses[m.id] = AnalysisResult.model_validate(
-                    json.loads(af.read_text(encoding="utf-8"))
-                )
-            except Exception:
+        try:
+            af = _analysis_path(project_id, m.id)
+            if not af.is_file():
                 continue
+            p.analyses[m.id] = AnalysisResult.model_validate(
+                json.loads(af.read_text(encoding="utf-8"))
+            )
+        except Exception as e:  # noqa: BLE001
+            # Never drop the whole project because one sidecar is damaged; log it so the loss is visible.
+            logger.warning("dropping unreadable analysis sidecar for media {}: {}", m.id, e)
+            continue
+    # Older projects stored Chinese tags; map them to canonical codes on load.
+    for a in p.analyses.values():
+        for r in a.rallies:
+            r.tags = migrate_tags(r.tags)
     return p
+
+
+def update_project(project_id: str, mutate: Callable[[Project], Any], *,
+                   write_analyses: bool = False) -> Project | None:
+    """Atomic read-modify-write: load, mutate, and save while holding the store lock.
+
+    Separate ``load_project`` + ``save_project`` calls take the lock individually, so two concurrent
+    requests can interleave and the later save silently overwrites the earlier one's changes. This
+    keeps the (reentrant) lock across the whole sequence. ``mutate`` must be fast and non-blocking.
+    """
+    with _lock:
+        p = load_project(project_id)
+        if p is None:
+            return None
+        mutate(p)
+        save_project(p, write_analyses=write_analyses)
+        return p
 
 
 def save_project(p: Project, write_analyses: bool = True) -> Project:
@@ -119,10 +170,13 @@ def save_project(p: Project, write_analyses: bool = True) -> Project:
             for mid, res in list(p.analyses.items()):
                 try:
                     _write_json(_analysis_path(p.id, mid), res.model_dump(mode="json"))
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    # A failed sidecar write used to vanish silently, so the analysis was lost with no
+                    # trace while the caller believed the save succeeded.
+                    logger.warning("failed to save analysis sidecar {}.{}: {}", p.id, mid, e)
                     continue
         payload = p.model_dump(mode="json")
-        payload["analyses"] = {}          # 分析结果走边车文件
+        payload["analyses"] = {}          # analysis results go to the sidecar file
         _write_json(_path(p.id), payload)
     return p
 
@@ -134,8 +188,8 @@ def save_analysis(project_id: str, media_id: str, res: AnalysisResult) -> None:
 
 
 def delete_analysis(project_id: str, media_id: str) -> None:
-    # 和写操作共用一把锁：Windows 上另一个线程正打开该文件时再删会抛
-    # PermissionError，删除与写入交错还可能丢掉边车文件。
+    # Share one lock with write operations: on Windows deleting a file while another thread has
+    # it open raises PermissionError, and interleaving deletes with writes can lose sidecar files.
     with _lock:
         _analysis_path(project_id, media_id).unlink(missing_ok=True)
 
@@ -160,7 +214,7 @@ def duplicate_project(project_id: str, new_name: str | None = None) -> Project |
         return None
     new = src.model_copy(deep=True)
     new.id = Project().id
-    new.name = new_name or f"{src.name} 副本"
+    new.name = new_name or tr("project.copy_name", name=src.name)
     new.created_at = now_ms()
     new.updated_at = now_ms()
     save_project(new)
@@ -168,11 +222,11 @@ def duplicate_project(project_id: str, new_name: str | None = None) -> Project |
 
 
 def touch_media(p: Project, media: MediaInfo) -> Project:
-    """把素材登记进工程（按路径去重），同时保留已有的派生路径。"""
+    """Register media into the project (deduplicated by path) while keeping existing derived paths."""
     for i, m in enumerate(p.media):
         if m.path == media.path:
             media.id = m.id
-            # 已有代理/音轨/封面就沿用，避免重复生成
+            # Reuse existing proxy/audio/poster to avoid regenerating them
             media.proxy_path = media.proxy_path or m.proxy_path
             media.proxy_fps = media.proxy_fps or m.proxy_fps
             media.proxy_width = media.proxy_width or m.proxy_width
@@ -183,4 +237,28 @@ def touch_media(p: Project, media: MediaInfo) -> Project:
             return save_project(p)
     p.media.append(media)
     return save_project(p)
+
+
+def clear_derived_paths(media: MediaInfo, targets: set[str]) -> bool:
+    """Drop derived-asset paths that no longer exist after a cache cleanup.
+
+    Projects keep ``proxy_path``/``audio_path``/``poster`` pointing into ``data/cache``. Removing
+    those files (cache clear) leaves the fields set but stale, so every consumer that only checks
+    "field is set" -- and the frontend ``ensurePrepare`` -- treats the asset as ready and hands a
+    missing path to cv2/ffmpeg. Clearing the fields makes regeneration and the fallback-to-source
+    paths kick in. Returns whether anything changed.
+    """
+    changed = False
+    if "proxies" in targets:
+        for attr in ("proxy_path", "proxy_fps", "proxy_width", "proxy_height"):
+            if getattr(media, attr) is not None:
+                setattr(media, attr, None)
+                changed = True
+    if "audio" in targets and media.audio_path is not None:
+        media.audio_path = None
+        changed = True
+    if "thumbs" in targets and media.poster is not None:
+        media.poster = None
+        changed = True
+    return changed
 

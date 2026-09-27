@@ -1,10 +1,10 @@
-"""为一段长视频建工程并只做「准备派生资源」（生成代理视频/音轨/封面）。
+"""Create a project for a long video and only do "prepare derived assets" (generate proxy video/audio/poster).
 
-长视频（4K 30 分钟级）这一步可能跑十几分钟，所以单独拆出来，
-之后反复调参做分析时就能复用缓存。
+For long videos (4K, 30-minute class) this step can take over ten minutes, so it is split out
+separately; afterwards, when repeatedly tuning parameters for analysis, the cache can be reused.
 
-用法:
-    python scripts/warmup.py "<video>" [--name 工程名] [--base http://127.0.0.1:8000]
+Usage:
+    python scripts/warmup.py "<video>" [--name project name] [--base http://127.0.0.1:8000]
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def main() -> int:
     if args.project:
         pid = args.project
     else:
-        # 复用同名工程，避免重复建
+        # Reuse a project with the same name to avoid creating duplicates
         for p in call("/api/projects"):
             if p["name"] == name:
                 pid = p["id"]

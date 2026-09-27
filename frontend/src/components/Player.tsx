@@ -1,6 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import {
   Play,
   Pause,
@@ -11,7 +10,6 @@ import {
   Volume2,
   VolumeX,
   Repeat,
-  Gauge,
   Sparkles,
   Maximize2,
   ListFilter,
@@ -19,10 +17,10 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn, scoreColor, timecode } from '../lib/format'
-import { Badge, Button, Tooltip } from './ui'
-import { filterRallies, useStore } from '../store/useStore'
-
-const SPEEDS = [0.25, 0.5, 1, 1.5, 2, 4]
+import type { Rally } from '../lib/types'
+import { Badge, Button, Progress, SpeedMenu, Tooltip } from './ui'
+import { DEFAULT_FILTER, orderedInScope, useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
 
 const COURT_COLORS: Record<string, string> = {
   green: '#4ade80',
@@ -55,6 +53,7 @@ function CourtOverlay({
   color: string
   label: string
 }) {
+  const tr = useT()
   const ref = useRef<HTMLDivElement>(null)
   const [box, setBox] = useState({ w: 0, h: 0 })
 
@@ -120,8 +119,8 @@ function CourtOverlay({
           />
         ))}
         <text x={px(polygon[0][0]) + 6} y={py(polygon[0][1]) - 8} fill={stroke} fontSize={11} opacity={0.95}>
-          AI 识别场地 · {label}
-          {polygon.length > 4 ? ` · ${polygon.length} 点` : ''}
+          {tr('player.courtOverlayLabel', { label })}
+          {polygon.length > 4 ? ` · ${tr('player.courtPointCount', { n: polygon.length })}` : ''}
         </text>
       </svg>
     </div>
@@ -129,17 +128,160 @@ function CourtOverlay({
 }
 
 
+/** 播放进度条：点击 / 拖动定位，方向键逐帧、Home/End 跳转。
+ *
+ * 值就是当前预览模式的时间轴时间（源片模式=原片时间、成片模式=成片时间），
+ * 与 Player 下面算出的 duration 同一套单位，所以这里不需要再做模式换算。
+ */
+function SeekBar({
+  value,
+  max,
+  onSeek,
+  onSeekingChange,
+  disabled,
+  className,
+}: {
+  value: number
+  max: number
+  onSeek: (t: number) => void
+  onSeekingChange: (v: boolean) => void
+  disabled?: boolean
+  className?: string
+}) {
+  const tr = useT()
+  const ref = useRef<HTMLDivElement>(null)
+  const [dragging, setDragging] = useState(false)
+  const [hover, setHover] = useState<{ left: number; t: number; width: number } | null>(null)
+
+  const metric = useCallback(
+    (clientX: number) => {
+      const el = ref.current
+      if (!el) return { t: 0, left: 0, width: 0 }
+      const r = el.getBoundingClientRect()
+      const w = Math.max(1, r.width)
+      const left = Math.max(0, Math.min(w, clientX - r.left))
+      return { t: max > 0 ? (left / w) * max : 0, left, width: w }
+    },
+    [max],
+  )
+
+  useEffect(() => {
+    if (!dragging) return
+    const move = (e: PointerEvent) => onSeek(metric(e.clientX).t)
+    const up = () => {
+      setDragging(false)
+      onSeekingChange(false)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+    document.body.classList.add('grabbing')
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      document.body.classList.remove('grabbing')
+    }
+  }, [dragging, metric, onSeek, onSeekingChange])
+
+  const pct = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0
+
+  return (
+    <div
+      ref={ref}
+      role="slider"
+      tabIndex={disabled ? -1 : 0}
+      aria-label={tr('player.seek')}
+      aria-valuemin={0}
+      aria-valuemax={Math.round(max) || 0}
+      aria-valuenow={Math.round(value) || 0}
+      aria-disabled={disabled}
+      title={tr('player.seekHint')}
+      onPointerDown={(e) => {
+        if (disabled || e.button !== 0) return
+        e.preventDefault()
+        ref.current?.focus()
+        onSeekingChange(true)
+        setDragging(true)
+        onSeek(metric(e.clientX).t)
+      }}
+      onMouseMove={(e) => {
+        if (disabled || max <= 0) return
+        const m = metric(e.clientX)
+        setHover({ left: m.left, t: m.t, width: m.width })
+      }}
+      onMouseLeave={() => setHover(null)}
+      onKeyDown={(e) => {
+        if (disabled || max <= 0) return
+        const fs = useStore.getState().frameStep()
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault()
+          onSeek(value - fs)
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault()
+          onSeek(value + fs)
+        } else if (e.key === 'Home') {
+          e.preventDefault()
+          onSeek(0)
+        } else if (e.key === 'End') {
+          e.preventDefault()
+          onSeek(max)
+        } else if (e.key === 'PageDown') {
+          e.preventDefault()
+          onSeek(value - 5)
+        } else if (e.key === 'PageUp') {
+          e.preventDefault()
+          onSeek(value + 5)
+        }
+      }}
+      className={cn(
+        'group/seek relative flex h-5 cursor-pointer touch-none items-center outline-none',
+        disabled && 'cursor-not-allowed opacity-50',
+        className,
+      )}
+    >
+      <div className="relative h-[5px] w-full overflow-hidden rounded-full bg-white/12">
+        <div
+          className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-court-500 to-court-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div
+        className="pointer-events-none absolute top-1/2 -translate-x-1/2 -translate-y-1/2"
+        style={{ left: `${pct}%` }}
+      >
+        <div
+          className={cn(
+            'h-3.5 w-3.5 rounded-full border-2 border-ink-950 bg-court-300 shadow-[0_0_0_1px_rgb(56_224_162/0.6)] transition-transform',
+            dragging ? 'scale-110' : 'group-hover/seek:scale-110',
+          )}
+        />
+      </div>
+      {hover && (
+        <div
+          className="pointer-events-none absolute -top-7 -translate-x-1/2 rounded-md border border-white/10 bg-ink-850/95 px-1.5 py-0.5 text-[10.5px] text-ink-100 shadow-lg"
+          style={{ left: Math.max(22, Math.min(hover.left, hover.width - 22)) }}
+        >
+          {timecode(hover.t, false)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Player() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const project = useStore((s) => s.project)
   const mediaId = useStore((s) => s.mediaId)
   const media = useStore((s) => s.currentMedia())
+  const proxyReady = !!media?.proxy_path
   const analysis = useStore((s) => s.currentAnalysis())
   const playing = useStore((s) => s.playing)
   const currentTime = useStore((s) => s.currentTime)
   const setPlaying = useStore((s) => s.setPlaying)
   const seek = useStore((s) => s.seek)
   const syncTime = useStore((s) => s.syncTime)
+  const setUserSeeking = useStore((s) => s.setUserSeeking)
   const previewMode = useStore((s) => s.previewMode)
   const setPreviewMode = useStore((s) => s.setPreviewMode)
   const selectedRallyId = useStore((s) => s.selectedRallyId)
@@ -149,12 +291,33 @@ export default function Player() {
   const previewFiltered = useStore((s) => s.previewFiltered)
   const setPreviewFiltered = useStore((s) => s.setPreviewFiltered)
   const filter = useStore((s) => s.filter)
+  const scope = useStore((s) => s.rallyScope)
+  const switchMediaAt = useStore((s) => s.switchMediaAt)
+  const nextFilteredTarget = useStore((s) => s.nextFilteredTarget)
   // AI 识别到的球场范围：可以叠在画面上，用来核对「它到底在看哪块场地」
   const calibration = analysis?.calibration ?? null
   const showCourt = useStore((s) => s.showCourtOverlay)
   const setShowCourtOverlay = useStore((s) => s.setShowCourtOverlay)
   const manualPoly = useStore((s) => s.currentCourtPoly())
   const setCourtEditorOpen = useStore((s) => s.setCourtEditorOpen)
+  const jobs = useStore((s) => s.jobs)
+  const tr = useT()
+
+  // 当前素材正在生成的预览副本任务（用于把静态占位换成真实进度条）
+  const prepareJob = useMemo(() => {
+    if (!mediaId) return null
+    return (
+      Object.values(jobs)
+        .filter(
+          (j) =>
+            j.kind === 'prepare' &&
+            j.media_id === mediaId &&
+            (j.status === 'running' || j.status === 'queued'),
+        )
+        .sort((a, b) => a.created_at - b.created_at)
+        .at(-1) ?? null
+    )
+  }, [jobs, mediaId])
 
   const [muted, setMuted] = useState(false)
   const [volume, setVolume] = useState(1)
@@ -162,7 +325,6 @@ export default function Player() {
   // 回合循环默认关：开着的时候一旦选中某个回合，播放就再也离不开它，
   // 用户会以为播放器坏了。需要反复看一个回合时再手动打开。
   const [loop, setLoop] = useState(false)
-  const [showSpeed, setShowSpeed] = useState(false)
   const [ready, setReady] = useState(false)
 
   const timeline = project?.timeline
@@ -170,6 +332,10 @@ export default function Player() {
     () => (timeline?.tracks?.[0]?.clips ?? []).slice().sort((a, b) => a.tl_start - b.tl_start),
     [timeline],
   )
+  // 帧率来源：成片模式用成片帧率，源片模式用代理帧率（代理最高 30fps）。
+  // 之前逐帧按钮直接读源片 fps，成片模式下读数是成片时间，帧号就对不上了。
+  const displayFps = previewMode === 'timeline' ? timeline?.fps || 30 : media?.proxy_fps || media?.fps || 30
+  const frameStep = 1 / displayFps
 
   /** 成片模式：把时间线时间映射回素材内时间。 */
   const mapTimeline = useCallback(
@@ -182,8 +348,9 @@ export default function Player() {
           return { src: c.src_in + (t - c.tl_start) * c.speed, clipIndex: i }
         }
       }
-      const last = clips[clips.length - 1]
-      return { src: last.src_out, clipIndex: clips.length - 1 }
+      // 落点不在任何片段里（成片首段之前 / 片段之间的空隙）：返回 null，
+      // 调用方据此「什么都不做」，而不是拿最后一段的出点当结果把画面跳到片尾。
+      return null
     },
     [clips],
   )
@@ -235,32 +402,24 @@ export default function Player() {
 
   const activeRally = selectedRally ?? rallyAtTime
 
-  /** 当前筛选出来的回合，按原片时间排出播放顺序 */
-  const filteredRallies = useMemo(() => {
-    const list = filterRallies(analysis?.rallies ?? [], filter)
-    return list.slice().sort((a, b) => a.start - b.start)
-  }, [analysis, filter])
-
-  const filteredIndex = useMemo(
-    () => filteredRallies.findIndex((r) => currentTime >= r.start && currentTime <= r.end),
-    [filteredRallies, currentTime],
+  /** 当前筛选出来的回合，按「素材顺序 → 素材内开始时间」排出播放顺序（跨素材队列） */
+  const filteredRallies = useMemo(
+    () => orderedInScope(project, scope, mediaId, filter),
+    [project, scope, mediaId, filter],
   )
 
-  /**
-   * 「只看筛选片段」的落点：不在任何筛选回合里（捡球、走动），
-   * 或者已经播到当前回合的尾巴，就跳到下一个筛选回合开头。
-   * 已经是最后一个了返回 'end'，让播放停下来。
-   */
-  const filteredTarget = useCallback(
-    (t: number): number | 'end' | null => {
-      if (!previewFiltered || !filteredRallies.length) return null
-      const cur = filteredRallies.find((r) => t >= r.start && t <= r.end)
-      const next = filteredRallies.find((r) => r.start > t + 0.02)
-      if (!cur) return next ? next.start : 'end'
-      if (t >= cur.end - 0.06) return next ? next.start : 'end'
-      return null
-    },
-    [previewFiltered, filteredRallies],
+  /** 范围内全部回合（未过筛选），用于上一/下一回合跨素材跳转 */
+  const scopeRallies = useMemo(
+    () => orderedInScope(project, scope, mediaId, DEFAULT_FILTER),
+    [project, scope, mediaId],
+  )
+
+  const filteredIndex = useMemo(
+    () =>
+      filteredRallies.findIndex(
+        (r) => r.media_id === mediaId && currentTime >= r.start && currentTime <= r.end,
+      ),
+    [filteredRallies, mediaId, currentTime],
   )
 
   // ------------------------------------------------ 同步 video 与状态
@@ -268,27 +427,39 @@ export default function Player() {
   // 若把 previewMode 也放进依赖，loadedmetadata 不再触发，遮罩会永远盖住画面。
   useEffect(() => {
     setReady(false)
-  }, [mediaId])
+    // 代理生成完成后要给 video 换成代理源：同一路径的内容变了，浏览器不一定会重新解，
+    // 所以这里把 proxy_path 也列入依赖，下面再用 key 强制重新挂载。
+  }, [mediaId, media?.proxy_path])
 
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
-    if (playing) v.play().catch(() => setPlaying(false))
-    else v.pause()
-  }, [playing, setPlaying, previewMode])
+    if (playing) {
+      // 换源 / 重挂载时 play() 可能被新的加载请求打断（AbortError），这不是用户想暂停，
+      // 忽略它；只有真正的自动播放限制才把 playing 复位。
+      v.play().catch((err: unknown) => {
+        if ((err as { name?: string } | null)?.name !== 'AbortError') setPlaying(false)
+      })
+    } else {
+      v.pause()
+    }
+    // proxyReady / mediaId：代理就绪或换素材时 video 会被 key 强制重挂，
+    // 重挂后要恢复播放状态，否则 store 里 playing=true 而画面是冻结的。
+  }, [playing, setPlaying, previewMode, proxyReady, mediaId])
 
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
     v.playbackRate = speed
-  }, [speed])
+    // 重挂载后新元素会丢掉这些属性，所以 proxyReady/mediaId 变化也要重设
+  }, [speed, proxyReady, mediaId])
 
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
     v.muted = muted
     v.volume = volume
-  }, [muted, volume])
+  }, [muted, volume, proxyReady, mediaId])
 
   // 播放头由 store 驱动 -> 若与 video 差异较大则校正
   useEffect(() => {
@@ -297,7 +468,9 @@ export default function Player() {
     let target = currentTime
     if (previewMode === 'timeline') {
       const m = mapTimeline(currentTime)
-      target = m ? m.src : 0
+      // 播放头落在片段之外时没有对应的原片时间，直接别动 video
+      if (!m) return
+      target = m.src
     }
     // 暂停时的容差要小得多：逐帧按钮一次只走 1/30 秒，
     // 阈值给 0.34 的话点十几下画面都不动（只有播放头在走）。
@@ -317,12 +490,13 @@ export default function Player() {
     let t = v.currentTime
     if (previewMode === 'timeline') {
       // 素材时间 -> 时间线时间
+      let mapped: number | null = null
       for (const c of clips) {
         const dur = (c.src_out - c.src_in) / c.speed
         if (t >= c.src_in && t < c.src_out) {
-          t = c.tl_start + (t - c.src_in) / c.speed
+          mapped = c.tl_start + (t - c.src_in) / c.speed
           // 快进到片段末尾时跳到下一段
-          if (t >= c.tl_start + dur - 0.06 && playing) {
+          if (mapped >= c.tl_start + dur - 0.06 && playing) {
             const idx = clips.indexOf(c)
             const next = clips[idx + 1]
             if (next) {
@@ -330,25 +504,39 @@ export default function Player() {
               seek(next.tl_start)
               return
             }
+            // 最后一段：到头就停，别让原片时间继续往前跑进没剪进成片的素材
+            v.pause()
+            setPlaying(false)
+            seek(c.tl_start + dur)
+            return
           }
           break
         }
       }
-    } else if (previewFiltered && playing) {
+      // 落在片段之间的空隙 / 首段之前：不写回，免得把成片播放头换成原片时间
+      if (mapped === null) return
+      syncTime(mapped)
+      return
+    } else if (previewFiltered && playing && mediaId) {
       // 只看筛选片段：跳过空档。timeupdate 大约 4 次/秒，
       // 所以在回合末尾提前 60ms 就起跳，避免看到下一段捡球的画面。
-      const jump = filteredTarget(v.currentTime)
+      // 全部素材模式下，落点在别的素材时直接切换视频源并定位。
+      const jump = nextFilteredTarget(mediaId, v.currentTime)
       if (jump === 'end') {
         setPlaying(false)
         return
       }
       if (jump !== null) {
+        if (jump.media_id !== mediaId) {
+          switchMediaAt(jump.media_id, jump.start, jump.rally_id)
+          return
+        }
         try {
-          v.currentTime = jump
+          v.currentTime = jump.start
         } catch {
           /* ignore */
         }
-        seek(jump)
+        seek(jump.start)
         return
       }
     }
@@ -358,20 +546,31 @@ export default function Player() {
   }
 
   const jumpRally = (dir: 1 | -1) => {
-    if (!analysis?.rallies.length) return
-    const list = analysis.rallies
-    // 查找用原片时间：成片模式下 currentTime 是成片时间，不能直接和回合范围比
+    const list = scopeRallies
+    if (!list.length) return
+    const order = new Map((project?.media ?? []).map((m, i) => [m.id, i]))
+    const myIdx = mediaId ? order.get(mediaId) ?? 0 : 0
+    // 查找用原片时间：成片模式下 currentTime 是成片时间，不能直接和回合范围比。
+    // 全部素材模式下跨素材时，selectRally 会自动切源并定位（同素材才用 goToSource）。
     if (dir === 1) {
-      const nxt = list.find((r) => r.start > srcTime + 0.05)
+      const nxt = list.find((r) => {
+        const ri = order.get(r.media_id) ?? 0
+        return ri > myIdx || (ri === myIdx && r.start > srcTime + 0.05)
+      })
       if (nxt) {
         selectRally(nxt.id)
-        goToSource(nxt.start)
+        if (nxt.media_id === mediaId) goToSource(nxt.start)
       }
     } else {
-      const prev = [...list].reverse().find((r) => r.end < srcTime - 0.35)
+      const prev = [...list]
+        .reverse()
+        .find((r) => {
+          const ri = order.get(r.media_id) ?? 0
+          return ri < myIdx || (ri === myIdx && r.end < srcTime - 0.35)
+        })
       if (prev) {
         selectRally(prev.id)
-        goToSource(prev.start)
+        if (prev.media_id === mediaId) goToSource(prev.start)
       }
     }
   }
@@ -384,13 +583,25 @@ export default function Player() {
     goToSource(selectedRally.start)
   }, [selectedRally, goToSource])
 
-  // 回合循环（默认关闭）
+  // 回合循环（默认关闭）。
+  // activeRally 在播放头越过回合终点后会立刻变成 null（rallyAtTime 找不到当前回合），
+  // 所以用 ref 记住最近一次所在的回合，否则「只是播到某个回合、没有显式选中」时
+  // 循环永远不触发，用户会以为按钮坏了。
+  const loopTargetRef = useRef<Rally | null>(null)
   useEffect(() => {
-    if (!loop || !activeRally || !playing) return
-    if (srcTime > activeRally.end + 0.15) {
-      goToSource(activeRally.clip_start ?? activeRally.start)
+    const t = selectedRally ?? rallyAtTime
+    if (t) loopTargetRef.current = t
+    else if (!playing) loopTargetRef.current = null
+  }, [selectedRally, rallyAtTime, playing])
+
+  useEffect(() => {
+    if (!loop || !playing) return
+    const target = selectedRally ?? loopTargetRef.current
+    if (!target) return
+    if (srcTime > target.end + 0.15) {
+      goToSource(target.clip_start ?? target.start)
     }
-  }, [srcTime, activeRally, loop, playing, goToSource])
+  }, [srcTime, selectedRally, loop, playing, goToSource])
 
   /** 当前选中的片段在成片时间轴上的范围（用于给分割提示兜错） */
   const selectedClipRange = useMemo(() => {
@@ -405,7 +616,8 @@ export default function Player() {
     return currentTime >= selectedClipRange.start && currentTime <= selectedClipRange.end
   }, [selectedClipId, selectedClipRange, currentTime])
 
-  const src = mediaId && project ? api.proxyUrl(project.id, mediaId) : undefined
+  // 代理就绪后加一个参数当缓存戳，避免浏览器继续拿代理生成前那次响应
+  const src = mediaId && project ? `${api.proxyUrl(project.id, mediaId)}${proxyReady ? '?ready=1' : ''}` : undefined
   const duration = previewMode === 'timeline' ? timeline?.duration ?? 0 : media?.duration ?? 0
 
   return (
@@ -418,7 +630,7 @@ export default function Player() {
             size="sm"
             onClick={() => setPreviewMode('source')}
           >
-            源片
+            {tr('player.modeSource')}
           </Button>
           <Button
             variant={previewMode === 'timeline' ? 'outline' : 'ghost'}
@@ -430,7 +642,7 @@ export default function Player() {
             }}
             disabled={!clips.length}
           >
-            成片预览
+            {tr('player.modeTimeline')}
             {clips.length > 0 && (
               <span className="mono ml-1 text-[10px] text-court-300">{clips.length}</span>
             )}
@@ -440,8 +652,8 @@ export default function Player() {
             width={300}
             content={
               previewFiltered
-                ? `只看筛选片段：开\n跳过没被筛选出来的部分，连着播这 ${filteredRallies.length} 个回合`
-                : `只看筛选片段\n播放时自动跳过筛选之外的捡球、走动，只连着放筛选出来的 ${filteredRallies.length} 个回合`
+                ? tr('player.onlyFilteredOnHint', { n: filteredRallies.length })
+                : tr('player.onlyFilteredOffHint', { n: filteredRallies.length })
             }
           >
             <Button
@@ -455,7 +667,7 @@ export default function Player() {
               className={previewFiltered ? 'text-court-300' : ''}
             >
               <ListFilter size={12} />
-              只看筛选
+              {tr('player.onlyFiltered')}
             </Button>
           </Tooltip>
         </div>
@@ -472,7 +684,7 @@ export default function Player() {
             >
               <Sparkles size={11} style={{ color: scoreColor(activeRally.scores.total) }} />
               <span className="text-[11.5px] text-ink-200">
-                回合 #{activeRally.index}
+                {tr('player.rallyIndex', { index: activeRally.index })}
               </span>
               <span
                 className="mono text-[12px] font-semibold"
@@ -481,7 +693,10 @@ export default function Player() {
                 {activeRally.scores.total.toFixed(0)}
               </span>
               <span className="text-[10.5px] text-ink-500">
-                {activeRally.features.shot_count} 拍 · {activeRally.duration.toFixed(1)}s
+                {tr('player.shotDuration', {
+                  shots: activeRally.features.shot_count,
+                  duration: activeRally.duration.toFixed(1),
+                })}
               </span>
             </motion.div>
           )}
@@ -492,17 +707,24 @@ export default function Player() {
           容器本身不再留多余的黑色边距 */}
       <div className="relative mx-3 flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-xl border border-white/8 bg-black">
         {src ? (
+          // key 带上 mediaId / proxy_path：换素材或代理重生成时强制重挂载，
+          // 保证 loadedmetadata 一定触发（否则 ready 会卡在 false，遮罩一直盖着）。
           <video
+            key={`${mediaId ?? ''}:${proxyReady ? media.proxy_path ?? 'proxy' : 'source'}`}
             ref={videoRef}
             src={src}
             className="block h-full w-full object-contain"
-            onLoadedMetadata={() => setReady(true)}
+            onLoadedMetadata={(e) => {
+              setReady(true)
+              // 重挂载后恢复播放（换素材 / 代理就绪时 store.playing 可能已经是 true）
+              if (playing) e.currentTarget.play().catch(() => undefined)
+            }}
             onTimeUpdate={onTimeUpdate}
             onClick={() => setPlaying(!playing)}
             playsInline
           />
         ) : (
-          <div className="text-[12.5px] text-ink-500">请先导入素材</div>
+          <div className="text-[12.5px] text-ink-500">{tr('player.importFirst')}</div>
         )}
 
         {calibration?.ok && showCourt && media && media.width > 0 && (
@@ -515,8 +737,28 @@ export default function Player() {
         )}
 
         {!ready && src && (
-          <div className="pointer-events-none absolute inset-0 grid place-items-center bg-ink-950/60">
-            <div className="text-[12px] text-ink-300">正在准备预览用的小尺寸副本…</div>
+          <div className="pointer-events-none absolute inset-0 grid place-items-center bg-ink-950/60 px-8">
+            <div className="w-[300px] text-center">
+              <div className="text-[12px] text-ink-200">
+                {prepareJob
+                  ? prepareJob.stage === 'queued'
+                    ? tr('player.prepareQueued')
+                    : prepareJob.message || tr('player.prepareGenerating')
+                  : tr('player.preparePreparing')}
+              </div>
+              {prepareJob && <Progress value={prepareJob.progress} className="mt-2" />}
+              <div className="mono mt-1 text-[10.5px] text-ink-500">
+                {prepareJob ? `${Math.round(prepareJob.progress * 100)}%` : tr('player.prepareDirectPlay')}
+              </div>
+              {!prepareJob && media && !proxyReady && mediaId && (
+                <button
+                  onClick={() => useStore.getState().ensurePrepare(mediaId)}
+                  className="pointer-events-auto mt-2 rounded-lg bg-white/10 px-3 py-1.5 text-[11.5px] text-ink-100 hover:bg-white/16"
+                >
+                  {tr('player.generateProxy')}
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -529,10 +771,10 @@ export default function Player() {
               onClick={() => setCourtEditorOpen(true)}
               title={
                 manualPoly
-                  ? `已手动标定场地（${manualPoly.length} 个点），点击可修改`
+                  ? tr('player.manualCalibrated', { n: manualPoly.length })
                   : calibration?.ok
-                    ? `AI 识别机位：${calibration.viewpoint_label}。识别不准的话点这里手动标一次`
-                    : '手动标出球场范围（AI 找不准时用这个）'
+                    ? tr('player.aiViewpointHint', { viewpoint: calibration.viewpoint_label })
+                    : tr('player.manualCalibrateHint')
               }
               className="pointer-events-auto"
             >
@@ -541,18 +783,22 @@ export default function Player() {
                 className={cn('backdrop-blur', manualPoly || calibration?.ok ? '' : 'bg-black/50')}
               >
                 <Crosshair size={9} />
-                {manualPoly ? `手动标定 ${manualPoly.length} 点` : calibration?.ok ? `机位 ${calibration.viewpoint_label}` : '标定场地'}
+                {manualPoly
+                  ? tr('player.manualCalibratedBadge', { n: manualPoly.length })
+                  : calibration?.ok
+                    ? tr('player.viewpointBadge', { viewpoint: calibration.viewpoint_label })
+                    : tr('player.calibrateCourt')}
               </Badge>
             </button>
           )}
           {calibration?.ok && (
             <button
               onClick={() => setShowCourtOverlay(!showCourt)}
-              title={showCourt ? '隐藏识别到的球场范围' : '在画面上显示识别到的球场范围（场地外会压暗）'}
+              title={showCourt ? tr('player.hideCourtRange') : tr('player.showCourtRangeHint')}
               className="pointer-events-auto"
             >
               <Badge className={cn('backdrop-blur', showCourt ? 'bg-court-500/25 text-court-200' : 'bg-black/50')}>
-                {showCourt ? '隐藏范围' : '显示范围'}
+                {showCourt ? tr('player.hideRange') : tr('player.showRange')}
               </Badge>
             </button>
           )}
@@ -560,23 +806,23 @@ export default function Player() {
         <div className="pointer-events-none absolute right-3 bottom-2.5 flex items-center gap-2">
           {loop && activeRally && (
             <Badge color="#38e0a2" className="backdrop-blur">
-              正在循环 回合 #{activeRally.index}
+              {tr('player.loopingRally', { index: activeRally.index })}
             </Badge>
           )}
           {previewMode === 'timeline' && selectedClipId && (
             <Badge color={splitHint ? '#5c9dff' : '#6b7787'} className="backdrop-blur">
-              {splitHint ? '按 S 在此分割选中片段' : '播放头不在选中片段内'}
+              {splitHint ? tr('player.splitHintAt') : tr('player.playheadOutsideClip')}
             </Badge>
           )}
           {rallyAtTime && previewMode === 'source' && (
             <Badge color={scoreColor(rallyAtTime.scores.total)} className="backdrop-blur">
-              回合进行中
+              {tr('player.rallyInProgress')}
             </Badge>
           )}
           {previewMode === 'source' && previewFiltered && (
             <Badge color="#5c9dff" className="backdrop-blur">
               <ListFilter size={9} />
-              只看筛选片段
+              {tr('player.onlyFilteredClips')}
               {filteredRallies.length > 0 && ` ${filteredIndex >= 0 ? filteredIndex + 1 : '-'}/${filteredRallies.length}`}
             </Badge>
           )}
@@ -586,9 +832,10 @@ export default function Player() {
             如果交给 Tooltip 的 span（它是 0×0 的 relative 盒子），
             absolute 的包含块就变成那个 span，按钮会跑到画面正中间。 */}
         <div className="absolute top-2.5 right-3">
-          <Tooltip content="全屏" side="left">
+          <Tooltip content={tr('player.fullscreen')} side="left">
             <button
               onClick={() => videoRef.current?.parentElement?.requestFullscreen?.()}
+              aria-label={tr('player.fullscreen')}
               className="grid h-7 w-7 place-items-center rounded-md bg-black/45 text-ink-300 backdrop-blur transition-colors hover:bg-black/70 hover:text-white"
             >
               <Maximize2 size={13} />
@@ -597,56 +844,73 @@ export default function Player() {
         </div>
       </div>
 
+      {/* 播放进度条：点击 / 拖动定位。值用当前模式的时间轴（源片或成片）。 */}
+      <div className="flex items-center gap-2.5 px-3 pt-1.5">
+        <span className="mono w-[54px] shrink-0 text-right text-[11px] text-white tabular">
+          {timecode(currentTime, false)}
+        </span>
+        <SeekBar
+          value={currentTime}
+          max={duration}
+          disabled={!src || duration <= 0}
+          onSeek={seek}
+          onSeekingChange={setUserSeeking}
+          className="flex-1"
+        />
+        <span className="mono w-[54px] shrink-0 text-[11px] text-ink-500 tabular">
+          {timecode(duration, false)}
+        </span>
+      </div>
+
       {/* 传输控制 */}
       <div className="flex items-center gap-2 px-3 py-2.5">
-        <Tooltip content="上一回合" side="top">
+        <Tooltip content={tr('player.prevRally')} side="top">
           <Button variant="ghost" size="icon" onClick={() => jumpRally(-1)}>
             <ChevronFirst size={15} />
           </Button>
         </Tooltip>
-        <Tooltip content="后退一帧 (←)" side="top">
-          <Button variant="ghost" size="icon" onClick={() => seek(currentTime - 1 / (media?.fps || 30))}>
+        <Tooltip content={tr('player.stepBack')} kbd="←" side="top">
+          <Button variant="ghost" size="icon" onClick={() => seek(currentTime - frameStep)}>
             <SkipBack size={15} />
           </Button>
         </Tooltip>
-        <button
-          onClick={() => setPlaying(!playing)}
-          className={cn(
-            'grid h-9 w-9 place-items-center rounded-full transition-all active:scale-95',
-            playing ? 'bg-white/12 text-white' : 'bg-gradient-to-b from-court-400 to-court-600 text-ink-950',
-          )}
-        >
-          {playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" className="ml-0.5" />}
-        </button>
-        <Tooltip content="前进一帧 (→)" side="top">
-          <Button variant="ghost" size="icon" onClick={() => seek(currentTime + 1 / (media?.fps || 30))}>
+        <Tooltip content={playing ? tr('player.pause') : tr('player.play')} kbd="Space" side="top">
+          <button
+            onClick={() => setPlaying(!playing)}
+            aria-label={playing ? tr('player.pause') : tr('player.play')}
+            className={cn(
+              'grid h-9 w-9 place-items-center rounded-full transition-all active:scale-95',
+              playing ? 'bg-white/12 text-white' : 'bg-gradient-to-b from-court-400 to-court-600 text-ink-950',
+            )}
+          >
+            {playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" className="ml-0.5" />}
+          </button>
+        </Tooltip>
+        <Tooltip content={tr('player.stepForward')} kbd="→" side="top">
+          <Button variant="ghost" size="icon" onClick={() => seek(currentTime + frameStep)}>
             <SkipForward size={15} />
           </Button>
         </Tooltip>
-        <Tooltip content="下一回合" side="top">
+        <Tooltip content={tr('player.nextRally')} side="top">
           <Button variant="ghost" size="icon" onClick={() => jumpRally(1)}>
             <ChevronLast size={15} />
           </Button>
         </Tooltip>
 
-        <div className="mono ml-2 text-[12px] text-ink-200 tabular">
-          <span className="text-white">{timecode(currentTime, false)}</span>
-          <span className="text-ink-500"> / {timecode(duration, false)}</span>
-          <span className="ml-2 text-[10.5px] text-ink-500">
-            f{Math.floor((currentTime % 1) * (media?.fps || 30))}
-          </span>
-        </div>
+        <span className="mono ml-2 text-[11px] text-ink-400" title={tr('player.frameIndex')}>
+          f{Math.floor((currentTime % 1) * displayFps)}
+        </span>
 
         <div className="flex-1" />
 
-        <Tooltip content={loop ? '正在循环当前回合 · 点击关闭' : '循环播放当前回合'} side="top">
+        <Tooltip content={loop ? tr('player.loopOnHint') : tr('player.loopOffHint')} side="top">
           <Button
             variant="ghost"
             size="icon"
             onClick={() => {
               const next = !loop
               setLoop(next)
-              if (next) toast({ kind: 'info', title: '已开启回合循环', detail: '播放到回合结束会自动跳回开头' })
+              if (next) toast({ kind: 'info', title: tr('player.loopEnabledTitle'), detail: tr('player.loopEnabledDetail') })
             }}
             className={loop ? 'text-court-300' : ''}
           >
@@ -654,51 +918,9 @@ export default function Player() {
           </Button>
         </Tooltip>
 
-        <div className="relative">
-          <Tooltip content="播放速度" side="top">
-            <Button variant="ghost" size="sm" onClick={() => setShowSpeed((v) => !v)}>
-              <Gauge size={13} />
-              <span className="mono">{speed}×</span>
-            </Button>
-          </Tooltip>
-          <AnimatePresence>
-            {showSpeed && (
-              <>
-                {/* 点击空白处关闭。用 portal 挂到 body：
-                    页面外壳 .anim-in 带 transform 动画，留在里面的话 fixed 会以它为参照，
-                    遮罩只盖住 main，点顶栏/导航栏关不掉这个弹层。 */}
-                {createPortal(
-                  <div className="fixed inset-0 z-40" onClick={() => setShowSpeed(false)} />,
-                  document.body,
-                )}
-                <motion.div
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 6 }}
-                  className="panel absolute right-0 bottom-full z-50 mb-1.5 flex flex-col p-1"
-                >
-                  {SPEEDS.map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => {
-                        setSpeed(s)
-                        setShowSpeed(false)
-                      }}
-                      className={cn(
-                        'mono rounded-md px-3 py-1 text-[11.5px] transition-colors',
-                        speed === s ? 'bg-court-500/20 text-court-300' : 'text-ink-300 hover:bg-white/8',
-                      )}
-                    >
-                      {s}×
-                    </button>
-                  ))}
-                </motion.div>
-              </>
-            )}
-          </AnimatePresence>
-        </div>
+        <SpeedMenu value={speed} onChange={setSpeed} title={tr('player.playbackSpeed')} />
 
-        <Tooltip content={muted ? '取消静音' : '静音'} side="top">
+        <Tooltip content={muted ? tr('player.unmute') : tr('player.mute')} side="top">
           <Button variant="ghost" size="icon" onClick={() => setMuted((v) => !v)}>
             {muted || volume === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </Button>

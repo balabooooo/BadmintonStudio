@@ -1,50 +1,56 @@
-"""球员运动切分引擎：真正找到「这一回合从哪里开始、在哪里结束」。
+"""Player-motion segmentation engine: actually finds "where this rally starts and where it ends".
 
-为什么需要它
-------------
-旧的切分完全建立在**整帧融合活跃度**上：把音频击球、整帧运动、球员速度、
-羽毛球出现加权求和，再做一次 1.2 秒的滑动平均，然后用「双阈值迟滞状态机」
-切区间，最后对超长区间按典型时长递归切分。
+Why it is needed
+----------------
+The old segmentation was built entirely on **full-frame fused activity**: audio hits, full-frame
+motion, player speed, and shuttle presence were weighted-summed, then smoothed with a 1.2-second
+moving average, then split into intervals by a "dual-threshold hysteresis state machine", and
+finally over-long intervals were recursively split by a typical duration.
 
-这条路在实测素材上是失效的，原因有三个，都是原理性的：
+This approach failed on the measured footage for three reasons, all fundamental:
 
-1. **整帧运动里没有回合信息。** 球馆里同时有观众走动、隔壁场地的球、灯光
-   变化，它们让整帧运动能量在**任何**时刻都不低。于是活跃度曲线在回合之间
-   根本塌不下去，迟滞状态机永远不认为「这一段结束了」。
-   实测：30 分钟素材只切出 8 个区间，其中一个是 236 秒、一个是 138 秒。
-2. **1.2 秒的平滑把「停顿」抹平了。** 回合之间只有几秒的静默，被 1.2 秒均值
-   一平滑再和持续的背景运动相加，谷底就消失了。
-3. **于是「-切分」变成了「-均分」。** 超长区间落进 ``_split_by_valley``，
-   而该函数只在 ``e - s > target * 1.35`` 时才递归；因为 30 秒的区间确实比
-   目标 28 秒长一点，它就会在每个区间内部找最低点再切一刀 ——
-   结果就是一堆时长几乎一样的片段（实测 32 个回合平均 20.1 秒、中位数
-   19.8 秒，且大量片段**首尾相接**：前一个的 end 正好等于后一个的 start）。
-   首尾相接的边界在真实比赛里不可能存在，因为得分之后必然有捡球/换发球的停顿。
+1. **Full-frame motion contains no rally information.** The gym simultaneously has audience
+   movement, the neighboring court's shuttle, and lighting changes, which keep full-frame motion
+   energy high at **any** moment. So the activity curve simply cannot collapse between rallies, and
+   the hysteresis state machine never considers "this segment has ended".
+   Measured: 30 minutes of footage yielded only 8 intervals, one of which was 236 seconds and another 138 seconds.
+2. **The 1.2-second smoothing flattened out the "pauses".** The few seconds of silence between
+   rallies get smoothed away by the 1.2-second average and added to the persistent background
+   motion, so the valleys disappear.
+3. **So "segmentation" became "equal division".** Over-long intervals fall into ``_split_by_valley``,
+   and that function only recurses when ``e - s > target * 1.35``; because a 30-second interval is
+   indeed slightly longer than the 28-second target, it finds the lowest point inside each interval
+   and cuts again — producing a bunch of nearly equal-length fragments (measured: 32 rallies
+   averaging 20.1 seconds, median 19.8 seconds, with many fragments **butting end-to-end**: the
+   previous one's end exactly equals the next one's start). End-to-end boundaries cannot exist in a
+   real match, because after a point there is necessarily a pause for picking up the shuttle / changing serve.
 
-本模块的做法
-------------
-回合的语义是：**发球 → 对拉 → 死球 → 捡球/准备 → 下一次发球**。
-球员是唯一贯穿全过程的可靠观测对象：
+How this module works
+---------------------
+The semantics of a rally are: **serve -> rally -> dead ball -> pick up / prepare -> next serve**.
+The players are the only reliable observation target that runs through the whole process:
 
-* 对拉时，两名比赛球员都在**持续快速**移动；
-* 死球之后他们会停下来（喘气、看球、捡球），这是**唯一**在每个回合之间
-  必然出现的长停顿。
+* during a rally, both match players keep moving **continuously and fast**;
+* after the dead ball they stop (catching their breath, watching the shuttle, picking it up), which is the **only**
+  long pause that necessarily appears between every rally.
 
-所以真正该用的信号不是「整帧有多吵」，而是「**这两名球员有多久没动了**」。
-只需要球员的运动轨迹，不需要知道球在哪里。本模块：
+So the signal that should really be used is not "how noisy the full frame is" but "**how long these two players have not moved**".
+Only the players' motion trajectories are needed; there is no need to know where the shuttle is. This module:
 
-1. 从检测框序列里得到「每一帧该球员移动了多少」（``box_motion``）；
-2. 在**局部时间尺度**（默认 4 秒）上做「最低点 + 显著度」分析，
-   把曲线切成「活跃段 / 静默段」交替 —— 不需要手动设阈值，
-   显著度天然要求谷底相对两边的峰足够低；
-3. 用**静默段**（而不是活跃段）定义回合之间的边界。静默段是真实存在的
-   物理停顿；活跃段则可能被背景运动污染。
-4. 边界回贴：起点退到静默段中真正的「站定」时刻，终点取最后一次明显移动；
-5. 最后用**羽毛球是否在飞行**做一次校验（可用时）：一个回合的核心区间里
-   应该反复看到球；如果完全看不到球，说明这段其实是捡球/换场。
+1. derives "how much this player moved in each frame" from the detection-box sequence (``box_motion``);
+2. performs "valley + prominence" analysis on a **local time scale** (4 seconds by default),
+   cutting the curve into alternating "active / quiet segments" — no manual threshold is needed,
+   since prominence inherently requires the valley to be sufficiently lower than the peaks on either side;
+3. defines rally boundaries using **quiet segments** (rather than active segments). Quiet segments are
+   real physical pauses; active segments may be polluted by background motion.
+4. boundary snapping: the start retreats to the real "standing still" moment within the quiet segment, and
+   the end takes the last obvious movement;
+5. finally validates once with **whether the shuttle is in flight** (when available): a rally's core
+   interval should repeatedly show the shuttle; if the shuttle is never visible, this segment is actually
+   picking up the shuttle / changing ends.
 
-没有任何球员信号时（检测失败 / 非比赛素材），自动退回
-:func:`bms.analysis.rally.segment` 的老路径，行为不变。
+When there is no player signal at all (detection failure / non-match footage), it automatically falls
+back to the old path of :func:`bms.analysis.rally.segment`, with unchanged behavior.
 """
 
 from __future__ import annotations
@@ -57,11 +63,11 @@ import numpy as np
 EPS = 1e-9
 
 
-# ------------------------------------------------------------------ 工具
+# ------------------------------------------------------------------ Utilities
 
 
 def _smooth(a: np.ndarray, win: int) -> np.ndarray:
-    """滑动均值（边缘 pad）。"""
+    """Moving average (edge padding)."""
     if a.size == 0 or win <= 1:
         return a.astype(np.float32)
     win = int(win)
@@ -93,19 +99,20 @@ def _resample_to(a: np.ndarray, src_fps: float, dst_fps: float, n: int) -> np.nd
 
 def box_motion(boxes_per_frame: list, fps: float, aspect: float = 1.78,
                window: float = 1.0) -> np.ndarray:
-    """把「逐帧球员框」变成「球员每秒移动了多少」的信号。
+    """Turn "per-frame player boxes" into a "how much the player moved per second" signal.
 
     Args:
-        boxes_per_frame: 每帧一个列表，元素是 ``(track_id, x1, y1, x2, y2)``
-            归一化坐标；``frame_boxes`` 就是这个结构。
-        fps: 该序列的帧率。
-        aspect: 画面宽高比，用来把 x 位移换算到「画面高度」尺度。
-        window: 求「移动」的时间窗（秒）。用滑动窗内的累计位移而不是逐帧
-            位移，是因为球员是「跑一步停一下」——逐帧位移会频繁归零，
-            而 1 秒窗内是否移动过才是「有没有在打」的判据。
+        boxes_per_frame: one list per frame, whose elements are ``(track_id, x1, y1, x2, y2)``
+            normalized coordinates; ``frame_boxes`` has exactly this structure.
+        fps: frame rate of the sequence.
+        aspect: frame aspect ratio, used to convert x displacement to the "frame height" scale.
+        window: time window (seconds) over which "movement" is measured. The cumulative displacement
+            within a sliding window is used instead of per-frame displacement because players
+            "run a step then stop" — per-frame displacement frequently drops to zero, whereas whether
+            there was any movement within a 1-second window is the criterion for "are they playing".
 
     Returns:
-        长度 = 帧数的数组，单位是「窗内累计位移 / 画面高度」。
+        An array whose length equals the frame count, in units of "cumulative displacement within the window / frame height".
     """
     n = len(boxes_per_frame)
     if n == 0:
@@ -117,23 +124,23 @@ def box_motion(boxes_per_frame: list, fps: float, aspect: float = 1.78,
     if not ids:
         return np.zeros(n, dtype=np.float32)
     col = {tid: k for k, tid in enumerate(sorted(ids))}
-    pos = np.full((n, len(ids)), np.nan, dtype=np.float32)   # 归一化 x（已按画面高度换算）
-    ys = np.full((n, len(ids)), np.nan, dtype=np.float32)    # 归一化 y
+    pos = np.full((n, len(ids)), np.nan, dtype=np.float32)   # normalized x (already converted using frame height)
+    ys = np.full((n, len(ids)), np.nan, dtype=np.float32)    # normalized y
     for i, fr in enumerate(boxes_per_frame):
         for item in fr or ():
             k = col[int(item[0])]
             pos[i, k] = 0.5 * (float(item[1]) + float(item[3])) * aspect
             ys[i, k] = 0.5 * (float(item[2]) + float(item[4]))
 
-    # nan 差分会得到 nan -> 视为「没有位移」（球员被遮挡时不该算作移动）
-    step = np.hypot(np.diff(pos, axis=0), np.diff(ys, axis=0))     # 单位：画面高度
+    # Differencing nan yields nan -> treat as "no displacement" (an occluded player should not count as moving)
+    step = np.hypot(np.diff(pos, axis=0), np.diff(ys, axis=0))     # unit: frame height
     step = np.nan_to_num(step, nan=0.0, posinf=0.0, neginf=0.0)
-    # 单帧位移超过画面高度 25% 基本是身份交换，丢掉
+    # A single-frame displacement over 25% of frame height is basically an identity switch, so drop it
     step = np.clip(step, 0.0, 0.25)
     step = np.vstack([np.zeros((1, step.shape[1]), dtype=np.float32), step])
 
     win_f = max(1, int(round(window * fps)))
-    # 每个球员在窗口内的累计位移，再取「最活跃的那名球员」
+    # Cumulative displacement of each player within the window, then take "the most active player"
     kern = np.ones(win_f, dtype=np.float32)
     per_player = np.empty_like(step)
     for k in range(step.shape[1]):
@@ -142,19 +149,20 @@ def box_motion(boxes_per_frame: list, fps: float, aspect: float = 1.78,
 
 
 def detection_coverage(boxes_per_frame: list, fps: float) -> np.ndarray:
-    """逐帧「有没有检到比赛球员」，再在时间上做形态学闭运算。
+    """Per-frame "whether a match player was detected", then a morphological closing over time.
 
-    单人帧也算有效：两名球员里只有一个人被检到时，那个人的运动仍然说明
-    「球在飞」。但**整段都检不到人**的时间必须被单独标出来——那段时间
-    我们对「球员动没动」一无所知，不能把它当成「球员没动」。
-    这正是旧实现容易丢回合的地方：检测失败的一段静默会被当成一次长停顿，
-    夹在它两边的真实回合就都被吃掉了。
+    A single-player frame still counts as valid: when only one of the two players is detected, that
+    player's motion still indicates "the shuttle is in flight". But times where **no person is
+    detected for a whole stretch** must be marked separately — during that time we know nothing about
+    "whether the players moved", so it must not be treated as "the players did not move".
+    This is exactly where the old implementation tended to lose rallies: a stretch of silence caused
+    by detection failure would be treated as one long pause, swallowing the real rallies on either side of it.
     """
     n = len(boxes_per_frame)
     if n == 0:
         return np.zeros(0, dtype=np.float32)
     ok = np.asarray([1.0 if fr else 0.0 for fr in boxes_per_frame], dtype=np.float32)
-    # 闭运算：把不超过 1.5 秒的检测空洞填掉（球员被挡住几帧不影响判断）
+    # Closing operation: fill detection holes no longer than 1.5 seconds (a player being blocked for a few frames does not affect the decision)
     from scipy.ndimage import binary_closing
 
     gap = max(1, int(round(1.5 * fps)))
@@ -164,12 +172,12 @@ def detection_coverage(boxes_per_frame: list, fps: float) -> np.ndarray:
 
 def blend_with_activity(player_motion: np.ndarray, coverage: np.ndarray,
                         activity: np.ndarray) -> np.ndarray:
-    """在球员信号缺失的时间上，用画面活跃度把信号补起来。
+    """Where the player signal is missing, fill it in with frame activity.
 
-    融合方式是 `covered * player + (1 - covered) * activity`：
-    有球员的时候完全信球员（球员运动是干净的「回合内证据」），
-    没有球员的时候退回画面活跃度（它不干净，但比「恒为 0」强得多）。
-    两者都先归一化到 0~1，所以混合不会引入量纲问题。
+    The fusion is `covered * player + (1 - covered) * activity`:
+    when players are present, fully trust the players (player motion is clean "in-rally evidence");
+    when players are absent, fall back to frame activity (it is not clean, but far better than "always 0").
+    Both are first normalized to 0~1, so blending introduces no dimensional issues.
     """
     n = player_motion.size
     if n == 0 or activity is None or activity.size != n:
@@ -183,18 +191,20 @@ def audio_visual_evidence(
     hit_density: np.ndarray | None,
     weight_hits: float = 0.7,
 ) -> np.ndarray:
-    """把「球员在动」和「这一带在连续击球」乘成一条回合证据曲线。
+    """Multiply "players are moving" and "hits are continuous around here" into a single rally-evidence curve.
 
-    单看球员运动区分度不够（球员捡球时也走，隔壁场地也在动，实测 AUC≈0.57）；
-    单看击球密度会被「隔壁场地恰好也连打几拍」骗到。两者**相乘**要求两件事
-    同时成立，正好对应「我们这场比赛正在对拉」：回合间任意一路塌下去，
-    证据就塌下去，谷底因此变清晰。
+    Player motion alone is not discriminative enough (players also walk when picking up the shuttle,
+    and the neighboring court is also moving; measured AUC≈0.57); hit density alone is fooled by
+    "the neighboring court happening to also rally a few shots". **Multiplying** the two requires both
+    to hold at once, which exactly corresponds to "our match is rallying": between rallies, if either
+    signal collapses, the evidence collapses, making the valleys clear.
 
-    之所以用 ``(1-weight) + weight*hits`` 而不是直接相乘：直接相乘时只要击球
-    密度有一点波动就会把整段证据压没，短回合尤其容易被吃掉；留一个下限让
-    「球员确实在快速移动」本身也能支撑起候选，漏检的击球不至于让回合消失。
+    The reason for using ``(1-weight) + weight*hits`` rather than a direct product: with a direct
+    product, any fluctuation in hit density would crush the whole evidence segment, and short rallies
+    are especially easy to swallow; keeping a floor lets "the players really are moving fast" itself
+    support a candidate, so a missed hit does not make the rally disappear.
 
-    两路都先做鲁棒归一化，避免量纲差异。
+    Both signals are robustly normalized first to avoid dimensional differences.
     """
     if player_motion is None or player_motion.size == 0:
         return hit_density if hit_density is not None else np.zeros(0, dtype=np.float32)
@@ -206,17 +216,17 @@ def audio_visual_evidence(
     return _robust_norm(p * ((1.0 - w) + w * h))
 
 
-# ------------------------------------------------------------------ 静默段检测
+# ------------------------------------------------------------------ Quiet-segment detection
 
 
 @dataclass
 class QuietSpan:
-    """一段「球员基本没动」的静默区间（帧索引）。"""
+    """A quiet interval where "the players basically did not move" (frame indices)."""
 
     start: int
     end: int
-    depth: float          # 谷底相对两侧峰的深度（0~1）
-    floor: float          # 谷底的绝对水平
+    depth: float          # depth of the valley relative to the peaks on either side (0~1)
+    floor: float          # absolute level of the valley floor
 
 
 def find_quiet_spans(
@@ -226,28 +236,29 @@ def find_quiet_spans(
     max_quiet: float = 0.0,
     prominence_ratio: float = 0.30,
 ) -> list[QuietSpan]:
-    """在球员运动曲线上找「静默段」。
+    """Find "quiet segments" on the player-motion curve.
 
-    做法是**最低点 + 显著度**，而不是「低于某个阈值」：
+    The approach is **valley + prominence**, not "below some threshold":
 
-    1. ``scipy.signal.find_peaks`` 找局部最低点（对负曲线找峰）；
-    2. 每个最低点算显著度（prominence）——谷底相对两侧较高的那个「鞍部」
-       下降了多深。显著度按全片运动强度的某个分位数归一化，
-       于是「安静球馆里的停顿」和「嘈杂球馆里的停顿」用同一套参数都能抓到；
-    3. 显著度不足的最低点直接丢掉（那不是停顿，只是运动强度的正常起伏）；
-    4. 相邻的最低点如果离得比 ``min_quiet`` 还近，只留更深的那个。
+    1. ``scipy.signal.find_peaks`` finds local minima (find peaks on the negated curve);
+    2. each minimum gets a prominence — how far the valley dropped relative to the higher "saddle"
+       on either side. Prominence is normalized by some quantile of the whole clip's motion intensity,
+       so "a pause in a quiet gym" and "a pause in a noisy gym" can both be caught with the same parameters;
+    3. minima with insufficient prominence are dropped outright (that is not a pause, just normal fluctuation of motion intensity);
+    4. if adjacent minima are closer than ``min_quiet``, only the deeper one is kept.
 
     Args:
-        m: 球员运动曲线（``box_motion`` 的输出）。
-        fps: 帧率。
-        min_quiet: 两个候选低谷之间至少隔多久才认为是「两次停顿」。
-        max_quiet: 单个静默段的最长时长（秒）；0 = 不限。超长的静默段说明
-            这段可能根本没有比赛（休息、换场），交给调用方按最大静默截断。
-        prominence_ratio: 显著度门限 = 该比例 × (p95 - p20)。默认 0.30 表示
-            谷底至少要比「典型活跃水平」低三成。
+        m: player-motion curve (the output of ``box_motion``).
+        fps: frame rate.
+        min_quiet: minimum separation between two candidate valleys for them to count as "two pauses".
+        max_quiet: maximum duration of a single quiet segment (seconds); 0 = unlimited. An over-long
+            quiet segment suggests there may be no match at all in this stretch (rest, changing ends),
+            and is left to the caller to truncate by maximum silence.
+        prominence_ratio: prominence threshold = this ratio x (p95 - p20). The default 0.30 means
+            the valley must be at least 30% lower than the "typical active level".
 
     Returns:
-        按时间排序的 :class:`QuietSpan` 列表。
+        A time-ordered list of :class:`QuietSpan`.
     """
     if m is None or m.size < max(8, int(fps)):
         return []
@@ -269,14 +280,14 @@ def find_quiet_spans(
     quiet = m <= base + 0.35 * span
     out: list[QuietSpan] = []
     for k, i in enumerate(idx):
-        # 低谷向两侧扩展到「不再属于静默」为止，得到静默段的宽度
+        # Expand the valley to both sides until it "no longer belongs to the quiet", giving the quiet segment's width
         a = i
         while a > 0 and quiet[a - 1]:
             a -= 1
         b = i
         while b + 1 < m.size and quiet[b + 1]:
             b += 1
-        # 静默段至少要有一点点宽度，否则只是曲线的一次抖动
+        # A quiet segment must have at least a little width, otherwise it is just a single jitter of the curve
         if b - a < max(1, int(0.25 * fps)):
             a = max(0, i - int(0.15 * fps))
             b = min(m.size - 1, i + int(0.15 * fps))
@@ -292,28 +303,28 @@ def find_quiet_spans(
     return out
 
 
-# ------------------------------------------------------------------ 主切分
+# ------------------------------------------------------------------ Main segmentation
 
 
 @dataclass
 class SegmentSignals:
-    """切分用到的全部信号（都在同一帧率上）。"""
+    """All signals used for segmentation (all at the same frame rate)."""
 
     fps: float
     duration: float
-    #: 球员运动（0~1 归一化后的同一尺度）
+    #: Player motion (same scale after 0~1 normalization)
     player_motion: np.ndarray
-    #: 融合活跃度（旧路径的产物，用作后备证据）
+    #: Fused activity (product of the old path, used as backup evidence)
     activity: np.ndarray | None = None
-    #: 每帧羽毛球是否在飞行（0~1），可为空
+    #: Whether the shuttle is in flight per frame (0~1), may be empty
     shuttle: np.ndarray | None = None
-    #: 音频击球时刻（秒），可为空
+    #: Audio hit times (seconds), may be empty
     hit_times: np.ndarray | None = None
-    #: 是否真的拿到了球员信号
+    #: Whether a player signal was actually obtained
     has_players: bool = False
-    #: 逐帧「球员检测是否有效」（``detection_coverage``）
+    #: Per-frame "whether player detection is valid" (``detection_coverage``)
     coverage: np.ndarray | None = None
-    #: 球员检测的有效时间占比
+    #: Fraction of time player detection is valid
     coverage_ratio: float = 0.0
 
 
@@ -321,22 +332,24 @@ class SegmentSignals:
 class SegmentOptions:
     min_rally: float = 2.0
     max_rally: float = 120.0
-    #: 两个静默谷之间至少要隔多久才当作「两次停顿」。旧默认 1.0s 配上海量
-    #: 噪声会在一次对拉内部切出一堆假边界，所以这里不能取太小。
+    #: Minimum separation between two quiet valleys for them to count as "two pauses". The old
+    #: default of 1.0s plus lots of noise would cut a bunch of false boundaries inside a single
+    #: rally, so this cannot be too small.
     min_quiet: float = 0.7
-    #: 静默谷的显著度门限（相对 p95-p20）。旧默认 0.30 太高：多球场素材里
-    #: 球员捡球时也在走动，谷本来就浅，于是大半回合之间的停顿被判成「不是谷」，
-    #: 相邻回合被粘在一起。
+    #: Prominence threshold for quiet valleys (relative to p95-p20). The old default of 0.30 is too
+    #: high: in multi-court footage players also walk while picking up the shuttle, so valleys are
+    #: inherently shallow, and most inter-rally pauses are judged "not a valley", gluing adjacent rallies together.
     prominence_ratio: float = 0.18
-    #: 静默段里「站定」之后还要往前留多久（接发球准备动作）
+    #: How long to keep before "standing still" within the quiet segment (receiving-ready motion)
     pre_roll: float = 1.0
-    #: 回合结束后往后留多久（球落地后的收势）
+    #: How long to keep after the rally ends (follow-through after the shuttle lands)
     post_roll: float = 1.6
-    #: 静默段短于这个长度就不算「回合结束」（避免把一次长停顿当成回合边界）
+    #: A quiet segment shorter than this does not count as "rally end" (avoid treating one long pause as a rally boundary)
     min_rest: float = 0.8
-    #: 允许的最短回合，比它短的候选丢掉。旧默认 2.5s 在业余素材上有「刀刃
-    #: 效应」：实测有整段因为最长连续移动段 2.42s（差 0.08s）被否掉。
-    #: 业余回合里球员「站着看球」的瞬间很多，连续移动段本来就短。
+    #: The minimum allowed rally length; shorter candidates are dropped. The old default of 2.5s has a
+    #: "knife-edge effect" on amateur footage: measured cases where a whole segment was rejected because
+    #: its longest continuous movement stretch was 2.42s (0.08s short). In amateur rallies players have many
+    #: moments of "standing and watching the shuttle", so continuous movement stretches are inherently short.
     min_core: float = 1.0
 
 
@@ -352,11 +365,12 @@ def segment_by_player_motion(
     sig: SegmentSignals,
     opt: SegmentOptions | None = None,
 ) -> list[RawSegment]:
-    """用「球员运动 + 静默段」切出回合。
+    """Segment rallies using "player motion + quiet segments".
 
-    区间定义：从**一段静默结束之后的第一次明显移动**开始，到**下一次静默
-    开始之前的最后一次明显移动**结束。这样得到的就是「球在飞」的时间窗，
-    不含捡球的走动，也不会跨过两次得分之间的停顿。
+    Interval definition: start at **the first obvious movement after a quiet segment ends**, and end
+    at **the last obvious movement before the next quiet segment begins**. What this yields is the
+    time window where "the shuttle is in flight", excluding the walking of picking up the shuttle,
+    and never crossing the pause between two points.
     """
     opt = opt or SegmentOptions()
     m = sig.player_motion
@@ -373,11 +387,11 @@ def segment_by_player_motion(
     base = float(np.percentile(m, 20))
     top = float(np.percentile(m, 95))
     span = max(top - base, EPS)
-    # 「明显移动」的门限：静默地板 + 25% 动态范围
+    # Threshold for "obvious movement": quiet floor + 25% of the dynamic range
     move_thr = base + 0.25 * span
     moving = m >= move_thr
 
-    # 球员检测长时间失效的时间段：那里的「静默」是假的，不能拿它当边界
+    # Stretches where player detection is invalid for a long time: the "silence" there is fake, so it cannot be used as a boundary
     unknown = None
     if sig.coverage is not None and sig.coverage.size == n:
         unknown = sig.coverage < 0.5
@@ -413,7 +427,7 @@ def segment_by_player_motion(
             return
         segs_out.append(RawSegment(start=start, end=end, score=score, meta=dict(meta)))
 
-    # ---- 静默段 → 回合：相邻两个静默段之间就是候选回合
+    # ---- Quiet segments -> rallies: between two adjacent quiet segments is a candidate rally
     segs: list[RawSegment] = []
     for k in range(len(quiet) - 1):
         q0, q1 = quiet[k], quiet[k + 1]
@@ -427,7 +441,7 @@ def segment_by_player_motion(
         _add(segs, q0.end, q1.start,
              {"rest_before": round(rest, 2), "quiet_depth": round(q1.depth, 2)})
 
-    # ---- 片头/片尾：如果视频一开始就在对拉，第一个静默段之前也是一个回合
+    # ---- Head/tail: if the video starts mid-rally, the stretch before the first quiet segment is also a rally
     first = quiet[0]
     if first.start / fps > opt.min_core and first.start > first_known:
         _add(segs, first_known, first.start, {"head": True})
@@ -441,14 +455,16 @@ def segment_by_player_motion(
 
 def _trim_to_motion(moving: np.ndarray, lo: int, hi: int, m: np.ndarray,
                     fps: float, opt: SegmentOptions) -> tuple[int, int, float] | None:
-    """在候选区间 ``[lo, hi)`` 里收紧到「真的有移动」的核心区段。
+    """Tighten the candidate interval ``[lo, hi)`` to the core stretch where "there really is movement".
 
-    收紧的作用：静默段的边界是按「低于静默地板」定的，而球员在还没完全站定
-    的时候就已经不算静默了；反过来运动段的头尾也常常是缓慢起动 / 惯性收势。
+    What tightening does: quiet-segment boundaries are defined by "below the quiet floor", but players
+    already stop counting as quiet before they have fully come to a standstill; conversely, the head
+    and tail of a movement segment are often a slow start / inertial follow-through.
 
-    做法是找「最大的连通团」而不是「第一段运动」：一场多拍对拉里球员会有
-    短暂站着看球的一瞬（比如球飞过顶时两个人都抬头不动），如果按「第一段」
-    截断，一个回合就会被切成两半。
+    The approach is to find "the largest connected clump" rather than "the first movement segment":
+    in a long multi-shot rally players have brief moments of standing and watching the shuttle (for
+    example when it flies overhead, both look up and freeze); if truncated by "the first segment", a
+    rally would be cut into two halves.
     """
     if hi <= lo:
         return None
@@ -456,7 +472,7 @@ def _trim_to_motion(moving: np.ndarray, lo: int, hi: int, m: np.ndarray,
     if idx.size == 0:
         return None
     gap = max(1, int(round(0.35 * fps)))
-    # 按「间隔 > gap」切成若干连通团
+    # Split into connected clumps where "separation > gap"
     splits = np.nonzero(np.diff(idx) > gap)[0]
     bounds = np.concatenate([[0], splits + 1, [idx.size]])
     best: tuple[int, int] | None = None
@@ -472,7 +488,7 @@ def _trim_to_motion(moving: np.ndarray, lo: int, hi: int, m: np.ndarray,
     base = float(np.percentile(m, 20))
     span = max(float(np.percentile(m, 95)) - base, EPS)
     score = float(np.clip((float(seg.mean()) - base) / span, 0.0, 1.0))
-    # 移动占空比太低说明这段主要是少量走动，不是回合
+    # A too-low movement duty ratio means this stretch is mostly a little walking, not a rally
     duty = float(np.count_nonzero(moving[lo + s_i: lo + e_i + 1])) / max(1, e_i - s_i + 1)
     if duty < 0.35 or (e_i - s_i) / fps < opt.min_core:
         return None
@@ -481,7 +497,7 @@ def _trim_to_motion(moving: np.ndarray, lo: int, hi: int, m: np.ndarray,
 
 def _split_long(m: np.ndarray, fps: float, start: float, end: float,
                 opt: SegmentOptions) -> list[RawSegment]:
-    """超长回合按内部最深的静默谷切开。"""
+    """Split an over-long rally at its deepest internal quiet valley."""
     a, b = int(start * fps), int(end * fps)
     if b - a < int(2 * opt.min_core * fps):
         return [RawSegment(start=start, end=end)]
@@ -499,7 +515,7 @@ def _split_long(m: np.ndarray, fps: float, start: float, end: float,
 
 
 def _dedupe(segs: list[RawSegment]) -> list[RawSegment]:
-    """去掉互相重叠的候选，保留更「有料」的那个；并消除首尾相接。"""
+    """Drop mutually overlapping candidates, keeping the more "substantial" one; and eliminate end-to-end abutment."""
     if not segs:
         return []
     segs = sorted(segs, key=lambda s: (s.start, -(s.end - s.start)))
@@ -509,13 +525,13 @@ def _dedupe(segs: list[RawSegment]) -> list[RawSegment]:
         if cur.start >= prev.end - 0.05:
             out.append(cur)
             continue
-        # 重叠：谁更长留谁
+        # Overlap: keep whichever is longer
         if (cur.end - cur.start) > (prev.end - prev.start):
             out[-1] = cur
     return out
 
 
-# ------------------------------------------------------------------ 主入口
+# ------------------------------------------------------------------ Main entry
 
 
 def segment_visual(
@@ -530,22 +546,23 @@ def segment_visual(
     hit_density: np.ndarray | None = None,
     opt: SegmentOptions | None = None,
 ) -> tuple[list[RawSegment], float]:
-    """面向流水线的入口：用球员运动切分，并返回球员检测的有效覆盖率。
+    """Pipeline-facing entry: segment using player motion, and return the valid coverage of player detection.
 
-    做法上有一个容易忽略但很关键的点：**球员检测失效的时间不能被当成
-    「球员没动」**。真实素材里比赛球员常常有一半以上的时间检不到
-    （在 960×540 代理上人只有 80~120 像素高），如果直接用球员运动曲线，
-    那些空洞会被读成一次长停顿，夹在它两边的真实回合就都被吃掉了。
-    实测 5 分钟素材上新旧两种写法分别是 5 个回合和 1 个回合。
+    There is an easily overlooked but crucial point in the approach: **times when player detection is
+    invalid must not be treated as "the players did not move"**. In real footage the match players
+    are often undetected for more than half the time (on a 960x540 proxy a person is only 80~120 pixels
+    tall); if the player-motion curve is used directly, those holes get read as one long pause and the
+    real rallies on either side are swallowed. Measured on 5 minutes of footage, the old and new
+    approaches gave 5 rallies and 1 rally respectively.
 
-    所以这里：
-      1. 先算逐帧的「检测是否有效」（``detection_coverage``，带 1.5 秒闭运算）；
-      2. 在检测失效的时间上**用画面活跃度补位**（``blend_with_activity``）；
-      3. 边界只允许落在检测有效的地方（否则那段「静默」不可信）。
+    So here:
+      1. first compute per-frame "whether detection is valid" (``detection_coverage``, with a 1.5-second closing operation);
+      2. where detection is invalid, **fill in with frame activity** (``blend_with_activity``);
+      3. boundaries are only allowed to fall where detection is valid (otherwise the "silence" there is untrustworthy).
 
     Returns:
-        ``(回合列表, 球员检测覆盖率 0~1)``。覆盖率很低时调用方应当改用
-        活跃度切分。
+        ``(rally list, player detection coverage 0~1)``. When coverage is very low the caller should
+        switch to activity segmentation.
     """
     opt = opt or SegmentOptions()
     n = max(1, int(round(duration * fps)))
@@ -563,8 +580,8 @@ def segment_visual(
     if act is not None and np.any(act):
         act = _robust_norm(_smooth(act, max(1, int(fps * 1.2))))
         m = blend_with_activity(m, cov, act)
-    # 击球密度是这条素材上区分度最高的一路（见 `audio_visual_evidence`）。
-    # 把它乘进球员运动里，让「球员在动」和「这一带在连续击球」同时成立才算回合。
+    # Hit density is the most discriminative signal on this footage (see `audio_visual_evidence`).
+    # Multiply it into player motion, so a rally requires both "players are moving" and "hits are continuous around here".
     if hit_density is not None and hit_density.size == n:
         m = audio_visual_evidence(m, hit_density)
     if not np.any(m):
@@ -592,17 +609,18 @@ def segment_activity(
     shuttle_presence: np.ndarray | None = None,
     shuttle_fps: float = 0.0,
 ) -> list[RawSegment]:
-    """只用融合活跃度曲线切分（球员信号不可用时的主力方案）。
+    """Segment using only the fused activity curve (the primary approach when the player signal is unavailable).
 
-    与旧路径（``rally.segment``）的区别，也正是旧路径切不准的原因：
+    The differences from the old path (``rally.segment``) are exactly why the old path segmented poorly:
 
-    1. **不做无条件的递归等分。** 旧路径只要区间比目标时长长一点点，
-       就在区间内部找最低点切一刀；这正是「32 个回合平均 20 秒、
-       大量片段首尾相接」的来源。这里只在**谷的显著度足够**时才切，
-       而且切点用的是谷中心（真正的停顿）而不是任意最低点。
-    2. **显著性自适应。** 显著度门限按 (p95 - p20) 的比例定，不写死绝对值，
-       所以安静球馆和嘈杂球馆用同一套参数。
-    3. **相邻回合之间必须留出停顿。** 输出不会首尾相接。
+    1. **No unconditional recursive equal division.** The old path cut at the lowest point inside an
+       interval whenever it was even slightly longer than the target duration; this is precisely the
+       source of "32 rallies averaging 20 seconds, with many fragments end-to-end". Here, cutting only
+       happens when **the valley's prominence is sufficient**, and the cut point is the valley center
+       (the real pause) rather than any arbitrary lowest point.
+    2. **Adaptive prominence.** The prominence threshold is set as a ratio of (p95 - p20) rather than a
+       hard-coded absolute value, so a quiet gym and a noisy gym use the same set of parameters.
+    3. **A pause must be left between adjacent rallies.** The output will not be end-to-end.
     """
     opt = opt or SegmentOptions()
     n = activity.size
@@ -614,7 +632,7 @@ def segment_activity(
     quiet = find_quiet_spans(activity, fps, min_quiet=opt.min_quiet,
                              prominence_ratio=opt.prominence_ratio)
 
-    # 活跃门限：静默地板 + 30% 动态范围
+    # Active threshold: quiet floor + 30% of the dynamic range
     live_thr = base + 0.30 * span
     live = activity >= live_thr
 
@@ -677,17 +695,18 @@ def segment_activity(
 
 def verify_with_shuttle(segs: list[RawSegment], sig: SegmentSignals,
                         opt: SegmentOptions) -> list[RawSegment]:
-    """用「羽毛球在不在飞」校验回合。
+    """Validate rallies with "whether the shuttle is in flight".
 
-    羽毛球一旦可见，就说明这一拍确实在打；反过来，如果一个候选回合的核心
-    区间里几乎从没看到球，那它更可能是捡球/换场。只在羽毛球信号**足够可靠**
-    （全片有一定出现率）时才动手，避免把这个模块变成新的不准确来源。
+    Once the shuttle is visible, that shot is indeed being played; conversely, if the shuttle is
+    almost never seen in a candidate rally's core interval, it is more likely picking up the shuttle /
+    changing ends. It only acts when the shuttle signal is **reliable enough** (a certain presence rate
+    across the clip), to avoid turning this module into a new source of inaccuracy.
     """
     sh = sig.shuttle
     if sh is None or sh.size == 0:
         return segs
     cover = float(np.mean(sh > 0.15))
-    if cover < 0.05 or cover > 0.9:      # 太少 = 检不到；太多 = 一直是噪声
+    if cover < 0.05 or cover > 0.9:      # too little = cannot detect; too much = always noise
         return segs
     fps = sig.fps
     out: list[RawSegment] = []
@@ -701,9 +720,9 @@ def verify_with_shuttle(segs: list[RawSegment], sig: SegmentSignals,
         hit_ratio = float(np.mean(core > 0.15))
         s.meta["shuttle_ratio"] = round(hit_ratio, 3)
         if hit_ratio < 0.02:
-            # 整段看不到球：不是回合，丢掉
+            # No shuttle visible in the whole segment: not a rally, drop it
             continue
-        # 用「球存在的第一/最后一帧」收紧边界，但保留 pre/post roll 的呼吸
+        # Tighten the boundaries using "the first/last frame where the shuttle exists", but keep the breathing room of pre/post roll
         nz = np.nonzero(core > 0.15)[0]
         if nz.size >= 2:
             s.start = max(s.start, (a + int(nz[0])) / fps - opt.pre_roll * 0.5)

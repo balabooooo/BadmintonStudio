@@ -1,28 +1,64 @@
 import { motion } from 'motion/react'
 import { useEffect, useState } from 'react'
-import { Download, Film, FolderOpen, RefreshCw, Play } from 'lucide-react'
+import { AlertTriangle, Download, Film, FolderOpen, FolderSearch, RefreshCw, Play } from 'lucide-react'
 import { api } from '../lib/api'
 import { bytes, relTime } from '../lib/format'
 import { Button, Card, Empty, Modal, Skeleton } from './ui'
 import { useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
+import type { ExportItem } from '../lib/types'
 
 export default function ExportsPage() {
+  const t = useT()
   const toast = useStore((s) => s.toast)
-  const [files, setFiles] = useState<{ name: string; path: string; size: number; mtime: number }[] | null>(null)
+  const [files, setFiles] = useState<ExportItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [playing, setPlaying] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
 
   async function load() {
     try {
-      setFiles(await api.listExports())
-    } catch {
-      setFiles([])
+      const list = await api.listExports()
+      setFiles(list)
+      setError(null)
+    } catch (e) {
+      // 不要吞掉错误只显示空列表：那会让人以为导出文件都没了。
+      setError(String((e as Error)?.message || e))
+      setFiles((prev) => prev ?? [])
+    }
+  }
+
+  async function refresh() {
+    setRefreshing(true)
+    try {
+      await load()
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  const reveal = async (id: string) => {
+    try {
+      await api.revealExport(id)
+    } catch (e) {
+      toast({ kind: 'error', title: t('exports.revealFailed'), detail: String(e) })
+    }
+  }
+
+  const copyPath = async (p: string | undefined) => {
+    if (!p) return
+    try {
+      await navigator.clipboard.writeText(p)
+      toast({ kind: 'info', title: t('common.copied') })
+    } catch (e) {
+      toast({ kind: 'error', title: t('exports.copyFailed'), detail: String(e) })
     }
   }
 
   useEffect(() => {
     load()
-    const t = window.setInterval(load, 4000)
-    return () => window.clearInterval(t)
+    const timer = window.setInterval(load, 4000)
+    return () => window.clearInterval(timer)
   }, [])
 
   return (
@@ -30,18 +66,29 @@ export default function ExportsPage() {
       <div className="mx-auto max-w-[1300px] px-8 py-8">
         <div className="mb-6 flex items-end justify-between gap-4">
           <div>
-            <h1 className="text-[24px] font-semibold tracking-tight text-white">导出记录</h1>
-            <p className="mt-1 text-[12.5px] text-ink-400">
-              成片统一保存在 data/exports 目录（所有工程共用），可直接播放或另存
-            </p>
+            <h1 className="text-[24px] font-semibold tracking-tight text-white">{t('exports.title')}</h1>
+            <p className="mt-1 text-[12.5px] text-ink-400">{t('exports.subtitle')}</p>
           </div>
-          <Button variant="outline" onClick={load}>
+          <Button variant="outline" onClick={() => void refresh()} loading={refreshing}>
             <RefreshCw size={13} />
-            刷新
+            {t('common.refresh')}
           </Button>
         </div>
 
-        {files === null ? (
+        {error && !files?.length ? (
+          <Card className="py-6">
+            <Empty
+              icon={<AlertTriangle size={34} className="text-amber-glow" />}
+              title={t('exports.loadFailed')}
+              desc={error}
+              action={
+                <Button variant="outline" onClick={() => void load()}>
+                  <RefreshCw size={13} /> {t('common.retry')}
+                </Button>
+              }
+            />
+          </Card>
+        ) : files === null ? (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4">
             {[0, 1].map((i) => (
               <Skeleton key={i} className="h-[180px]" />
@@ -49,13 +96,13 @@ export default function ExportsPage() {
           </div>
         ) : files.length === 0 ? (
           <Card className="py-6">
-            <Empty icon={<Film size={34} />} title="还没有导出过成片" desc="在剪辑台里自动剪辑后，点击右上角「导出」即可生成成片。" />
+            <Empty icon={<Film size={34} />} title={t('exports.emptyTitle')} desc={t('exports.emptyDesc')} />
           </Card>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(330px,1fr))] gap-4">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4">
             {files.map((f, i) => (
               <motion.div
-                key={f.name}
+                key={f.id}
                 initial={{ opacity: 0, y: 12 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: Math.min(i * 0.05, 0.35), duration: 0.36 }}
@@ -63,7 +110,7 @@ export default function ExportsPage() {
                 <Card hover className="overflow-hidden">
                   <div className="relative flex h-[130px] items-center justify-center bg-ink-850">
                     <video
-                      src={api.exportUrl(f.name)}
+                      src={api.exportUrl(f.id)}
                       className="h-full w-full object-cover"
                       muted
                       preload="metadata"
@@ -73,7 +120,8 @@ export default function ExportsPage() {
                       }}
                     />
                     <button
-                      onClick={() => setPlaying(f.name)}
+                      onClick={() => setPlaying(f.id)}
+                      aria-label={t('exports.play')}
                       className="absolute inset-0 grid place-items-center bg-ink-950/25 opacity-0 transition-opacity hover:opacity-100"
                     >
                       <span className="grid h-12 w-12 place-items-center rounded-full bg-court-500/90 text-ink-950 shadow-lg">
@@ -93,14 +141,14 @@ export default function ExportsPage() {
                       size="sm"
                       onClick={() => {
                         const a = document.createElement('a')
-                        a.href = api.exportUrl(f.name)
+                        a.href = api.exportUrl(f.id)
                         a.download = f.name
                         a.click()
-                        toast({ kind: 'info', title: '开始下载', detail: f.name })
+                        toast({ kind: 'info', title: t('exports.downloadStarted'), detail: f.name })
                       }}
                     >
                       <Download size={13} />
-                      保存
+                      {t('exports.save')}
                     </Button>
                   </div>
                 </Card>
@@ -110,26 +158,41 @@ export default function ExportsPage() {
         )}
       </div>
 
-      <Modal open={!!playing} onClose={() => setPlaying(null)} title={playing || ''} width={900}>
+      <Modal
+        open={!!playing}
+        onClose={() => setPlaying(null)}
+        title={files?.find((f) => f.id === playing)?.name || ''}
+        width={900}
+      >
         {playing && (
           <video src={api.exportUrl(playing)} controls autoPlay className="w-full rounded-lg bg-black" />
         )}
-        <div className="mt-3 flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-[11.5px] text-ink-400">
-            <FolderOpen size={12} />
-            {files?.find((f) => f.name === playing)?.path}
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <div className="mono flex min-w-0 items-center gap-1.5 text-[11.5px] text-ink-400">
+            <FolderOpen size={12} className="shrink-0" />
+            <span className="truncate" title={files?.find((f) => f.id === playing)?.path}>
+              {files?.find((f) => f.id === playing)?.path}
+            </span>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              const p = files?.find((f) => f.name === playing)?.path
-              if (p) navigator.clipboard.writeText(p)
-              toast({ kind: 'info', title: '路径已复制' })
-            }}
-          >
-            复制路径
-          </Button>
+          <div className="flex shrink-0 gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void copyPath(files?.find((f) => f.id === playing)?.path)}
+            >
+              {t('exports.copyPath')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (playing) void reveal(playing)
+              }}
+            >
+              <FolderSearch size={13} />
+              {t('exports.openFolder')}
+            </Button>
+          </div>
         </div>
       </Modal>
     </div>

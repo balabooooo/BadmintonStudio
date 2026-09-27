@@ -1,6 +1,6 @@
-"""BadmintonStudio - Windows 端羽毛球视频 AI 自动剪辑软件。
+"""BadmintonStudio - Windows AI automatic badminton video editing software.
 
-后端包入口。
+Backend package entry point.
 """
 
 __version__ = "0.1.0"

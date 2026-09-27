@@ -1,6 +1,7 @@
-"""侦察脚本：抽取测试视频的关键帧，输出联络图，便于人工/多模态确认机位与场地。
+"""Reconnaissance script: extract keyframes from a test video and output a contact sheet,
+making it easier to confirm the camera angle and court by hand / multimodally.
 
-用法:
+Usage:
     python scripts/probe_video.py "<video path>" [--from 0] [--span 60] [--n 8]
 """
 

@@ -1,6 +1,7 @@
 /** 通用 UI 原语：按钮、徽章、滑块、进度、弹窗、提示等。 */
 
 import { AnimatePresence, motion } from 'motion/react'
+import { Gauge } from 'lucide-react'
 import {
   createContext,
   useContext,
@@ -14,7 +15,9 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '../lib/format'
+import { SPEEDS } from '../lib/playback'
 import { useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
 
 /* ------------------------------------------------------------------ 按钮 */
 
@@ -274,6 +277,79 @@ export function Slider({
   )
 }
 
+/* ------------------------------------------------------------------ 倍速 */
+
+/** 预设倍速菜单：Gauge 按钮 + 向上/向下展开的档位弹层。
+ *
+ * 工作室播放器和标注页共用，避免两处各写一套（标注页此前用裸 range，
+ * 还被全局 `input[type=range]{width:100%}` 撑成整行，几乎看不出是倍速）。
+ *
+ * `direction` 决定弹层展开方向：控件在底部用 up，在顶部用 down。
+ */
+export function SpeedMenu({
+  value,
+  onChange,
+  title,
+  direction = 'up',
+}: {
+  value: number
+  onChange: (v: number) => void
+  /** 按钮 tooltip 文案 */
+  title: string
+  direction?: 'up' | 'down'
+}) {
+  const [open, setOpen] = useState(false)
+  const up = direction === 'up'
+  return (
+    <div className="relative">
+      <Tooltip content={title} side={up ? 'top' : 'bottom'}>
+        <Button variant="ghost" size="sm" onClick={() => setOpen((v) => !v)}>
+          <Gauge size={13} />
+          <span className="mono">{value}×</span>
+        </Button>
+      </Tooltip>
+      <AnimatePresence>
+        {open && (
+          <>
+            {/* 点击空白处关闭。用 portal 挂到 body：
+                页面外壳 .anim-in 带 transform 动画，留在里面的话 fixed 会以它为参照，
+                遮罩只盖住局部，点别处关不掉这个弹层。 */}
+            {createPortal(
+              <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />,
+              document.body,
+            )}
+            <motion.div
+              initial={{ opacity: 0, y: up ? 6 : -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: up ? 6 : -6 }}
+              className={cn(
+                'panel absolute z-50 flex flex-col p-1',
+                up ? 'right-0 bottom-full mb-1.5' : 'left-0 top-full mt-1.5',
+              )}
+            >
+              {SPEEDS.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => {
+                    onChange(s)
+                    setOpen(false)
+                  }}
+                  className={cn(
+                    'mono rounded-md px-3 py-1 text-[11.5px] transition-colors',
+                    value === s ? 'bg-court-500/20 text-court-300' : 'text-ink-300 hover:bg-white/8',
+                  )}
+                >
+                  {s}×
+                </button>
+              ))}
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
 /* ------------------------------------------------------------------ 开关 */
 
 export function Toggle({
@@ -365,6 +441,15 @@ export function Segmented<T extends string>({
 
 /* ------------------------------------------------------------------ 弹窗 */
 
+/**
+ * 已打开弹窗的栈（按打开顺序）。
+ *
+ * 每个 Modal 都监听 window 的 Escape；堆叠时（例如场地编辑器上又弹出确认框）
+ * 两个监听器会同时触发、一次 Escape 关掉两层。用这个栈记录打开顺序，只让
+ * 最上层响应。卸载 / 关闭时对应 id 出栈。
+ */
+const modalStack: symbol[] = []
+
 export function Modal({
   open,
   onClose,
@@ -382,12 +467,30 @@ export function Modal({
   width?: number
   footer?: ReactNode
 }) {
+  const tr = useT()
+  // onClose 可能是每次渲染新建的内联函数；放进 ref，让下面的 effect 只依赖 open，
+  // 这样堆叠中下层弹窗重渲染时不会重新入栈、把自己顶到最上层。
+  const closeRef = useRef(onClose)
+  useEffect(() => {
+    closeRef.current = onClose
+  })
+  const [stackId] = useState(() => Symbol('modal'))
   useEffect(() => {
     if (!open) return
-    const h = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    modalStack.push(stackId)
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (modalStack[modalStack.length - 1] !== stackId) return
+      e.stopPropagation()
+      closeRef.current()
+    }
     window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [open, onClose])
+    return () => {
+      window.removeEventListener('keydown', h)
+      const i = modalStack.indexOf(stackId)
+      if (i >= 0) modalStack.splice(i, 1)
+    }
+  }, [open, stackId])
 
   // 弹窗也挂到 body：页面外壳（.anim-in）上带着 transform 动画，
   // 留在它里面的话 fixed 会以那个盒子为参照，遮罩盖不住顶栏、定位也会偏。
@@ -402,6 +505,9 @@ export function Modal({
         >
           <div className="absolute inset-0 bg-ink-950/72 backdrop-blur-[3px]" onClick={onClose} />
           <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-label={title}
             initial={{ opacity: 0, scale: 0.975, y: 14 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.98, y: 8 }}
@@ -414,7 +520,7 @@ export function Modal({
                 <h2 className="truncate text-[15px] font-semibold text-white">{title}</h2>
                 {subtitle && <p className="mt-0.5 text-[11.5px] text-ink-400">{subtitle}</p>}
               </div>
-              <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭">
+              <Button variant="ghost" size="icon" onClick={onClose} aria-label={tr('common.close')}>
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M18 6 6 18M6 6l12 12" />
                 </svg>
@@ -448,6 +554,7 @@ export function Tooltip({
   width = 264,
   className,
   block,
+  kbd,
 }: {
   children: ReactNode
   content: ReactNode
@@ -461,6 +568,8 @@ export function Tooltip({
    * 子元素的 w-full 会算成 0，整块就看不见了。
    */
   block?: boolean
+  /** 快捷键提示：一个或多个按键，渲染成 Kbd 徽章跟在说明下方。 */
+  kbd?: string | string[]
 }) {
   const [show, setShow] = useState(false)
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null)
@@ -534,6 +643,13 @@ export function Tooltip({
               )}
             >
               {content}
+              {kbd && (
+                <span className="mt-1.5 flex items-center gap-1 border-t border-white/10 pt-1.5">
+                  {(Array.isArray(kbd) ? kbd : [kbd]).map((k) => (
+                    <Kbd key={k}>{k}</Kbd>
+                  ))}
+                </span>
+              )}
             </motion.span>
           )}
         </AnimatePresence>,
@@ -696,6 +812,7 @@ export function ContextMenu({
   return createPortal(
     <div
       ref={ref}
+      role="menu"
       className="panel fixed z-[70] min-w-[180px] overflow-hidden py-1"
       style={{
         left: pos?.left ?? x,
@@ -750,56 +867,46 @@ export function useConfirm() {
 }
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<{
-    open: boolean
-    title: string
-    desc?: string
-    danger?: boolean
-    resolve?: (v: boolean) => void
-  }>({ open: false, title: '' })
+  const tr = useT()
+  // 用队列而不是单个 state：并发 ask() 时（例如确认框还没关又来了一个）
+  // 覆盖式写法会把前一个 resolve 丢掉，导致它的 Promise 永远挂着。
+  const [queue, setQueue] = useState<
+    { title: string; desc?: string; danger?: boolean; resolve: (v: boolean) => void }[]
+  >([])
 
   const ask = useMemo(
     () => (opts: { title: string; desc?: string; danger?: boolean }) =>
-      new Promise<boolean>((resolve) => setState({ open: true, ...opts, resolve })),
+      new Promise<boolean>((resolve) => setQueue((q) => [...q, { ...opts, resolve }])),
     [],
   )
+
+  const current = queue[0]
+  const settle = (v: boolean) => {
+    current?.resolve(v)
+    setQueue((q) => q.slice(1))
+  }
 
   return (
     <ConfirmCtx.Provider value={ask}>
       {children}
       <Modal
-        open={state.open}
-        onClose={() => {
-          state.resolve?.(false)
-          setState((s) => ({ ...s, open: false }))
-        }}
-        title={state.title}
-        subtitle={state.desc}
+        open={!!current}
+        onClose={() => settle(false)}
+        title={current?.title ?? ''}
+        subtitle={current?.desc}
         width={440}
         footer={
           <div className="flex justify-end gap-2">
-            <Button
-              variant="ghost"
-              onClick={() => {
-                state.resolve?.(false)
-                setState((s) => ({ ...s, open: false }))
-              }}
-            >
-              取消
+            <Button variant="ghost" onClick={() => settle(false)}>
+              {tr('common.cancel')}
             </Button>
-            <Button
-              variant={state.danger ? 'danger' : 'primary'}
-              onClick={() => {
-                state.resolve?.(true)
-                setState((s) => ({ ...s, open: false }))
-              }}
-            >
-              确认
+            <Button variant={current?.danger ? 'danger' : 'primary'} onClick={() => settle(true)}>
+              {tr('common.confirm')}
             </Button>
           </div>
         }
       >
-        <p className="text-[12.5px] leading-relaxed text-ink-300">此操作会立即生效。</p>
+        <p className="text-[12.5px] leading-relaxed text-ink-300">{tr('common.actionImmediate')}</p>
       </Modal>
     </ConfirmCtx.Provider>
   )

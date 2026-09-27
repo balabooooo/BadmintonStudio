@@ -1,10 +1,10 @@
-"""FFmpeg / FFprobe 定位与命令执行封装。
+"""FFmpeg / FFprobe location and command execution wrapper.
 
-优先级：
-1. 环境变量 ``BMS_FFMPEG`` / ``BMS_FFPROBE``
-2. 工程内 ``tools/ffmpeg/bin``
-3. ``imageio-ffmpeg`` 自带的静态构建
-4. 系统 PATH
+Priority:
+1. Environment variables ``BMS_FFMPEG`` / ``BMS_FFPROBE``
+2. In-project ``tools/ffmpeg/bin``
+3. The static build bundled with ``imageio-ffmpeg``
+4. System PATH
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from ..config import TOOLS_DIR
+from ..i18n import tr
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -48,12 +49,12 @@ def find_ffmpeg() -> str:
                 _ffmpeg_cache = str(p)
                 return _ffmpeg_cache
 
-    try:  # imageio-ffmpeg 自带静态构建
+    try:  # static build bundled with imageio-ffmpeg
         import imageio_ffmpeg
 
         _ffmpeg_cache = imageio_ffmpeg.get_ffmpeg_exe()
         return _ffmpeg_cache
-    except Exception:  # pragma: no cover - 依赖缺失时回退
+    except Exception:  # pragma: no cover - fallback when the dependency is missing
         pass
 
     found = shutil.which("ffmpeg")
@@ -61,10 +62,7 @@ def find_ffmpeg() -> str:
         _ffmpeg_cache = found
         return _ffmpeg_cache
 
-    raise FileNotFoundError(
-        "找不到 ffmpeg。请将 ffmpeg.exe 放入 tools/ffmpeg/bin，"
-        "或设置环境变量 BMS_FFMPEG。"
-    )
+    raise FileNotFoundError(tr("ffmpeg.not_found"))
 
 
 def find_ffprobe() -> str | None:
@@ -92,7 +90,7 @@ def find_ffprobe() -> str | None:
 
 
 def caps() -> dict[str, bool]:
-    """探测当前 ffmpeg 构建支持哪些能力。"""
+    """Detect which capabilities the current ffmpeg build supports."""
     out = run([find_ffmpeg(), "-hide_banner", "-encoders"], capture=True).stdout
     result = {
         "nvenc_h264": "h264_nvenc" in out,
@@ -107,7 +105,7 @@ def caps() -> dict[str, bool]:
     return result
 
 
-# ------------------------------------------------------------------ 进程执行
+# ------------------------------------------------------------------ Process execution
 
 
 @dataclass
@@ -144,7 +142,8 @@ def run(cmd: Sequence[str], capture: bool = True, check: bool = False) -> ProcRe
     out, err = p.communicate()
     res = ProcResult(p.returncode, out or "", err or "")
     if check and not res.ok:
-        raise RuntimeError(f"命令失败 ({res.returncode}): {' '.join(map(str, cmd))}\n{res.stderr[-4000:]}")
+        raise RuntimeError(tr("ffmpeg.command_failed", code=res.returncode,
+                              cmd=" ".join(map(str, cmd)), stderr=res.stderr[-4000:]))
     return res
 
 
@@ -159,7 +158,7 @@ def run_with_progress(
     cancel: Callable[[], bool] | None = None,
     log_tail: int = 8000,
 ) -> ProcResult:
-    """执行 ffmpeg 并解析 ``-progress`` 输出回报 0~1 进度。"""
+    """Run ffmpeg and parse the ``-progress`` output to report 0~1 progress."""
     p = _popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     tail: list[str] = []
     try:
@@ -188,10 +187,10 @@ def run_with_progress(
 
 
 def probe_json(path: str | Path) -> dict:
-    """用 ffprobe 读取媒体信息。"""
+    """Read media information with ffprobe."""
     exe = find_ffprobe()
     if not exe:
-        raise FileNotFoundError("找不到 ffprobe")
+        raise FileNotFoundError(tr("ffmpeg.ffprobe_not_found"))
     res = run(
         [
             exe,
@@ -205,7 +204,7 @@ def probe_json(path: str | Path) -> dict:
         ]
     )
     if not res.ok:
-        raise RuntimeError(f"ffprobe 失败: {res.stderr[-2000:]}")
+        raise RuntimeError(tr("ffmpeg.probe_failed", stderr=res.stderr[-2000:]))
     return json.loads(res.stdout or "{}")
 
 

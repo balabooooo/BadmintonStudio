@@ -1,12 +1,13 @@
-"""回合标注与「用标注优化切分参数」的 REST 接口。
+"""REST API for rally annotation and "using annotations to optimize segmentation parameters".
 
-对应前端「标注」页：
-* 读取/保存某段素材的人工标注；
-* 一键从当前 AI 分析结果生成草稿（半自动标注）；
-* 用标注评估并搜索最优切分参数，返回指标供用户选择；
-* 导出 CSV。
+Corresponds to the frontend "Annotation" page:
+* Read/save the manual annotations for a media clip;
+* One-click generation of a draft from the current AI analysis result (semi-automatic annotation);
+* Evaluate with the annotations and search for the best segmentation parameters, returning metrics
+  for the user to choose from;
+* Export CSV.
 
-路由挂在主服务上（:mod:`bms.main`），不需要再起一个独立进程。
+The routes are mounted on the main service (:mod:`bms.main`); no separate process is needed.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from .. import config as CFG
 from ..analysis import annotation as AN
 from ..core import store as ST
 from ..core.models import AnalysisParams, MediaInfo, Project
+from ..i18n import tr
 
 router = APIRouter(prefix="/api/projects/{pid}/media/{mid}/annotation", tags=["annotation"])
 
@@ -30,10 +32,10 @@ def _load(pid: str) -> Project:
     try:
         proj = ST.load_project(pid)
     except ValueError as e:
-        # 非法 id 会被 store 拒绝（防路径穿越），这里是它对应的 HTTP 语义
+        # Illegal ids are rejected by store (to prevent path traversal); this is the corresponding HTTP semantics
         raise HTTPException(400, str(e)) from e
     if proj is None:
-        raise HTTPException(404, "工程不存在")
+        raise HTTPException(404, tr("api.project_not_found"))
     return proj
 
 
@@ -41,11 +43,11 @@ def _media(proj: Project, mid: str) -> MediaInfo:
     for m in proj.media:
         if m.id == mid:
             return m
-    raise HTTPException(404, "素材不存在")
+    raise HTTPException(404, tr("api.media_not_found"))
 
 
 def _auto_draft(proj: Project, mid: str) -> tuple[list[dict[str, Any]], float, float]:
-    """把当前分析结果里的回合作为标注草稿。"""
+    """Use the rallies in the current analysis result as annotation drafts."""
     res = proj.analyses.get(mid)
     if res is None or res.status != "done":
         return [], 0.0, 0.0
@@ -75,6 +77,8 @@ def get_annotation(pid: str, mid: str) -> dict:
         duration = float(m.duration or 0.0)
     if fps <= 0:
         fps = float(m.fps or 0.0)
+    res = proj.analyses.get(mid)
+    sig = (res.signals or {}) if res is not None else {}
     return {
         "media_id": mid,
         "media_name": m.name,
@@ -82,9 +86,15 @@ def get_annotation(pid: str, mid: str) -> dict:
         "fps": fps,
         "path": str(path),
         "rallies": AN.normalize_rallies(doc.get("rallies") or []),
+        "hits": AN.normalize_hits(doc.get("hits") or []),
         "focus": doc.get("focus"),
         "note": str(doc.get("note") or ""),
         "auto": auto,
+        # Signals for hit-level annotation: the audio envelope plus the raw / gated hit times.
+        "envelope": sig.get("envelope") or [],
+        "envelope_fps": float((sig.get("envelope_fps") or [0.0])[0] or 0.0),
+        "hit_times": sig.get("hit_times") or [],
+        "hit_times_raw": sig.get("hit_times_raw") or [],
     }
 
 
@@ -117,21 +127,29 @@ def export_csv(pid: str, mid: str) -> PlainTextResponse:
 
 @router.post("/optimize")
 def optimize(pid: str, mid: str, payload: dict = Body(default={})) -> dict:
-    """用标注评估当前切分，并搜索 F1 最高的一组参数。
+    """Evaluate the current segmentation against the annotation and search for the parameter set with the highest F1.
 
-    只读已存好的分析信号，不重跑 AI。返回里 ``best`` 是建议写回的参数，
-    ``results`` 是网格上靠前的结果，供前端展示。
+    Reads only the stored analysis signals; it does not re-run AI. In the return value, ``best`` is
+    the parameters to write back and ``results`` are the top results on the grid, for the frontend
+    to display.
     """
     proj = _load(pid)
     m = _media(proj, mid)
     res = proj.analyses.get(mid)
     if res is None or res.status != "done":
-        raise HTTPException(400, "还没有分析结果，请先运行一次 AI 分析")
+        raise HTTPException(400, tr("annotation.no_analysis"))
 
     doc = AN.load_annotation(AN.annotation_path(m))
     gt = [(float(r["start"]), float(r["end"])) for r in AN.normalize_rallies(doc.get("rallies") or [])]
     if not gt:
-        raise HTTPException(400, "还没有人工标注，请先标注几个回合再优化")
+        raise HTTPException(400, tr("annotation.no_labels"))
+
+    hit_labels = [(float(h["t"]), bool(h.get("ours", True)))
+                  for h in AN.normalize_hits(doc.get("hits") or [])]
+    # Hit-level stages are only meaningful when the user has actually marked at least one
+    # neighboring-court sound; labels that are all "ours" would simply reward keeping every hit.
+    if hit_labels and not any(not ours for _, ours in hit_labels):
+        hit_labels = []
 
     focus = doc.get("focus")
     if isinstance(focus, (list, tuple)) and len(focus) == 2:
@@ -139,7 +157,24 @@ def optimize(pid: str, mid: str, payload: dict = Body(default={})) -> dict:
     else:
         focus_t = None
 
-    # 允许前端带上「当前正在用的参数」当基座，这样优化结果能与屏幕上看到的一致。
+    # Hit-level labels unlock two extra calibration stages: the attribution gate threshold and the
+    # audio detection sensitivity. The latter needs the cached WAV (cheap STFT done once) so we can
+    # re-threshold over a sensitivity grid without re-running any video AI.
+    sensitivity_fn = None
+    if hit_labels:
+        try:
+            from ..analysis import audio_hits as AH
+            from ..core import media as _M
+
+            _M.ensure_audio(m)
+            if m.audio_path:
+                env = AH.build_hit_envelope(m.audio_path)
+                if env is not None:
+                    sensitivity_fn = lambda s, _e=env: AH.pick_hits(_e, sensitivity=float(s))
+        except Exception:  # noqa: BLE001
+            sensitivity_fn = None
+
+    # Allow the frontend to pass "the parameters currently in use" as a base, so the optimization result matches what is on screen.
     base = res.params
     for k, v in (payload.get("params") or {}).items():
         if hasattr(base, k):
@@ -147,7 +182,8 @@ def optimize(pid: str, mid: str, payload: dict = Body(default={})) -> dict:
     res = res.model_copy(update={"params": base})
 
     try:
-        result = AN.optimize(res, gt, focus=focus_t)
+        result = AN.optimize(res, gt, focus=focus_t, hit_labels=hit_labels,
+                             sensitivity_fn=sensitivity_fn)
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     except Exception as e:  # noqa: BLE001

@@ -1,16 +1,17 @@
-"""回合分割融合引擎。
+"""Rally segmentation fusion engine.
 
-把音频击球、画面运动、球员活跃度、羽毛球出现这四路互补信号融合成
-「这是一次回合」的逐帧置信度，再用带迟滞的状态机切出回合区间。
+Fuses four complementary signals — audio hits, frame motion, player activity, and shuttle presence —
+into a per-frame confidence that "this is a rally", then cuts rally intervals with a hysteresis state machine.
 
-设计原则
---------
-1. **每路信号先做鲁棒归一化**（分位数拉伸），避免不同量纲互相压制。
-2. **权重按可信度自适应**：某路信号如果区分度差（正态分布、没有双峰），
-   自动降权；这样在「音轨被 AGC 污染」或「画面没检出球员」时仍能工作。
-3. **迟滞 + 最短持续时间 + 间隔合并**：避免一次回合被切碎，也避免
-   脚步声/观众走动触发假回合。
-4. **边界回贴音频击球**：可用时把回合起点对齐到第一次击球（发球）。
+Design principles
+-----------------
+1. **Each signal is robustly normalized first** (quantile stretching) to avoid different dimensions overpowering each other.
+2. **Weights adapt to reliability**: if a signal has poor discriminative power (Gaussian distribution,
+   no bimodality), it is automatically down-weighted; this keeps things working when "the audio track is
+   polluted by AGC" or "no players are detected in the frame".
+3. **Hysteresis + minimum duration + gap merging**: avoid chopping a single rally apart, and avoid
+   footsteps / audience movement triggering false rallies.
+4. **Boundary snapping to audio hits**: when available, align the rally start to the first hit (serve).
 """
 
 from __future__ import annotations
@@ -25,11 +26,11 @@ from .audio_hits import HitDetection, cluster_rallies
 EPS = 1e-9
 
 
-# ------------------------------------------------------------------ 工具
+# ------------------------------------------------------------------ Utilities
 
 
 def robust_norm(a: np.ndarray, lo_q: float = 5.0, hi_q: float = 95.0) -> np.ndarray:
-    """分位数拉伸到 0~1；对离群值不敏感。"""
+    """Quantile-stretch to 0~1; insensitive to outliers."""
     if a is None or a.size == 0:
         return np.zeros(0, dtype=np.float32)
     a = a.astype(np.float32)
@@ -40,7 +41,7 @@ def robust_norm(a: np.ndarray, lo_q: float = 5.0, hi_q: float = 95.0) -> np.ndar
 
 
 def smooth(a: np.ndarray, win: int) -> np.ndarray:
-    """滑动均值。"""
+    """Moving average."""
     if a.size == 0 or win <= 1:
         return a
     win = int(win)
@@ -51,7 +52,7 @@ def smooth(a: np.ndarray, win: int) -> np.ndarray:
 
 
 def resample(a: np.ndarray, src_fps: float, dst_fps: float, dst_len: int) -> np.ndarray:
-    """把信号按时间轴线性重采样到目标长度。"""
+    """Linearly resample a signal along the time axis to the target length."""
     if a is None or a.size == 0:
         return np.zeros(dst_len, dtype=np.float32)
     if abs(src_fps - dst_fps) < 1e-9 and a.size == dst_len:
@@ -63,7 +64,7 @@ def resample(a: np.ndarray, src_fps: float, dst_fps: float, dst_len: int) -> np.
 
 def spikes_to_signal(times: np.ndarray, values: np.ndarray, fps: float, length: int,
                      decay: float = 1.0) -> np.ndarray:
-    """把离散事件（击球）转成逐帧信号：命中处赋值，然后指数衰减。"""
+    """Turn discrete events (hits) into a per-frame signal: assign at the hit, then exponential decay."""
     out = np.zeros(length, dtype=np.float32)
     if times is None or times.size == 0:
         return out
@@ -72,7 +73,7 @@ def spikes_to_signal(times: np.ndarray, values: np.ndarray, fps: float, length: 
     np.maximum.at(out, idx, np.asarray(v, dtype=np.float32))
     if decay <= 0:
         return out
-    # 指数衰减冲击响应：y[i] = max(out[i], decay * y[i-1])
+    # Exponential-decay impulse response: y[i] = max(out[i], decay * y[i-1])
     for i in range(1, length):
         p = out[i - 1] * decay
         if p > out[i]:
@@ -87,18 +88,19 @@ def hit_density_signal(
     window: float = 2.0,
     min_confidence: float = 0.15,
 ) -> np.ndarray:
-    """把音频击球转成「这一带有没有在连续打球」的密度曲线（0~1）。
+    """Turn audio hits into a density curve (0~1) for "is there continuous hitting around here".
 
-    为什么需要它：多球场球馆里单个击球声不可信（隔壁场地也在响），但
-    「一段时间里出现了好几拍」这件事仍然是我们这场比赛在进行的最直接观测。
-    实测（`audio_reliability` 只有 0.23 的素材）：回合内 2 秒窗平均击球密度
-    是回合间的 1.6 倍，区分度 AUC≈0.78；而整帧运动 / 球员速度的 AUC 只有
-    0.5~0.6。旧融合把这个信号按 `audio_reliability` 压到权重 0.13，
-    等于把最有信息量的一路丢掉了。
+    Why it is needed: in a multi-court gym a single hit sound is untrustworthy (the neighboring court
+    is also making noise), but "several shots occurred within a stretch of time" is still the most
+    direct observation that our match is underway. Measured (on footage with `audio_reliability` of
+    only 0.23): the average hit density in a 2-second window within rallies is 1.6x that between
+    rallies, with a discriminative AUC≈0.78; whereas the AUC of frame motion / player speed is only
+    0.5~0.6. The old fusion squeezed this signal down to weight 0.13 via `audio_reliability`, which
+    amounts to discarding the most informative signal.
 
-    用滑动窗计数（而不是单个脉冲衰减）是因为关键证据是「密度」而不是
-    「某一声有多响」：孤立的一拍（捡球、隔壁场地）不会形成密度，
-    只有连续对拉才会。
+    A sliding-window count is used (rather than single-pulse decay) because the key evidence is
+    "density" rather than "how loud some sound is": an isolated shot (picking up the shuttle, the
+    neighboring court) will not form density; only continuous rallying will.
     """
     out = np.zeros(max(0, int(length)), dtype=np.float32)
     if hits is None or hits.times.size == 0 or length <= 0:
@@ -114,10 +116,11 @@ def hit_density_signal(
 
 
 def discriminative_power(a: np.ndarray) -> float:
-    """估计一路信号「有没有双峰结构」，作为自适应权重。
+    """Estimate whether a signal "has a bimodal structure", as an adaptive weight.
 
-    用 (p90 - p50) / (p90 - p10) 衡量：数值越集中在上部，说明越像
-    「少数时刻明显高」的稀疏事件信号，值得给高权重。
+    Measured by (p90 - p50) / (p90 - p10): the more the values concentrate in the upper part, the more
+    it looks like a sparse-event signal where "a few moments are clearly high", and the more it deserves
+    a high weight.
     """
     if a is None or a.size < 32:
         return 0.35
@@ -125,23 +128,23 @@ def discriminative_power(a: np.ndarray) -> float:
     if p90 - p10 < EPS:
         return 0.05
     sep = float((p90 - p50) / (p90 - p10))
-    # sep≈0.5 表示均匀/对称（无信息），越接近 0.8~0.95 越像脉冲信号
+    # sep≈0.5 means uniform/symmetric (no information); the closer to 0.8~0.95, the more it looks like an impulse signal
     return float(np.clip((sep - 0.42) / 0.45, 0.05, 1.0))
 
 
-# ------------------------------------------------------------------ 融合
+# ------------------------------------------------------------------ Fusion
 
 
 @dataclass
 class FusedSignal:
     fps: float
     duration: float
-    activity: np.ndarray                 # 融合后的活跃度 0~1
+    activity: np.ndarray                 # fused activity 0~1
     components: dict[str, np.ndarray] = field(default_factory=dict)
     weights: dict[str, float] = field(default_factory=dict)
     threshold_hi: float = 0.5
     threshold_lo: float = 0.3
-    #: 音频击球信号的可信度 0~1（多球场/AGC 污染时接近 0）
+    #: Reliability of the audio hit signal 0~1 (near 0 with multiple courts / AGC pollution)
     audio_reliability: float = 1.0
 
 
@@ -150,7 +153,7 @@ class RallyInterval:
     start: float
     end: float
     confidence: float = 0.5
-    #: 区间内命中的音频击球索引
+    #: Indices of audio hits falling within the interval
     hit_indices: list[int] = field(default_factory=list)
     serve_time: float | None = None
     serve_side: str = "unknown"
@@ -161,35 +164,36 @@ class RallyInterval:
 
 def hit_reliability(hits: HitDetection | None, duration: float, fps: float,
                     n: int) -> tuple[float, float]:
-    """评估音频击球信号到底有多可信。
+    """Assess how trustworthy the audio hit signal actually is.
 
-    多球场球馆 + 相机 AGC 会让「击球声」在整个时间轴上均匀出现，这种信号
-    几乎不含回合起止信息，强行加权重会把单独一个回合粘成几分钟。
+    A multi-court gym + camera AGC make "hit sounds" appear uniformly across the whole timeline; such
+    a signal contains almost no rally start/end information, and forcibly weighting it would glue a
+    single rally into several minutes.
 
-    返回 ``(reliability 0~1, gate 强度分位)``：
+    Returns ``(reliability 0~1, gate strength quantile)``:
 
-    - ``coverage``：被「2 秒内有击球」覆盖的时间比例。真实比赛通常在
-      0.25~0.55；若 > 0.8 说明几乎一直在响，基本是噪声或其他场地。
-    - ``rate``：平均每秒触球数。羽毛球单场地现实上限约 2.5 次/秒。
-    - ``burst``：相邻间隔 < 0.35s 的击球占比，真实回合里很高。
+    - ``coverage``: fraction of time covered by "a hit within 2 seconds". A real match is usually
+      0.25~0.55; if > 0.8 it means the sound is almost always there, basically noise or other courts.
+    - ``rate``: average touches per second. The realistic upper bound for a single badminton court is about 2.5/s.
+    - ``burst``: fraction of hits with adjacent separation < 0.35s, which is high in real rallies.
     """
     if hits is None or hits.times.size < 8 or duration <= 0:
         return 0.0, 0.0
     t = hits.times
     rate = t.size / max(duration, 1e-6)
-    # 覆盖率：把时间轴切成 2 秒格，统计含击球的格子比例
+    # Coverage: split the timeline into 2-second bins and count the fraction of bins containing hits
     nb = max(1, int(np.ceil(duration / 2.0)))
     idx = np.clip((t / 2.0).astype(np.int64), 0, nb - 1)
     coverage = float(np.unique(idx).size / nb)
     gaps = np.diff(t)
     burst = float(np.mean(gaps < 0.35)) if gaps.size else 0.0
 
-    rate_ok = float(np.clip((3.2 - rate) / 2.2, 0.05, 1.0))       # >3.2/s 判定为噪声
-    cover_ok = float(np.clip((0.86 - coverage) / 0.36, 0.05, 1.0))  # >0.86 判定为噪声
+    rate_ok = float(np.clip((3.2 - rate) / 2.2, 0.05, 1.0))       # >3.2/s is judged as noise
+    cover_ok = float(np.clip((0.86 - coverage) / 0.36, 0.05, 1.0))  # >0.86 is judged as noise
     burst_ok = float(np.clip(burst / 0.35, 0.2, 1.0))
     rel = float(np.clip(rate_ok * cover_ok * (0.55 + 0.45 * burst_ok), 0.0, 1.0))
 
-    # 强度门限：只保留相对较强的那部分击球
+    # Strength threshold: keep only the relatively strong portion of hits
     gate = float(np.percentile(hits.strength, 35)) if hits.strength.size else 0.0
     return rel, gate
 
@@ -203,11 +207,11 @@ def fuse(
     shuttle: dict[str, np.ndarray] | None = None,
     roi_activity: np.ndarray | None = None,
 ) -> FusedSignal:
-    """把各路基线信号融合成单一活跃度曲线。"""
+    """Fuse the various baseline signals into a single activity curve."""
     n = max(1, int(round(duration * fps)))
     comp: dict[str, np.ndarray] = {}
 
-    # --- 音频：击球密度 + 强度（先做可信度门控与强度过滤）
+    # --- Audio: hit density + strength (reliability gating and strength filtering first)
     audio_rel = 0.0
     if hits is not None and hits.times.size:
         audio_rel, gate = hit_reliability(hits, duration, fps, n)
@@ -226,7 +230,7 @@ def fuse(
     else:
         comp["audio_hits"] = np.zeros(n, dtype=np.float32)
 
-    # --- 画面运动
+    # --- Frame motion
     if motion:
         mfps = float(motion.get("fps", fps))
         court = motion.get("court_motion")
@@ -237,15 +241,15 @@ def fuse(
     else:
         comp["motion"] = np.zeros(n, dtype=np.float32)
 
-    # --- 球员活跃度
+    # --- Player activity
     if players:
         pfps = float(players.get("fps", fps))
         cnt = resample(players.get("active_count", np.zeros(0)), pfps, fps, n)
         spd = resample(players.get("active_speed", np.zeros(0)), pfps, fps, n)
         mspd = resample(players.get("max_speed", np.zeros(0)), pfps, fps, n)
         on_court = np.clip(cnt / 2.0, 0.0, 1.0)
-        # 球员速度是脉冲式的：跑一步停下来、再跑一步。所以「最近几秒里
-        # 有多少时间在快速移动」比瞬时平均速度更能区分「正在对拉」和「在走动」。
+        # Player speed is pulse-like: run a step, stop, run another step. So "how much of the last few
+        # seconds was spent moving fast" distinguishes "rallying" from "walking" better than the instantaneous average speed.
         thr = float(np.percentile(spd, 72)) if spd.size else 0.0
         burst = smooth((spd > thr).astype(np.float32), max(1, int(fps * 3.0)))
         comp["players"] = (
@@ -257,7 +261,7 @@ def fuse(
     else:
         comp["players"] = np.zeros(n, dtype=np.float32)
 
-    # --- 羽毛球出现
+    # --- Shuttle presence
     if shuttle:
         sfps = float(shuttle.get("fps", fps))
         pres = resample(shuttle.get("presence", np.zeros(0)), sfps, fps, n)
@@ -267,14 +271,14 @@ def fuse(
     else:
         comp["shuttle"] = np.zeros(n, dtype=np.float32)
 
-    # --- 外部 ROI 活动
+    # --- External ROI activity
     if roi_activity is not None and roi_activity.size:
         rfps = float(motion.get("fps", fps)) if motion else fps
         comp["roi"] = robust_norm(resample(roi_activity, rfps, fps, n))
     else:
         comp["roi"] = np.zeros(n, dtype=np.float32)
 
-    # --- 自适应权重（音频额外乘上可信度）
+    # --- Adaptive weights (audio is additionally multiplied by its reliability)
     base = {"players": 1.35, "motion": 1.0, "audio_hits": 0.95, "shuttle": 0.9, "roi": 0.8}
     weights: dict[str, float] = {}
     for k, v in comp.items():
@@ -287,7 +291,7 @@ def fuse(
         weights[k] = w
     total = sum(weights.values())
     if total < EPS:
-        # 所有信号都不可用时退化成「整段都是候选」，由后续音频/人工修正
+        # When all signals are unavailable, degrade to "the whole clip is a candidate", to be fixed by later audio / manual edits
         weights = {"audio_hits": 1.0}
         total = 1.0
         comp["audio_hits"] = np.ones(n, dtype=np.float32) * 0.5
@@ -297,7 +301,7 @@ def fuse(
         activity += (weights[k] / total) * v
     activity = smooth(activity, max(1, int(fps * 1.2)))
 
-    # --- 自适应阈值（双阈值迟滞）
+    # --- Adaptive thresholds (dual-threshold hysteresis)
     p_hi = float(np.percentile(activity, 78))
     p_lo = float(np.percentile(activity, 55))
     med = float(np.median(activity))
@@ -317,7 +321,7 @@ def _fps_of(sig: dict | None, key: str, default: float) -> float:
         return default
 
 
-# ------------------------------------------------------------------ 状态机
+# ------------------------------------------------------------------ State machine
 
 
 def segment(
@@ -332,14 +336,15 @@ def segment(
     target_seconds: float = 28.0,
     split_sensitivity: float = 0.5,
 ) -> list[RallyInterval]:
-    """带迟滞的状态机 + 按「典型回合时长」二次切分。
+    """A hysteresis state machine + secondary splitting by "typical rally duration".
 
-    为什么需要二次切分：训练/多球练习里球员在两个回合之间只停顿几秒，
-    活跃度曲线不会塌到低阈值以下，迟滞状态机就会把连续几个回合粘成一条
-    几十秒甚至上百秒的「回合」。所以对超长区间再按**活跃度最低点**递归切，
-    直到每段不超过 ``target_seconds`` 的合理倍数。
+    Why secondary splitting is needed: in training / multi-shuttle practice players pause only a few
+    seconds between rallies, so the activity curve does not collapse below the low threshold and the
+    hysteresis state machine glues several consecutive rallies into one "rally" lasting tens or even
+    hundreds of seconds. So over-long intervals are recursively split at the **lowest activity point**
+    until each segment does not exceed a reasonable multiple of ``target_seconds``.
 
-    ``split_sensitivity`` 0~1 控制积极程度：越大目标时长越短、退出阈值越高。
+    ``split_sensitivity`` 0~1 controls how aggressive it is: higher means a shorter target duration and a higher exit threshold.
     """
     a = sig.activity
     fps = sig.fps
@@ -348,14 +353,14 @@ def segment(
         return []
 
     s = float(np.clip(split_sensitivity, 0.0, 1.0))
-    # 目标时长：保守 48s -> 积极 16s
+    # Target duration: conservative 48s -> aggressive 16s
     target = float(np.clip(target_seconds, 8.0, 180.0)) * (1.35 - 0.7 * s)
     target = float(np.clip(target, 8.0, 180.0))
 
     hi = sig.threshold_hi * (1.0 - 0.12 * s)
     lo = sig.threshold_lo * (1.0 + 0.28 * s)
     on_need = max(1, int(round(min_on_seconds * fps)))
-    # 越积极越早判定「这一段结束了」
+    # The more aggressive, the earlier it decides "this segment has ended"
     off_need = max(1, int(round(min_off_seconds * fps * (1.35 - 0.7 * s))))
 
     intervals: list[tuple[int, int]] = []
@@ -381,7 +386,7 @@ def segment(
     if not intervals:
         return []
 
-    # 距离很近的区间合并（同样受积极程度影响）
+    # Merge intervals that are very close (also affected by how aggressive it is)
     merged: list[list[int]] = [list(intervals[0])]
     gap_frames = int(round(max(0.6, gap_seconds * (1.3 - 0.75 * s)) * fps))
     for s0, e0 in intervals[1:]:
@@ -410,10 +415,11 @@ def segment(
 
 
 def _split_by_valley(sig: FusedSignal, s: int, e: int, target_f: int, min_f: int) -> list[tuple[int, int]]:
-    """把过长的区间在「局部活跃度最低点」递归切开。
+    """Recursively split an overly long interval at the "local activity minimum".
 
-    切点选最低点而不是等分，是为了尽量落在「捡球 / 擦汗」的空档上；
-    同时在切点附近留一点边距，避免把一拍的收尾切掉。
+    The cut point is chosen as the minimum rather than an equal division, so it lands on the "picking
+    up the shuttle / wiping sweat" gap as much as possible; at the same time a little margin is left
+    around the cut point, to avoid chopping off a shot's follow-through.
     """
     if e - s <= target_f * 1.35 or target_f <= 0:
         return [(s, e)]
@@ -426,16 +432,17 @@ def _split_by_valley(sig: FusedSignal, s: int, e: int, target_f: int, min_f: int
     return left + right
 
 
-# ------------------------------------------------------------------ 边界回贴与发球识别
+# ------------------------------------------------------------------ Boundary snapping and serve detection
 
 
 def thin_shots(times: np.ndarray, strength: np.ndarray, confidence: np.ndarray,
                min_gap: float = 0.28) -> np.ndarray:
-    """在候选击球里挑出物理上合理的一串。
+    """Pick a physically plausible sequence out of the candidate hits.
 
-    羽毛球里同一方两次击球间隔不可能小于约 0.3 秒（业余更慢），
-    一段回合里出现「每秒 4 拍」基本一定是检测噪声。这里按强度从高到低
-    贪心挑选，保证任意两次入选击球的间隔 ≥ ``min_gap``，再按时间排序。
+    In badminton, two hits by the same side cannot be less than about 0.3 seconds apart (amateurs are
+    slower), so "4 shots per second" within a rally is almost certainly detection noise. Here the hits
+    are greedily picked from highest to lowest strength, ensuring the separation between any two selected
+    hits is >= ``min_gap``, then sorted by time.
     """
     if times.size == 0:
         return np.zeros(0, dtype=np.int64)
@@ -451,18 +458,21 @@ def thin_shots(times: np.ndarray, strength: np.ndarray, confidence: np.ndarray,
     return np.array(sorted(chosen), dtype=np.int64)
 
 
-#: 同一回合内两次击球的**最大**间隔（秒）的保守下限。
+#: Conservative lower bound for the **maximum** separation (seconds) between two hits within a rally.
 #:
-#: 依据是物理而不是调参：一回合内的拍间隔由球的飞行时间决定 —— 业余素材实测
-#: 段内最大 2.4~3.6 秒，绝大多数落在 0.4~1.5 秒；而两个回合之间必然隔着
-#: 捡球 / 换发球 / 走回接发球位置，**没有任何人击球**的时间普遍 ≥4 秒。
-#: 所以「击球序列里的大空档」几乎就是回合边界 —— 这比「球员有没有停下来」
-#: 可靠得多，因为球员在捡球时也一直在走动，活跃度根本不塌。
+#: This is based on physics rather than tuning: the shot interval within a rally is determined by the
+#: shuttle's flight time — measured on amateur footage, the maximum within a segment is 2.4~3.6 seconds,
+#: with the vast majority falling in 0.4~1.5 seconds; whereas between two rallies there is necessarily
+#: picking up the shuttle / changing serve / walking back to the receiving position, and the time with
+#: **nobody hitting** is generally >= 4 seconds. So "a large gap in the hit sequence" is almost exactly a
+#: rally boundary — this is far more reliable than "whether the players stopped", because players keep
+#: walking while picking up the shuttle and the activity never collapses.
 MAX_INTRA_HIT_GAP = 3.0
 
-#: 取击球窗口时向两侧多看的秒数。切分给出的边界本身是粗的（可能落在发球
-#: 之后、或最后一拍之前），所以要往外看一点才能把发球/收尾那一拍捞回来。
-#: 但**不能太大**，否则会把邻居回合的拍吃进来（见 :func:`refine_with_hits`）。
+#: Seconds to look on each side when taking the hit window. The boundaries given by segmentation are
+#: themselves coarse (they may fall after the serve, or before the last shot), so looking a little
+#: outward is needed to catch the serve / follow-through shot. But it **must not be too large**, otherwise
+#: it will swallow hits from the neighboring rally (see :func:`refine_with_hits`).
 _HIT_TOL_BEFORE = 1.0
 _HIT_TOL_AFTER = 1.2
 
@@ -474,16 +484,17 @@ def hit_gap_limit(
     quantile: float = 70.0,
     cap: float = 4.5,
 ) -> float:
-    """估计「同一回合内允许的最大拍间隔」。
+    """Estimate the "maximum shot separation allowed within a rally".
 
-    取一个**典型**拍间隔（p70）再乘以余量，而不是取高分位数：分位数取得越高，
-    越容易被「回合之间那些几秒到几十秒的大空档」自己抬上去 ——
-    实测门控之后（只剩我们自己的击球）p80 就已经到 2.42 秒，
-    乘 1.8 得到 4.36 秒的门限，于是 3.7 秒和 3.1 秒的真实停顿全都切不开，
-    20 多秒的回合就这么留在那里。
+    Take a **typical** shot interval (p70) and multiply by a margin, rather than taking a high quantile:
+    the higher the quantile, the more it is itself raised by "the large gaps of seconds to tens of seconds
+    between rallies" — measured after gating (only our own hits remain), p80 is already at 2.42 seconds,
+    and multiplying by 1.8 gives a threshold of 4.36 seconds, so real pauses of 3.7 seconds and 3.1 seconds
+    all fail to be split, and a rally of over 20 seconds just stays there.
 
-    ``floor`` 是物理下限（一回合内的拍间隔由球的飞行时间决定），
-    ``cap`` 防止序列本身很稀疏时门限被放到失效。
+    ``floor`` is the physical lower bound (the shot interval within a rally is determined by the shuttle's
+    flight time), and ``cap`` prevents the threshold from being relaxed into uselessness when the sequence
+    itself is very sparse.
     """
     if times is None or len(times) < 3:
         return float(floor)
@@ -496,10 +507,10 @@ def hit_gap_limit(
 
 def _hit_idx_in_window(hits: HitDetection, t0: float, t1: float,
                        min_confidence: float = 0.18) -> np.ndarray:
-    """``[t0, t1]`` 区间里「像我们这场比赛」的击球下标。
+    """Indices of hits "like our match" within ``[t0, t1]``.
 
-    两道过滤：置信度门限 + :func:`thin_shots` 的物理合理性筛选
-    （同一方两次击球不可能小于约 0.3 秒，出现「每秒 4 拍」一定是噪声）。
+    Two filters: a confidence threshold + the physical plausibility screening of :func:`thin_shots`
+    (two hits by the same side cannot be less than about 0.3 seconds apart; "4 shots per second" must be noise).
     """
     t = hits.times
     idx = np.nonzero((t >= t0) & (t <= t1))[0]
@@ -519,16 +530,17 @@ def split_by_hit_gaps(
     min_side_hits: int = 2,
     min_side_seconds: float = 2.0,
 ) -> list[RallyInterval]:
-    """把「内部含有过大拍间隔」的区间在空档的正中切开。
+    """Split intervals "containing an overly large shot separation" at the middle of the gap.
 
-    这是「一个回合里混进了下一个回合」的正解。旧实现依赖「球员静默段」和
-    「活跃度谷值」，两者在多球场球馆里都失效：球员捡球时在走动（活跃度不塌）、
-    整帧运动被隔壁场地持续点亮（谷底消失）。于是几个回合被粘成一条几十秒的
-    区间。而**球有没有在被击打**是这件事的直接观测：一旦击球序列里出现一个
-    远超正常拍间隔的空档，那两段一定是两个回合。
+    This is the correct solution to "one rally containing the next rally". The old implementation relied
+    on "player quiet segments" and "activity valleys", both of which fail in a multi-court gym: players
+    walk while picking up the shuttle (activity does not collapse), and full-frame motion is continuously
+    lit up by the neighboring court (the valley disappears). So several rallies get glued into an interval
+    of tens of seconds. But **whether the shuttle is being hit** is the direct observation of this: once the
+    hit sequence contains a gap far exceeding the normal shot interval, those two stretches must be two rallies.
 
-    ``min_side_hits`` / ``min_side_seconds`` 是防误切的护栏：两侧都必须
-    真的有足够的拍数、并且各自撑得起一个回合，否则宁可留着不切。
+    ``min_side_hits`` / ``min_side_seconds`` are guardrails against false splits: both sides must really have
+    enough shots and each be able to support a rally, otherwise it is better to leave it unsplit.
     """
     if hits is None or hits.times.size == 0 or not intervals:
         return intervals
@@ -550,7 +562,7 @@ def split_by_hit_gaps(
             out.append(iv)
             return
         left, right = ts[: k + 1], ts[k + 1:]
-        # 护栏：两侧都要够料，否则这不是「两个回合」而是「漏检了几拍」
+        # Guardrail: both sides must have enough material, otherwise this is not "two rallies" but "a few missed hits"
         if (left.size < min_side_hits or right.size < min_side_hits
                 or (left[-1] - left[0]) < min_side_seconds
                 or (right[-1] - right[0]) < min_side_seconds):
@@ -581,24 +593,25 @@ def refine_with_hits(
     trim_start: bool = True,
     gap_limit: float | None = None,
 ) -> list[RallyInterval]:
-    """用音频击球修正回合边界，并**允许把终点收紧**。
+    """Correct rally boundaries with audio hits, and **allow tightening the end point**.
 
-    旧实现在这里写的是 ``iv.end = max(iv.end, last + tail)`` —— 终点只能往后
-    推、永远不能往前收。于是无论切分给出的区间有多长（实测有 69 秒、72 拍的
-    「一回合」），击球信息都**无法**把球落地之后那一段砍掉。这正是
-    「一回合内包含球落地后很长时间」的直接原因。
+    The old implementation wrote ``iv.end = max(iv.end, last + tail)`` here — the end could only be pushed
+    later, never pulled earlier. So no matter how long the interval given by segmentation was (measured:
+    a 69-second "rally" with 72 shots), the hit information **could not** cut off the stretch after the
+    shuttle landed. This is exactly the direct cause of "a rally containing a long time after the shuttle lands".
 
-    现在的规则：
+    Current rules:
 
-    1. 先按击球序列的大空档把区间切开（:func:`split_by_hit_gaps`），
-       消掉「一回合里混进下一个回合」；
-    2. 终点**锚到最后一拍**：``iv.end = last + tail_seconds``。
-       但只在有证据时才敢收紧 —— 判据是「全局下一次击球离 ``last`` 超过
-       ``gap_limit``」：连隔壁场地的声音都没有，说明这一段确实没人打球了。
-       若紧接着还有击球，说明球还在飞，就保持原来的更晚终点。
-    3. 起点仍然对齐到第一次击球（发球）之前 ``pre_roll``；
-       ``trim_start=False`` 用于球员运动切分（它的起点是「球员开始动」，
-       本身已经包含了发球准备，不该被推迟）。
+    1. First split intervals by large gaps in the hit sequence (:func:`split_by_hit_gaps`), eliminating
+       "one rally containing the next rally";
+    2. The end is **anchored to the last shot**: ``iv.end = last + tail_seconds``.
+       But tightening is only dared when there is evidence — the criterion is "the next hit globally is more
+       than ``gap_limit`` away from ``last``": if even the neighboring court's sound is absent, this stretch
+       really has nobody playing. If there is a hit immediately after, the shuttle is still in flight, so the
+       original later end is kept.
+    3. The start is still aligned to ``pre_roll`` before the first hit (serve);
+       ``trim_start=False`` is used for player-motion segmentation (its start is "the player starts moving",
+       which already includes the serve preparation and should not be delayed).
     """
     if hits is None or hits.times.size == 0:
         for iv in intervals:
@@ -611,11 +624,11 @@ def refine_with_hits(
     if split:
         intervals = split_by_hit_gaps(intervals, hits, limit=lim)
 
-    # 取击球窗口时要**不要越过邻居**：一次击球只能属于一个回合。
-    # 不设这个夹逼的话，切点两侧会把同一拍都算进来（左边当成「最后一拍」、
-    # 右边当成「第一次击球」），于是左区间往后留 0.9s、右区间往前留 1.2s，
-    # 两段直接重叠 2.1 秒 —— 下游 dedupe_overlaps 会在中间切一刀，切完又首尾
-    # 相接，最后被 _join_abutting 合并回去，等于白切。
+    # When taking the hit window, **do not cross into neighbors**: one hit can belong to only one rally.
+    # Without this clamping, both sides of the cut would count the same shot (the left as "last shot", the
+    # right as "first hit"), so the left interval keeps 0.9s forward and the right keeps 1.2s backward, and
+    # the two segments overlap by 2.1 seconds — downstream dedupe_overlaps cuts in the middle, the cut is
+    # again end-to-end, and finally _join_abutting merges it back, making the split pointless.
     ordered = sorted(intervals, key=lambda v: v.start)
     bounds: list[tuple[float, float]] = []
     for k, iv in enumerate(ordered):
@@ -633,19 +646,20 @@ def refine_with_hits(
         iv.hit_indices = idx.tolist()
         if idx.size >= min_hits:
             first = float(t[idx[0]])
-            # 「最后一拍」只在区间内部找：窗口右侧多出的 1.6 秒是给
-            # 「活动区间结束得比最后一拍早」留的补救余地，不能拿它当终点锚点。
+            # The "last shot" is only searched inside the interval: the extra 1.6 seconds on the right of
+            # the window is the remediation margin for "the active interval ending earlier than the last shot",
+            # and must not be used as the end anchor.
             inside = idx[t[idx] <= iv.end]
             last = float(t[inside[-1]]) if inside.size else first
             anchor = last + max(0.0, tail_seconds)
 
-            # 全局下一次击球离最后一拍多远？超过 gap_limit 就说明这一段真的结束了。
+            # How far is the next hit globally from the last shot? If it exceeds gap_limit, this stretch really has ended.
             nxt = int(np.searchsorted(t, last + 1e-6, side="right"))
             gap_after = float(t[nxt] - last) if nxt < t.size else float("inf")
             if gap_after > lim:
-                iv.end = min(iv.end, anchor)          # 收紧
+                iv.end = min(iv.end, anchor)          # tighten
             else:
-                iv.end = max(iv.end, anchor)          # 后面还有拍，别切掉
+                iv.end = max(iv.end, anchor)          # there are more shots after, do not cut it off
             iv.end = max(iv.end, last + 0.05)
             if trim_start:
                 iv.start = max(0.0, first - pre_roll)
@@ -672,15 +686,15 @@ def attach_features(
     players: dict[str, np.ndarray] | None = None,
     shuttle: dict[str, np.ndarray] | None = None,
 ) -> list[RallyInterval]:
-    """给每个回合算客观特征，用于后续评分。"""
+    """Compute objective features for each rally, for subsequent scoring."""
     fps = sig.fps
     for iv in intervals:
         a, b = int(iv.start * fps), int(iv.end * fps)
         a, b = max(0, a), min(sig.activity.size, max(b, a + 1))
         seg = sig.activity[a:b]
-        # 从已有的 features 出发而不是新建一个字典：边界锚定时写进去的
-        # hit_anchored / tail_gap 是诊断信息，界面要靠它解释「终点为什么在这儿」。
-        # 旧代码在这里直接换了一个新字典，把它们全丢了。
+        # Start from the existing features rather than creating a new dict: the hit_anchored / tail_gap
+        # written in during boundary anchoring are diagnostic information that the UI relies on to explain
+        # "why the end is here". The old code swapped in a brand-new dict here, throwing them all away.
         f: dict[str, float] = dict(iv.features)
         f.update({
             "duration": float(iv.end - iv.start),
@@ -700,9 +714,29 @@ def attach_features(
                 d = np.diff(ts)
                 f["tempo"] = float(1.0 / max(np.median(d), 1e-3))
                 f["rally_span"] = float(ts[-1] - ts[0])
-                # 回合末段节奏（越密集说明越激烈）
+                # Late-rally tempo (the denser, the more intense)
                 tail = d[-max(2, len(d) // 3):]
                 f["finish_tempo"] = float(1.0 / max(np.median(tail), 1e-3))
+                # Tempo variance: high variance = unpredictable/unstable exchange
+                f["tempo_variance"] = float(np.var(d)) if d.size else 0.0
+                # Confrontation streak: longest run of gaps <= 0.85s (rapid fire exchange)
+                if d.size:
+                    streak = max_run = 1
+                    for gap in d:
+                        if gap <= 0.85:
+                            streak += 1
+                            max_run = max(max_run, streak)
+                        else:
+                            streak = 1
+                    f["confrontation_streak"] = float(max_run)
+                else:
+                    f["confrontation_streak"] = 1.0
+            # Smash proxy: hits whose strength is in the top 15% of the rally (simple proxy for smash)
+            if hs.size:
+                thr = float(np.percentile(hs, 85))
+                f["smash_proxy"] = float(np.count_nonzero(hs >= thr))
+            else:
+                f["smash_proxy"] = 0.0
         if players:
             pfps = float(players.get("fps", fps))
             f["player_speed_mean"] = _seg_mean(players.get("active_speed"), pfps, iv.start, iv.end)
@@ -748,11 +782,12 @@ def _seg_pct(arr, fps, t0, t1, q) -> float:
 
 def dedupe_overlaps(intervals: list[RallyInterval], hits: HitDetection | None = None,
                     fps: float = 15.0, activity: np.ndarray | None = None) -> list[RallyInterval]:
-    """消除相邻回合之间的重叠。
+    """Eliminate overlap between adjacent rallies.
 
-    边界回贴时每个回合都会向前留 ``pre_roll``、向后留 ``tail``，两个挨得近的
-    回合就会互相盖住几秒。直接拿去拼时间线会让同一段画面出现两次。
-    这里把重叠区切在「击球间隔最大处」（或活跃度最低点），比简单取中点更自然。
+    During boundary snapping each rally keeps ``pre_roll`` forward and ``tail`` backward, so two nearby
+    rallies cover each other by a few seconds. Using them directly to build the timeline would show the
+    same footage twice. Here the overlap region is cut at "the largest hit separation" (or the lowest
+    activity point), which is more natural than simply taking the midpoint.
     """
     if len(intervals) < 2:
         return intervals
@@ -774,7 +809,7 @@ def dedupe_overlaps(intervals: list[RallyInterval], hits: HitDetection | None = 
 
 def _best_cut(a: float, b: float, hits: HitDetection | None, fps: float,
               activity: np.ndarray | None) -> float:
-    """在 [a, b] 里挑一个最像「两次回合之间」的时刻。"""
+    """Pick the moment within [a, b] that most resembles "between two rallies"."""
     if b - a < 0.25:
         return (a + b) / 2
     if hits is not None and hits.times.size:
@@ -786,7 +821,7 @@ def _best_cut(a: float, b: float, hits: HitDetection | None, fps: float,
             k = int(np.argmax(gaps))
             return float(seg[k] + gaps[k] / 2.0)
         if seg.size == 1:
-            # 只有一次击球落在重叠区，切在它前面一点
+            # Only one hit falls in the overlap region; cut a little before it
             return float(max(a, min(seg[0] - 0.15, b)))
     if activity is not None and activity.size and fps > 0:
         i0, i1 = max(0, int(a * fps)), min(activity.size, int(b * fps))
@@ -795,11 +830,11 @@ def _best_cut(a: float, b: float, hits: HitDetection | None, fps: float,
     return (a + b) / 2
 
 
-# ------------------------------------------------------------------ 只靠音频的兜底
+# ------------------------------------------------------------------ Audio-only fallback
 
 
 def fallback_from_audio(hits: HitDetection, params: Any) -> list[RallyInterval]:
-    """没有任何视觉信号时，退回纯音频聚类（老式但可用）。"""
+    """When there is no visual signal at all, fall back to pure audio clustering (old-school but usable)."""
     clusters = cluster_rallies(
         hits,
         gap_seconds=getattr(params, "gap_seconds", 3.2),

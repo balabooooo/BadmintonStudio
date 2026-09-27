@@ -13,6 +13,8 @@ import {
 import { cn } from './lib/format'
 import { Button, ConfirmProvider, ToastHost, Tooltip } from './components/ui'
 import { useStore } from './store/useStore'
+import { useT } from './i18n/useT'
+import { t as tr } from './i18n'
 import LibraryPage from './components/LibraryPage'
 import StudioPage from './components/StudioPage'
 import AnnotatePage from './components/AnnotatePage'
@@ -22,6 +24,8 @@ import JobTray from './components/JobTray'
 import CourtEditor from './components/CourtEditor'
 
 function Logo() {
+  const t = useT()
+  const lang = useStore((s) => s.lang)
   return (
     <div className="flex items-center gap-2.5">
       <div className="relative grid h-8 w-8 place-items-center rounded-[10px] bg-gradient-to-br from-court-300 via-court-500 to-court-700 shadow-[0_6px_20px_-6px_rgb(22_201_138/0.8)]">
@@ -32,23 +36,26 @@ function Logo() {
         </svg>
       </div>
       <div className="leading-tight">
-        <div className="text-[13.5px] font-semibold tracking-tight text-white">羽毛球智能剪辑台</div>
-        <div className="text-[10px] tracking-[0.16em] text-ink-500 uppercase">Badminton Studio</div>
+        <div className="text-[13.5px] font-semibold tracking-tight text-white">{t('app.name')}</div>
+        {lang === 'zh' && (
+          <div className="text-[10px] tracking-[0.16em] text-ink-500 uppercase">Badminton Studio</div>
+        )}
       </div>
     </div>
   )
 }
 
 function NavRail() {
+  const t = useT()
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
   const project = useStore((s) => s.project)
   const items = [
-    { id: 'library' as const, icon: FolderOpen, label: '工程库', hint: '浏览与新建工程' },
-    { id: 'studio' as const, icon: Film, label: '剪辑台', hint: '预览 / 时间线 / AI 分析', disabled: !project },
-    { id: 'annotate' as const, icon: PenLine, label: '标注', hint: '人工标注回合，并用标注自动优化切分参数', disabled: !project },
-    { id: 'exports' as const, icon: Download, label: '导出记录', hint: '查看已导出的成片' },
-    { id: 'settings' as const, icon: Settings2, label: '设置', hint: '环境检测与缓存管理' },
+    { id: 'library' as const, icon: FolderOpen, label: t('nav.library'), hint: t('nav.libraryHint') },
+    { id: 'studio' as const, icon: Film, label: t('nav.studio'), hint: t('nav.studioHint'), disabled: !project },
+    { id: 'annotate' as const, icon: PenLine, label: t('nav.annotate'), hint: t('nav.annotateHint'), disabled: !project },
+    { id: 'exports' as const, icon: Download, label: t('nav.exports'), hint: t('nav.exportsHint') },
+    { id: 'settings' as const, icon: Settings2, label: t('nav.settings'), hint: t('nav.settingsHint') },
   ]
   return (
     <nav className="flex w-[68px] shrink-0 flex-col items-center gap-1.5 border-r border-white/6 bg-ink-950/40 py-3">
@@ -87,6 +94,7 @@ function NavRail() {
 }
 
 function TitleBar() {
+  const t = useT()
   const project = useStore((s) => s.project)
   const closeProject = useStore((s) => s.closeProject)
   const view = useStore((s) => s.view)
@@ -99,7 +107,7 @@ function TitleBar() {
       {(view === 'studio' || view === 'annotate') && project ? (
         <Button variant="ghost" size="sm" onClick={closeProject} className="-ml-1">
           <ChevronLeft size={14} />
-          工程库
+          {t('nav.backToLibrary')}
         </Button>
       ) : (
         <Logo />
@@ -126,10 +134,8 @@ function TitleBar() {
             <div className="space-y-0.5">
               <div>Python {env.python}</div>
               <div>{env.platform}</div>
-              <div>
-                GPU：{env.gpu?.available ? env.gpu.name : '不可用（将使用 CPU）'}
-              </div>
-              <div>硬件编码：{env.caps?.nvenc_h264 ? 'NVENC 可用' : '仅 CPU'}</div>
+              <div>{t('app.gpu.accel')}：{env.gpu?.available ? env.gpu.name : t('app.gpu.unavailable')}</div>
+              <div>{t('app.hwEncoding')}：{env.caps?.nvenc_h264 ? t('app.hw.nvenc') : t('app.hw.cpuOnly')}</div>
               <div className="max-w-[420px] break-all text-ink-400">{env.ffmpeg || env.ffmpeg_error}</div>
             </div>
           }
@@ -141,7 +147,7 @@ function TitleBar() {
                 env.gpu?.available ? 'bg-court-400' : 'bg-amber-glow',
               )}
             />
-            {env.gpu?.available ? 'GPU 加速' : 'CPU'}
+            {env.gpu?.available ? t('app.gpu.accel') : t('app.gpu.cpu')}
           </div>
         </Tooltip>
       )}
@@ -155,7 +161,7 @@ class ErrorBoundary extends Component<{ children: ReactNode; view: string }, { e
   state = { err: null as Error | null }
 
   static getDerivedStateFromError(err: Error) {
-    return { err }
+    return { err } as { err: Error | null }
   }
 
   componentDidUpdate(prev: { view: string }) {
@@ -167,10 +173,8 @@ class ErrorBoundary extends Component<{ children: ReactNode; view: string }, { e
       return (
         <div className="grid h-full place-items-center p-8">
           <div className="panel max-w-[640px] p-6">
-            <div className="text-[14px] font-semibold text-rose-hot">界面渲染出错</div>
-            <div className="mt-1 text-[12px] text-ink-300">
-              这一页崩了，其他功能不受影响。可以先切到别的页面，或刷新重试。
-            </div>
+            <div className="text-[14px] font-semibold text-rose-hot">{tr('app.error.title')}</div>
+            <div className="mt-1 text-[12px] text-ink-300">{tr('app.error.desc')}</div>
             <pre className="mono mt-3 max-h-[280px] overflow-auto rounded-lg bg-black/40 p-3 text-[11px] whitespace-pre-wrap text-ink-400">
               {String(this.state.err?.stack || this.state.err)}
             </pre>
@@ -178,7 +182,7 @@ class ErrorBoundary extends Component<{ children: ReactNode; view: string }, { e
               onClick={() => location.reload()}
               className="mt-3 rounded-lg bg-white/10 px-3 py-1.5 text-[12px] text-ink-100 hover:bg-white/16"
             >
-              刷新页面
+              {tr('app.error.reload')}
             </button>
           </div>
         </div>
@@ -188,7 +192,9 @@ class ErrorBoundary extends Component<{ children: ReactNode; view: string }, { e
   }
 }
 
-function Splash() {  return (
+function Splash() {
+  const t = useT()
+  return (
     <div className="flex h-full flex-col items-center justify-center gap-5">
       <motion.div
         initial={{ opacity: 0, scale: 0.9 }}
@@ -199,8 +205,8 @@ function Splash() {  return (
         <Sparkles size={28} className="text-ink-950" />
       </motion.div>
       <div className="text-center">
-        <div className="text-[15px] font-semibold text-white">羽毛球智能剪辑台</div>
-        <div className="mt-1 text-[12px] text-ink-400">正在连接本地分析引擎…</div>
+        <div className="text-[15px] font-semibold text-white">{t('app.name')}</div>
+        <div className="mt-1 text-[12px] text-ink-400">{t('app.splash.connecting')}</div>
       </div>
     </div>
   )
@@ -218,37 +224,65 @@ export default function App() {
     bootstrap()
   }, [bootstrap])
 
+  // 往窗口里拖文件时别让浏览器直接打开文件把界面顶掉；剪辑台会自己接管导入。
+  useEffect(() => {
+    const guard = (e: DragEvent) => {
+      if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) e.preventDefault()
+    }
+    window.addEventListener('dragover', guard)
+    window.addEventListener('drop', guard)
+    return () => {
+      window.removeEventListener('dragover', guard)
+      window.removeEventListener('drop', guard)
+    }
+  }, [])
+
   // 全局快捷键
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement
-      const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+      const el = e.target as HTMLElement | null
+      const typing =
+        !!el &&
+        (el.tagName === 'INPUT' ||
+          el.tagName === 'TEXTAREA' ||
+          el.isContentEditable ||
+          !!el.closest('[contenteditable="true"]'))
       const s = useStore.getState()
       if (typing) return
       // 这些快捷键只服务于剪辑台。标注页有自己的保存/删除键，选中过片段后
       // 在标注页按 S / Delete / 空格会把时间线片段悄悄切掉或删掉。
       if (s.view !== 'studio') return
+      // 场地标定窗口 / 弹窗 / 右键菜单打开时，别让 S、Delete、空格穿透到底层时间线
+      if (s.courtEditorOpen) return
+      if (el?.closest('[role="dialog"][aria-modal="true"], [role="menu"]')) return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
         e.preventDefault()
         s.undo()
       } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
         e.preventDefault()
         s.redo()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+        e.preventDefault()
+        s.selectAllClips()
       } else if (e.code === 'Space') {
+        // 焦点在按钮上时空格是「激活按钮」；别再顺带切换播放，否则一次触发两次
+        if (el?.closest('button')) return
         e.preventDefault()
         s.setPlaying(!s.playing)
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault()
-        s.seek(s.currentTime - (e.shiftKey ? 5 : 1 / 30))
+        s.seek(s.currentTime - (e.shiftKey ? 5 : s.frameStep()))
       } else if (e.key === 'ArrowRight') {
         e.preventDefault()
-        s.seek(s.currentTime + (e.shiftKey ? 5 : 1 / 30))
+        s.seek(s.currentTime + (e.shiftKey ? 5 : s.frameStep()))
       } else if (e.key === 'Home') {
-        s.seek(0)
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && s.selectedClipId) {
         e.preventDefault()
-        s.removeClip(s.selectedClipId)
-      } else if (e.key.toLowerCase() === 's' && s.selectedClipId) {
+        s.seek(0)
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && s.selectedClipIds.length) {
+        e.preventDefault()
+        s.removeClips(s.selectedClipIds)
+      } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 's' && s.selectedClipId) {
+        // 不拦 Ctrl+S：那是浏览器「保存网页」，不该顺带去分割片段
         e.preventDefault()
         // 源片模式下播放头读数是原片时间，必须换算，否则会切在完全不相干的位置
         if (s.previewMode === 'source') s.splitClipAtSourceTime(s.selectedClipId, s.currentTime)

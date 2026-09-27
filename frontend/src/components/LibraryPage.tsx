@@ -3,10 +3,14 @@ import { useEffect, useMemo, useState } from 'react'
 import { FolderPlus, Film, Trash2, Clock, Sparkles, Search, Clapperboard, Copy } from 'lucide-react'
 import { api } from '../lib/api'
 import { humanDuration, relTime } from '../lib/format'
-import { Button, Card, Empty, Modal, Skeleton, useConfirm } from './ui'
+import { Button, Card, Empty, Modal, Skeleton, Tooltip, useConfirm } from './ui'
+import ImportVideoButton from './ImportVideoButton'
 import { useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
+import { getLang } from '../i18n'
 
 export default function LibraryPage() {
+  const t = useT()
   const projects = useStore((s) => s.projects)
   const refresh = useStore((s) => s.refreshProjects)
   const createProject = useStore((s) => s.createProject)
@@ -18,10 +22,30 @@ export default function LibraryPage() {
 
   const [q, setQ] = useState('')
   const [creating, setCreating] = useState(false)
+  const [saving, setSaving] = useState(false)
   const [name, setName] = useState('')
-  const [importing, setImporting] = useState(false)
-  const [importPath, setImportPath] = useState('')
-  const [targetProject, setTargetProject] = useState<string | null>(null)
+
+  function defaultProjectName(): string {
+    return t('library.newProjectName', {
+      date: new Date().toLocaleDateString(getLang() === 'en' ? 'en-US' : 'zh-CN'),
+    })
+  }
+
+  /** 新建工程：页脚按钮与输入框回车共用，避免两处逻辑漂移。 */
+  async function handleCreate() {
+    const n = name.trim()
+    if (!n) return
+    setSaving(true)
+    try {
+      const id = await createProject(n)
+      setCreating(false)
+      if (id) toast({ kind: 'success', title: t('library.created'), detail: t('library.createdDetail') })
+    } catch (e) {
+      toast({ kind: 'error', title: t('library.createFailed'), detail: String(e) })
+    } finally {
+      setSaving(false)
+    }
+  }
 
   useEffect(() => {
     refresh()
@@ -41,24 +65,6 @@ export default function LibraryPage() {
     [projects],
   )
 
-  async function doImport() {
-    if (!targetProject || !importPath.trim()) return
-    const paths = importPath
-      .split(/\r?\n|;/)
-      .map((s) => s.trim())
-      .filter(Boolean)
-    setImporting(true)
-    try {
-      await openProject(targetProject)
-      const s = useStore.getState()
-      await s.importMedia(paths)
-      setTargetProject(null)
-      setImportPath('')
-    } finally {
-      setImporting(false)
-    }
-  }
-
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-[1400px] px-8 py-8">
@@ -71,7 +77,7 @@ export default function LibraryPage() {
               transition={{ duration: 0.4 }}
               className="text-[26px] font-semibold tracking-tight text-white"
             >
-              工程库
+              {t('library.title')}
             </motion.h1>
             <motion.p
               initial={{ opacity: 0 }}
@@ -80,13 +86,13 @@ export default function LibraryPage() {
               className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[12.5px] text-ink-400"
             >
               <span className="inline-flex items-center gap-1.5">
-                <Clapperboard size={13} /> {stats.count} 个工程
+                <Clapperboard size={13} /> {t('library.projectCount', { n: stats.count })}
               </span>
               <span className="inline-flex items-center gap-1.5">
-                <Clock size={13} /> 素材总时长 {stats.hours.toFixed(1)} 小时
+                <Clock size={13} /> {t('library.totalDuration', { hours: stats.hours.toFixed(1) })}
               </span>
               <span className="inline-flex items-center gap-1.5">
-                <Sparkles size={13} /> 已识别 {stats.rallies} 个回合
+                <Sparkles size={13} /> {t('library.ralliesFound', { n: stats.rallies })}
               </span>
             </motion.p>
           </div>
@@ -96,7 +102,7 @@ export default function LibraryPage() {
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="搜索工程…"
+                placeholder={t('library.searchPlaceholder')}
                 className="field w-[220px] pl-8"
               />
             </div>
@@ -104,12 +110,12 @@ export default function LibraryPage() {
               variant="primary"
               size="lg"
               onClick={() => {
-                setName(`羽毛球剪辑 ${new Date().toLocaleDateString('zh-CN')}`)
+                setName(defaultProjectName())
                 setCreating(true)
               }}
             >
               <FolderPlus size={15} />
-              新建工程
+              {t('library.newProject')}
             </Button>
           </div>
         </div>
@@ -125,30 +131,26 @@ export default function LibraryPage() {
           <Card className="py-6">
             <Empty
               icon={<Film size={34} />}
-              title={q ? '没有匹配的工程' : '还没有工程'}
-              desc={
-                q
-                  ? '换个关键词试试。'
-                  : '新建一个工程，导入你的羽毛球录像，AI 会自动剔除无效片段、切分每个回合并给出质量评分。'
-              }
+              title={q ? t('library.noMatch') : t('library.noProjects')}
+              desc={q ? t('library.noMatchDesc') : t('library.noProjectsDesc')}
               action={
                 !q && (
                   <Button
                     variant="primary"
                     onClick={() => {
-                      setName(`羽毛球剪辑 ${new Date().toLocaleDateString('zh-CN')}`)
+                      setName(defaultProjectName())
                       setCreating(true)
                     }}
                   >
                     <FolderPlus size={15} />
-                    新建第一个工程
+                    {t('library.createFirst')}
                   </Button>
                 )
               }
             />
           </Card>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(310px,1fr))] gap-4">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4">
             {filtered.map((p, i) => (
               <motion.div
                 key={p.id}
@@ -177,12 +179,12 @@ export default function LibraryPage() {
                     <div className="absolute bottom-2 left-3 flex items-center gap-2 text-[11px] text-ink-200">
                       <span className="mono">{humanDuration(p.duration)}</span>
                       <span className="text-ink-500">·</span>
-                      <span>{p.media_count} 个素材</span>
+                      <span>{t('library.mediaCount', { n: p.media_count })}</span>
                     </div>
                     {p.analyzed && (
                       <span className="absolute top-2.5 right-2.5 inline-flex items-center gap-1 rounded-md bg-court-500/85 px-1.5 py-[2px] text-[10.5px] font-semibold text-ink-950">
                         <Sparkles size={10} />
-                        {p.rally_count} 回合
+                        {t('library.rallyCount', { n: p.rally_count })}
                       </span>
                     )}
                   </button>
@@ -195,21 +197,37 @@ export default function LibraryPage() {
                         {p.name}
                       </div>
                       <div className="mt-0.5 text-[11px] text-ink-500">
-                        更新于 {relTime(p.updated_at)}
-                        {!p.analyzed && <span className="ml-2 text-amber-glow">尚未分析</span>}
+                        {t('library.updatedAt', { time: relTime(p.updated_at) })}
+                        {!p.analyzed && <span className="ml-2 text-amber-glow">{t('library.notAnalyzed')}</span>}
                       </div>
                     </div>
                     <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                      <Tooltip content={t('library.importVideo')}>
+                        {/* 拦住冒泡，否则点导入会顺带触发卡片的「打开工程」 */}
+                        <span onClick={(e) => e.stopPropagation()}>
+                          <ImportVideoButton
+                            variant="ghost"
+                            size="icon"
+                            label=""
+                            projectId={p.id}
+                            onDone={() => refresh()}
+                          />
+                        </span>
+                      </Tooltip>
                       <Button
                         variant="ghost"
                         size="icon"
-                        title="复制工程"
+                        title={t('library.duplicate')}
                         onClick={async (e) => {
                           // 别让点击冒泡到卡片本身：那会顺手把工程打开，跳进剪辑台
                           e.stopPropagation()
-                          await api.duplicateProject(p.id)
-                          refresh()
-                          toast({ kind: 'success', title: '已复制工程' })
+                          try {
+                            await api.duplicateProject(p.id)
+                            refresh()
+                            toast({ kind: 'success', title: t('library.duplicated') })
+                          } catch (err) {
+                            toast({ kind: 'error', title: t('library.duplicateFailed'), detail: String(err) })
+                          }
                         }}
                       >
                         <Copy size={13} />
@@ -217,17 +235,21 @@ export default function LibraryPage() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        title="删除工程"
+                        title={t('library.delete')}
                         onClick={async (e) => {
                           e.stopPropagation()
                           const ok = await confirm({
-                            title: `删除工程「${p.name}」？`,
-                            desc: '工程文件会被移到同目录的备份文件，素材本身不会被删除。',
+                            title: t('library.deleteTitle', { name: p.name }),
+                            desc: t('library.deleteDesc'),
                             danger: true,
                           })
                           if (ok) {
-                            await deleteProject(p.id)
-                            toast({ kind: 'info', title: '工程已删除' })
+                            try {
+                              await deleteProject(p.id)
+                              toast({ kind: 'info', title: t('library.deleted') })
+                            } catch (err) {
+                              toast({ kind: 'error', title: t('library.deleteFailed'), detail: String(err) })
+                            }
                           }
                         }}
                       >
@@ -246,70 +268,34 @@ export default function LibraryPage() {
       <Modal
         open={creating}
         onClose={() => setCreating(false)}
-        title="新建工程"
-        subtitle="工程用于组织素材、分析结果与时间线"
+        title={t('library.modalTitle')}
+        subtitle={t('library.modalSubtitle')}
         width={460}
         footer={
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => setCreating(false)}>
-              取消
+              {t('common.cancel')}
             </Button>
-            <Button
-              variant="primary"
-              disabled={!name.trim()}
-              onClick={async () => {
-                const id = await createProject(name.trim())
-                setCreating(false)
-                if (id) toast({ kind: 'success', title: '工程已创建', detail: '现在导入素材开始剪辑' })
-              }}
-            >
-              创建并进入
+            <Button variant="primary" disabled={!name.trim()} loading={saving} onClick={() => void handleCreate()}>
+              {t('library.createAndEnter')}
             </Button>
           </div>
         }
       >
-        <label className="mb-1.5 block text-[12px] text-ink-300">工程名称</label>
+        <label className="mb-1.5 block text-[12px] text-ink-300">{t('library.nameLabel')}</label>
         <input
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && name.trim()) {
-              createProject(name.trim()).then((id) => {
-                setCreating(false)
-                if (id) toast({ kind: 'success', title: '工程已创建' })
-              })
+            // 中文/日文输入法按回车确认候选词时也会触发 keydown，必须避开，
+            // 否则候选词还没上屏就把工程建出来了。
+            if (e.key === 'Enter' && !e.nativeEvent.isComposing && name.trim()) {
+              void handleCreate()
             }
           }}
           className="field"
-          placeholder="例如：2026-09-13 羽毛球训练"
-        />
-      </Modal>
-
-      {/* 按路径导入 */}
-      <Modal
-        open={!!targetProject}
-        onClose={() => setTargetProject(null)}
-        title="导入素材"
-        subtitle="每行一个文件路径，也可以直接把文件拖进剪辑台"
-        width={620}
-        footer={
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" onClick={() => setTargetProject(null)}>
-              取消
-            </Button>
-            <Button variant="primary" loading={importing} onClick={doImport} disabled={!importPath.trim()}>
-              开始导入
-            </Button>
-          </div>
-        }
-      >
-        <textarea
-          value={importPath}
-          onChange={(e) => setImportPath(e.target.value)}
-          rows={7}
-          className="field mono text-[11.5px]"
-          placeholder={'C:\\Users\\me\\Videos\\match.mp4\nC:\\Users\\me\\Videos\\match2.mp4'}
+          placeholder={t('library.namePlaceholder')}
         />
       </Modal>
     </div>

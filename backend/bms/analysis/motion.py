@@ -1,7 +1,8 @@
-"""视觉运动分析：帧间运动能量、全局抖动、清晰度、场景切换、活动热区。
+"""Visual motion analysis: inter-frame motion energy, global shake, sharpness, scene cuts, activity hotspots.
 
-这些信号本身不依赖任何神经网络，速度极快，并且能给回合分割提供
-与音频互补的证据（音频怕安静球馆里的回声，视觉怕观众走动）。
+These signals do not depend on any neural network, are extremely fast, and can provide
+evidence complementary to audio for rally segmentation (audio suffers from echo in a quiet
+gym, vision suffers from crowd movement).
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ from typing import Callable
 
 import numpy as np
 
+from ..core.media import proxy_source
 from ..core.models import MediaInfo
+from ..i18n import tr
 
 Progress = Callable[[float, str], None]
 
@@ -21,25 +24,25 @@ Progress = Callable[[float, str], None]
 class MotionSignal:
     fps: float
     duration: float
-    #: 全局帧间运动能量（0~1）
+    #: Global inter-frame motion energy (0~1)
     motion: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 场地区域内运动能量（0~1），无标定时等于全局
+    #: Motion energy within the court region (0~1); equals global when there is no calibration
     court_motion: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 亮度均值
+    #: Mean brightness
     brightness: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 清晰度（Laplacian 方差，归一化）
+    #: Sharpness (Laplacian variance, normalized)
     sharpness: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 手持抖动幅度（像素/帧，归一化）
+    #: Handheld shake magnitude (pixels/frame, normalized)
     shake: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 相邻采样帧直方图差异（场景切换检测）
+    #: Histogram difference between adjacent sampled frames (scene cut detection)
     cut: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 活动热区（小尺寸 2D 数组）
+    #: Activity hotspot (small 2D array)
     activity_map: np.ndarray | None = None
-    #: 自动估计的场地区域（归一化 x0,y0,x1,y1）
+    #: Automatically estimated court region (normalized x0,y0,x1,y1)
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
 
     def resample(self, fps_target: float) -> dict[str, np.ndarray]:
-        """重采样到统一时间轴，供信号融合使用。"""
+        """Resample to a unified time axis for signal fusion."""
         if self.fps <= 0 or self.motion.size == 0:
             return {}
         n = max(1, int(round(self.duration * fps_target)))
@@ -64,10 +67,10 @@ def analyze_motion(
 ) -> MotionSignal:
     import cv2
 
-    src = str(media.proxy_path or media.path)
+    src = str(proxy_source(media))
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频: {src}")
+        raise RuntimeError(tr("analysis.motion.open_failed", src=src))
 
     src_fps = cap.get(cv2.CAP_PROP_FPS) or media.fps or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -115,7 +118,7 @@ def analyze_motion(
             motion.append(float(d.mean()) / 255.0)
             diff = cv2.GaussianBlur(d, (0, 0), 1.2)
             activity = diff if activity is None else 0.985 * activity + 0.015 * diff
-            # 全局位移（抖动 + 摇镜）
+            # Global displacement (shake + panning)
             if window is None:
                 wy = np.hanning(grayf.shape[0]).astype(np.float32)
                 wx = np.hanning(grayf.shape[1]).astype(np.float32)
@@ -136,7 +139,7 @@ def analyze_motion(
         prev_gray, prev_hist = grayf, hist
 
         if on and total:
-            on(min(0.99, read / min(total, limit)), "分析画面运动")
+            on(min(0.99, read / min(total, limit)), tr("analysis.stage.motion"))
 
     cap.release()
 
@@ -152,7 +155,7 @@ def analyze_motion(
     )
     sig.motion = _norm(sig.motion)
     sig.roi = _auto_roi(activity)
-    sig.court_motion = sig.motion.copy()  # 无球员/场地标定时先等同全局
+    sig.court_motion = sig.motion.copy()  # without players/court calibration, equate to global for now
     return sig
 
 
@@ -166,7 +169,7 @@ def _norm(a: np.ndarray) -> np.ndarray:
 
 
 def _auto_roi(activity: np.ndarray | None, thr: float = 0.35) -> tuple[float, float, float, float]:
-    """从时间累积的活动热区里估计场地大致范围（归一化坐标）。"""
+    """Estimate the rough court extent from the time-accumulated activity hotspot (normalized coords)."""
     if activity is None or activity.size == 0:
         return (0.0, 0.0, 1.0, 1.0)
     a = activity / (activity.max() + 1e-9)
@@ -179,7 +182,7 @@ def _auto_roi(activity: np.ndarray | None, thr: float = 0.35) -> tuple[float, fl
     h, w = a.shape
     x0, x1 = xs.min() / w, (xs.max() + 1) / w
     y0, y1 = ys.min() / h, (ys.max() + 1) / h
-    # 适当外扩，避免裁掉球员手脚
+    # Expand outward a bit to avoid cropping off players' hands and feet
     px, py = 0.04, 0.04
     return (
         float(max(0.0, x0 - px)),
@@ -190,5 +193,5 @@ def _auto_roi(activity: np.ndarray | None, thr: float = 0.35) -> tuple[float, fl
 
 
 def motion_events(sig: MotionSignal, fps: float = 10.0) -> dict[str, np.ndarray]:
-    """按目标帧率输出重采样后的运动信号字典。"""
+    """Output a dict of motion signals resampled to the target frame rate."""
     return sig.resample(fps)

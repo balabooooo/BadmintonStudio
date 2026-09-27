@@ -1,6 +1,6 @@
-"""验证脚本：视觉运动分析 + 活动热区。
+"""Verification script: visual motion analysis + activity heatmap.
 
-用法:
+Usage:
     python scripts/test_motion.py "<proxy or video>" [--fps 15]
 """
 

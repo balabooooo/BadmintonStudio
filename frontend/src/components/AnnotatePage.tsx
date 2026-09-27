@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  AlertTriangle,
   Check,
   Download,
   Pause,
@@ -24,11 +25,25 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn, clamp } from '../lib/format'
-import { Badge, Button, Empty } from './ui'
+import { Badge, Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
+import { stepSpeedValue } from '../lib/playback'
 import { useStore } from '../store/useStore'
-import type { AnnotationDraft, AnnotationRally, OptimizeResult, SegmentMetric } from '../lib/types'
+import { useT } from '../i18n/useT'
+import type {
+  AnalysisParams,
+  AnnotationDraft,
+  AnnotationRally,
+  OptimizeResult,
+  SegmentMetric,
+} from '../lib/types'
 
 interface AnnRally extends AnnotationRally {
+  id: number
+}
+
+interface AnnHit {
+  t: number
+  ours: boolean
   id: number
 }
 
@@ -70,21 +85,31 @@ function MetricBar({ label, m, color }: { label: string; m: SegmentMetric; color
   )
 }
 
-const SEG_LABELS: Record<string, string> = {
-  seg_prominence: '静默谷显著度',
-  seg_min_core: '最短连续移动',
-  seg_min_rest: '最短停顿',
-  seg_min_quiet: '最短静默',
-  min_rally_seconds: '最短回合',
+const SEG_LABEL_KEYS: Record<string, string> = {
+  seg_prominence: 'annotate.seg.prominence',
+  seg_min_core: 'annotate.seg.minCore',
+  seg_min_rest: 'annotate.seg.minRest',
+  seg_min_quiet: 'annotate.seg.minQuiet',
+  min_rally_seconds: 'annotate.seg.minRally',
+  pose_gate_threshold: 'annotate.seg.poseGate',
+  pose_gate_window: 'annotate.seg.poseGateWindow',
+  pose_gate_one_to_one: 'annotate.seg.poseGateOneToOne',
+  pose_gate_force: 'annotate.seg.poseGateForce',
+  hit_sensitivity: 'annotate.seg.hitSensitivity',
 }
 
 export default function AnnotatePage() {
+  const tr = useT()
   const project = useStore((s) => s.project)
   const mediaId = useStore((s) => s.mediaId)
   const media = useStore((s) => s.currentMedia())
   const params = useStore((s) => s.params)
   const resegment = useStore((s) => s.resegment)
+  const rebuildHits = useStore((s) => s.rebuildHits)
   const toast = useStore((s) => s.toast)
+  const savePreset = useStore((s) => s.savePreset)
+  const courtPoly = useStore((s) => s.currentCourtPoly())
+  const confirm = useConfirm()
 
   const pid = project?.id ?? ''
   const mid = mediaId ?? ''
@@ -99,11 +124,14 @@ export default function AnnotatePage() {
   const [fps, setFps] = useState(media?.fps ?? 0)
   const [auto, setAuto] = useState<AnnotationDraft[]>([])
   const [ann, setAnn] = useState<AnnRally[]>([])
+  const [hits, setHits] = useState<AnnHit[]>([])
+  const [rawHitTimes, setRawHitTimes] = useState<number[]>([])
   const [focus, setFocus] = useState<[number, number]>([0, 0])
   const [note, setNote] = useState('')
   const [loaded, setLoaded] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [saveState, setSaveState] = useState('—')
+  const [videoError, setVideoError] = useState(false)
   const [tab, setTab] = useState<'auto' | 'ann'>('auto')
 
   // ---------- 播放 / 视图
@@ -118,15 +146,23 @@ export default function AnnotatePage() {
   // ---------- 编辑
   const [sel, setSel] = useState<number | null>(null)
   const [pending, setPending] = useState<{ start: number } | null>(null)
-  const undoRef = useRef<{ start: number; end: number; source?: string; note?: string }[][]>([])
+  const undoRef = useRef<{ rallies: Omit<AnnRally, 'id'>[]; hits: { t: number; ours: boolean }[] }[]>([])
 
   // ---------- 优化
   const [opt, setOpt] = useState<OptimizeResult | null>(null)
   const [optimizing, setOptimizing] = useState(false)
 
+  // ---------- 场景预设
+  const [presetOpen, setPresetOpen] = useState(false)
+  const [presetName, setPresetName] = useState('')
+  const [presetNote, setPresetNote] = useState('')
+  const [presetSaving, setPresetSaving] = useState(false)
+
   const idSeq = useRef(1)
   const nextId = () => idSeq.current++
   const saveTimer = useRef<number | null>(null)
+  // 每次编辑自增；保存返回时用它判断「保存期间是否又有新改动」，避免把 dirty 误清。
+  const editSeq = useRef(0)
   const dragging = useRef<null | {
     id: number
     edge: 'start' | 'end' | 'move'
@@ -141,9 +177,9 @@ export default function AnnotatePage() {
 
   // 键盘 / rAF 回调里读最新状态（避免闭包过期，也避免每帧重绑监听器）。
   // 用 effect 而不是在 render 里直接赋值：并发渲染下在 render 期间写 ref 不安全。
-  const stateRef = useRef({ ann, auto, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop })
+  const stateRef = useRef({ ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop })
   useEffect(() => {
-    stateRef.current = { ann, auto, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop }
+    stateRef.current = { ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop }
   })
 
   /* ---------------------------------------------------------------- 加载 */
@@ -155,6 +191,16 @@ export default function AnnotatePage() {
       setFps(info.fps || media?.fps || 0)
       setAuto(info.auto || [])
       setAnn((info.rallies || []).map((r) => ({ ...r, id: nextId() })))
+      const infoHits = info.hits || []
+      const raw = (info.hit_times_raw && info.hit_times_raw.length
+        ? info.hit_times_raw
+        : (info.hit_times || []))
+      setRawHitTimes(raw)
+      setHits(
+        infoHits.length
+          ? infoHits.map((h) => ({ t: h.t, ours: h.ours, id: nextId() }))
+          : raw.map((t) => ({ t, ours: true, id: nextId() })),
+      )
       setNote(info.note || '')
       const f = info.focus && info.focus[1] ? (info.focus as [number, number]) : [0, info.duration || 0]
       setFocus(f as [number, number])
@@ -162,13 +208,14 @@ export default function AnnotatePage() {
       setViewCenter(f[0])
       setSel(null)
       setLoaded(true)
+      setVideoError(false)
       setDirty(false)
-      setSaveState(info.rallies?.length ? `已载入 ${info.rallies.length} 回合` : '新建标注')
+      setSaveState(info.rallies?.length ? tr('annotate.loadedRallies', { n: info.rallies.length }) : tr('annotate.newAnnotation'))
       undoRef.current = []
     } catch (e) {
-      toast({ kind: 'error', title: '读取标注失败', detail: String(e) })
+      toast({ kind: 'error', title: tr('annotate.loadFailed'), detail: String(e) })
     }
-  }, [pid, mid, media?.duration, media?.fps, toast])
+  }, [pid, mid, media?.duration, media?.fps, toast, tr])
 
   useEffect(() => {
     void reload()
@@ -177,33 +224,73 @@ export default function AnnotatePage() {
   /* ---------------------------------------------------------------- 保存 */
   const doSave = useCallback(async () => {
     if (!pid || !mid) return
+    const seq = editSeq.current
     try {
       const res = await api.saveAnnotation(pid, mid, {
         rallies: stateRef.current.ann.map(({ start, end, source, note: n }) => ({
           start, end, source, note: n,
         })),
+        hits: stateRef.current.hits.map(({ t, ours }) => ({ t, ours })),
         focus,
         note,
       })
-      setDirty(false)
-      setSaveState(`已保存 · ${res.count} 回合`)
+      // 保存期间又编辑过就不要清 dirty：否则编辑会被这次「旧」保存的返回误标成已保存。
+      if (seq === editSeq.current) setDirty(false)
+      setSaveState(tr('annotate.savedCount', { n: res.count }))
     } catch (e) {
-      setSaveState('保存失败')
-      toast({ kind: 'error', title: '保存失败', detail: String(e) })
+      setSaveState(tr('annotate.saveFailed'))
+      toast({ kind: 'error', title: tr('annotate.saveFailed'), detail: String(e) })
     }
-  }, [pid, mid, focus, note, toast])
+  }, [pid, mid, focus, note, toast, tr])
 
   const markDirty = useCallback(() => {
+    editSeq.current += 1
     setDirty(true)
-    setSaveState('未保存…')
+    setSaveState(tr('annotate.unsaved'))
     if (saveTimer.current) window.clearTimeout(saveTimer.current)
     saveTimer.current = window.setTimeout(() => void doSave(), 1200)
-  }, [doSave])
+  }, [doSave, tr])
+
+  // 卸载时清掉待触发的自动保存，避免离开页面后回调里再去 setState。
+  useEffect(
+    () => () => {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current)
+    },
+    [],
+  )
 
   const pushUndo = useCallback(() => {
-    undoRef.current.push(stateRef.current.ann.map(({ id: _id, ...r }) => r))
+    undoRef.current.push({
+      rallies: stateRef.current.ann.map(({ id: _id, ...r }) => r),
+      hits: stateRef.current.hits.map(({ t, ours }) => ({ t, ours })),
+    })
     if (undoRef.current.length > 100) undoRef.current.shift()
   }, [])
+
+  /* ---------------------------------------------------------------- 击球标注 */
+  const toggleHit = useCallback((id: number) => {
+    pushUndo()
+    setHits((prev) => prev.map((h) => (h.id === id ? { ...h, ours: !h.ours } : h)))
+    markDirty()
+  }, [markDirty, pushUndo])
+
+  const markAllHitsOurs = useCallback(() => {
+    pushUndo()
+    setHits((prev) => prev.map((h) => ({ ...h, ours: true })))
+    markDirty()
+  }, [markDirty, pushUndo])
+
+  const seedHits = useCallback(() => {
+    pushUndo()
+    setHits(rawHitTimes.map((t) => ({ t, ours: true, id: nextId() })))
+    markDirty()
+  }, [markDirty, pushUndo, rawHitTimes])
+
+  const clearHits = useCallback(() => {
+    pushUndo()
+    setHits([])
+    markDirty()
+  }, [markDirty, pushUndo])
 
   /* ---------------------------------------------------------------- 播放控制 */
   const seek = useCallback((t: number, center = true, pause = true) => {
@@ -228,6 +315,17 @@ export default function AnnotatePage() {
     else v.pause()
   }, [])
 
+  /** 在预设档位间调倍速：dir=+1 加速，-1 减速。 */
+  const stepSpeed = useCallback((dir: number) => {
+    setSpeed((prev) => stepSpeedValue(prev, dir))
+  }, [])
+
+  // 与工作室播放器一致：speed 是唯一真源，由它写 playbackRate。
+  useEffect(() => {
+    const v = videoRef.current
+    if (v) v.playbackRate = speed
+  }, [speed])
+
   /* ---------------------------------------------------------------- 标注操作 */
   const addAnn = useCallback((r: { start: number; end: number; source?: string; note?: string }, select = true) => {
     const obj: AnnRally = { start: r.start, end: r.end, source: r.source || 'manual', note: r.note || '', id: nextId() }
@@ -247,58 +345,61 @@ export default function AnnotatePage() {
   const finishSeg = useCallback(() => {
     const v = videoRef.current
     const t = v?.currentTime ?? 0
-    setPending((p) => {
-      if (!p) return null
-      const st = Math.min(p.start, t)
-      const en = Math.max(p.start, t)
-      if (en - st >= 0.05) {
-        pushUndo()
-        addAnn({ start: st, end: en, source: 'manual' }, true)
-      }
-      return null
-    })
+    const p = stateRef.current.pending
+    if (!p) return
+    const st = Math.min(p.start, t)
+    const en = Math.max(p.start, t)
+    setPending(null)
+    if (en - st >= 0.05) {
+      pushUndo()
+      addAnn({ start: st, end: en, source: 'manual' }, true)
+    }
   }, [addAnn, pushUndo])
 
   const delSel = useCallback(() => {
-    setSel((cur) => {
-      if (cur == null) return cur
-      pushUndo()
-      setAnn((prev) => prev.filter((r) => r.id !== cur))
-      markDirty()
-      return null
-    })
+    const cur = stateRef.current.sel
+    if (cur == null) return
+    pushUndo()
+    setAnn((prev) => prev.filter((r) => r.id !== cur))
+    setSel(null)
+    markDirty()
   }, [markDirty, pushUndo])
 
   const undo = useCallback(() => {
     const snap = undoRef.current.pop()
     if (!snap) return
-    setAnn(snap.map((r) => ({ ...r, id: nextId() })))
+    setAnn(snap.rallies.map((r) => ({ ...r, id: nextId() })))
+    setHits(snap.hits.map((h) => ({ ...h, id: nextId() })))
     setSel(null)
     markDirty()
   }, [markDirty])
 
-  const clearAll = useCallback(() => {
+  const clearAll = useCallback(async () => {
     if (!stateRef.current.ann.length) return
-    if (!window.confirm(`确定清空全部 ${stateRef.current.ann.length} 条标注？`)) return
+    const ok = await confirm({ title: tr('annotate.confirmClear', { n: stateRef.current.ann.length }), danger: true })
+    if (!ok) return
     pushUndo()
     setAnn([])
     setSel(null)
     markDirty()
-  }, [markDirty, pushUndo])
+  }, [confirm, markDirty, pushUndo, tr])
 
-  const seedAll = useCallback(() => {
+  const seedAll = useCallback(async () => {
     if (!stateRef.current.auto.length) {
-      toast({ kind: 'warn', title: '没有自动切分结果可导入' })
+      toast({ kind: 'warn', title: tr('annotate.noAutoToImport') })
       return
     }
-    if (stateRef.current.ann.length && !window.confirm('将把自动回合追加到现有标注，继续？')) return
+    if (stateRef.current.ann.length) {
+      const ok = await confirm({ title: tr('annotate.confirmSeed') })
+      if (!ok) return
+    }
     pushUndo()
     setAnn((prev) => [
       ...prev,
       ...stateRef.current.auto.map((a) => ({ start: a.start, end: a.end, source: 'auto', note: '', id: nextId() })),
     ].sort((a, b) => a.start - b.start))
     markDirty()
-  }, [markDirty, pushUndo, toast])
+  }, [confirm, markDirty, pushUndo, toast, tr])
 
   const currentAuto = useCallback((): AnnotationDraft | null => {
     const t = videoRef.current?.currentTime ?? 0
@@ -438,13 +539,21 @@ export default function AnnotatePage() {
           setPending(null)
           setSel(null)
           break
+        case '-':
+        case '_':
+          stepSpeed(-1)
+          break
+        case '=':
+        case '+':
+          stepSpeed(1)
+          break
         default:
           break
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [acceptAuto, delSel, doSave, finishSeg, jumpAuto, newSeg, selectNearest, step, togglePlay, undo])
+  }, [acceptAuto, delSel, doSave, finishSeg, jumpAuto, newSeg, selectNearest, step, stepSpeed, togglePlay, undo])
 
   /* ---------------------------------------------------------------- rAF：时间同步 + 播放跟随 */
   useEffect(() => {
@@ -641,7 +750,7 @@ export default function AnnotatePage() {
   const runOptimize = useCallback(async () => {
     if (!pid || !mid) return
     if (!stateRef.current.ann.length) {
-      toast({ kind: 'warn', title: '先标注几个回合再优化' })
+      toast({ kind: 'warn', title: tr('annotate.needAnnotations') })
       return
     }
     setOptimizing(true)
@@ -650,32 +759,106 @@ export default function AnnotatePage() {
       await doSave()
       const res = await api.optimizeSegmentation(pid, mid, { params })
       setOpt(res)
-      if (!res.best) toast({ kind: 'warn', title: '没有搜到可用参数' })
+      if (!res.best) toast({ kind: 'warn', title: tr('annotate.noUsableParams') })
       else
         toast({
           kind: 'success',
-          title: `最优 F1 ${res.best.f1.toFixed(3)}（当前 ${res.baseline.f1.toFixed(3)}）`,
-          detail: `试了 ${res.tried} 组参数，点「应用」写回工程并重新切分`,
+          title: tr('annotate.bestF1', { f1: res.best.f1.toFixed(3), baseline: res.baseline.f1.toFixed(3) }),
+          detail: tr('annotate.triedDetail', { n: res.tried }),
         })
     } catch (e) {
-      toast({ kind: 'error', title: '参数优化失败', detail: String((e as Error)?.message || e) })
+      toast({ kind: 'error', title: tr('annotate.optimizeFailed'), detail: String((e as Error)?.message || e) })
     } finally {
       setOptimizing(false)
     }
-  }, [doSave, mid, pid, params, toast])
+  }, [doSave, mid, pid, params, toast, tr])
+
+  // 只要改动了 hit_sensitivity，就必须重跑音频检测（重建击球序列）；否则 resegment 只会
+  // 复用按旧灵敏度检测的原始击球，标注标定出的灵敏度等于没生效。
+  const applyParamsToProject = useCallback(async (patch: Record<string, number>) => {
+    const needAudio = 'hit_sensitivity' in patch && patch.hit_sensitivity !== params.hit_sensitivity
+    if (needAudio) await rebuildHits(patch)
+    else await resegment(patch)
+  }, [params.hit_sensitivity, rebuildHits, resegment])
 
   const applyBest = useCallback(async () => {
     if (!opt?.best) return
-    await resegment(opt.best.params)
-    toast({ kind: 'success', title: '已应用最优参数并重新切分' })
+    await applyParamsToProject(opt.best.params)
+    toast({ kind: 'success', title: tr('annotate.appliedBest') })
     await reload()
-  }, [opt, reload, resegment, toast])
+  }, [applyParamsToProject, opt, reload, toast, tr])
 
   const applyParam = useCallback(async (patch: Record<string, number>) => {
-    await resegment(patch)
-    toast({ kind: 'info', title: '已按这组参数重新切分' })
+    await applyParamsToProject(patch)
+    toast({ kind: 'info', title: tr('annotate.appliedParams') })
     await reload()
-  }, [reload, resegment, toast])
+  }, [applyParamsToProject, reload, toast, tr])
+
+  /* ---------------------------------------------------------------- 场景预设 */
+  // 存哪组参数：当前参数打底，有优化结果就用「最优」覆盖——那才是这次标注得到的结论。
+  const collectPresetParams = useCallback((): Partial<AnalysisParams> => {
+    const keys = [
+      'seg_prominence', 'seg_min_core', 'seg_min_rest', 'seg_min_quiet',
+      'min_rally_seconds', 'max_rally_seconds', 'pre_roll', 'post_roll', 'hit_tail_seconds',
+      // 击球归属 / 邻场抑制（由标注优化标定）
+      'pose_gate_threshold', 'pose_gate_window', 'hit_sensitivity',
+    ] as const
+    const out: Partial<AnalysisParams> = {}
+    for (const k of keys) {
+      const v = params[k]
+      if (typeof v === 'number' && Number.isFinite(v)) out[k] = v
+    }
+    out.pose_gate_one_to_one = params.pose_gate_one_to_one
+    out.pose_gate_force = params.pose_gate_force
+    if (opt?.best?.params) Object.assign(out, opt.best.params)
+    return out
+  }, [params, opt])
+
+  const collectFit = useCallback((): Record<string, number | string> | undefined => {
+    if (!opt) return undefined
+    const best = opt.best
+    const fit: Record<string, number | string> = {
+      source: 'annotation',
+      scope: (opt.hit_label_count ?? 0) > 0 ? 'hit' : 'rally',
+      baseline_f1: opt.baseline.f1,
+      hit_label_count: opt.hit_label_count ?? 0,
+    }
+    if (best) {
+      fit.f1 = best.f1
+      fit.precision = best.precision
+      fit.recall = best.recall
+      if (best.hit) {
+        fit.hit_f1 = best.hit.f1
+        fit.hit_precision = best.hit.precision
+        fit.hit_recall = best.hit.recall
+      }
+    }
+    return fit
+  }, [opt])
+
+  const openPresetDialog = useCallback(() => {
+    setPresetName(`${media?.name || tr('annotate.sceneFallback')} · ${opt ? tr('annotate.optimizedParams') : tr('annotate.baseline')}`)
+    setPresetNote('')
+    setPresetOpen(true)
+  }, [media?.name, opt, tr])
+
+  const doSavePreset = useCallback(async () => {
+    if (!presetName.trim()) return
+    setPresetSaving(true)
+    try {
+      await savePreset({
+        name: presetName.trim(),
+        note: presetNote.trim(),
+        frameTime: time,
+        params: collectPresetParams(),
+        courtPoly: courtPoly ?? null,
+        fit: collectFit(),
+      })
+      setPresetOpen(false)
+    } finally {
+      setPresetSaving(false)
+    }
+  }, [presetName, presetNote, time, collectPresetParams, collectFit, courtPoly, savePreset])
 
   /* ---------------------------------------------------------------- 列表点击 */
   const jumpToList = (r: { start: number; id?: number }) => {
@@ -688,35 +871,35 @@ export default function AnnotatePage() {
   if (!project || !media) {
     return (
       <div className="grid h-full place-items-center">
-        <Empty icon={<PenLine size={30} />} title="先打开一个工程并导入素材" desc="标注与参数优化都需要一段已分析的视频。" />
+        <Empty icon={<PenLine size={30} />} title={tr('annotate.emptyTitle')} desc={tr('annotate.emptyDesc')} />
       </div>
     )
   }
 
-  const rows = tab === 'auto' ? auto.map((a) => ({ start: a.start, end: a.end, key: `a${a.index}`, meta: `${a.shots} 拍 · ${a.score} 分`, id: undefined as number | undefined })) : ann.map((r) => ({ start: r.start, end: r.end, key: `r${r.id}`, meta: r.source === 'auto' ? '自动采纳' : '手动', id: r.id }))
+  const rows = tab === 'auto' ? auto.map((a) => ({ start: a.start, end: a.end, key: `a${a.index}`, meta: tr('annotate.autoMeta', { shots: a.shots, score: a.score }), id: undefined as number | undefined })) : ann.map((r) => ({ start: r.start, end: r.end, key: `r${r.id}`, meta: r.source === 'auto' ? tr('annotate.sourceAuto') : tr('annotate.sourceManual'), id: r.id }))
   const canOptimize = ann.length > 0
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-white/7 px-3 py-2">
         <PenLine size={15} className="text-court-300" />
-        <div className="text-[13px] font-semibold text-white">回合标注</div>
+        <div className="text-[13px] font-semibold text-white">{tr('annotate.title')}</div>
         <span className="text-[11px] text-ink-500">
-          {media.name} · {fmt(duration)} · {auto.length} 自动 / {ann.length} 标注
+          {media.name} · {fmt(duration)} · {tr('annotate.headerMeta', { auto: auto.length, ann: ann.length })}
         </span>
         <div className="flex-1" />
         <span className={cn('text-[11px]', dirty ? 'text-amber-glow' : 'text-ink-500')}>{saveState}</span>
-        <Button size="sm" variant="ghost" onClick={seedAll}>
-          <Sparkles size={13} /> 全部采用自动
+        <Button size="sm" variant="ghost" onClick={() => void seedAll()}>
+          <Sparkles size={13} /> {tr('annotate.seedAll')}
         </Button>
         <Button size="sm" variant="ghost" onClick={exportCsv}>
           <Download size={13} /> CSV
         </Button>
-        <Button size="sm" variant="danger" onClick={clearAll}>
-          <Trash2 size={13} /> 清空
+        <Button size="sm" variant="danger" onClick={() => void clearAll()}>
+          <Trash2 size={13} /> {tr('annotate.clearAll')}
         </Button>
         <Button size="sm" variant="primary" onClick={() => void doSave()}>
-          <Check size={13} /> 保存
+          <Check size={13} /> {tr('common.save')}
         </Button>
       </div>
 
@@ -725,7 +908,8 @@ export default function AnnotatePage() {
           <div className="relative bg-black">
             <video
               ref={videoRef}
-              src={api.proxyUrl(pid, mid)}
+              // 加代理路径做缓存键：重新生成代理后 URL 变化，浏览器才会取到新视频。
+              src={`${api.proxyUrl(pid, mid)}?v=${encodeURIComponent(media.proxy_path ?? '')}`}
               className="mx-auto max-h-[44vh] w-full bg-black"
               preload="auto"
               playsInline
@@ -733,43 +917,64 @@ export default function AnnotatePage() {
               onLoadedMetadata={(e) => {
                 const v = e.currentTarget
                 if (!duration) setDuration(v.duration)
-                if (!fps) setFps(0)
               }}
               onPlay={() => setPlaying(true)}
               onPause={() => setPlaying(false)}
               onRateChange={(e) => setSpeed(e.currentTarget.playbackRate)}
+              onError={() => setVideoError(true)}
             />
+            {videoError && (
+              <div className="absolute inset-0 grid place-items-center bg-ink-950/85 px-6 text-center">
+                <div className="flex max-w-[420px] flex-col items-center gap-1.5 text-[12px] text-ink-300">
+                  <AlertTriangle size={20} className="text-amber-glow" />
+                  <div className="font-medium text-ink-100">{tr('annotate.videoFailed')}</div>
+                  <div className="text-[11px] leading-relaxed text-ink-500">{tr('annotate.videoFailedHint')}</div>
+                </div>
+              </div>
+            )}
             <div className="mono absolute top-2 left-3 rounded-md bg-black/55 px-2 py-0.5 text-[12px]">
               <b className="text-court-300">{fmt(time)}</b> / {fmt(duration)}
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5 border-b border-white/7 px-3 py-2">
-            <Button size="sm" variant="primary" onClick={togglePlay}>
-              {playing ? <Pause size={13} /> : <Play size={13} />}
-              {playing ? '暂停' : '播放'}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => step(-1)}>« -1s (←)</Button>
-            <Button size="sm" variant="ghost" onClick={() => step(1)}>(→) +1s »</Button>
-            <span className="mx-1 text-[11px] text-ink-500">速度</span>
-            <input
-              type="range" min={0.1} max={2} step={0.1} value={speed} className="w-[80px]"
-              onChange={(e) => {
-                const v = parseFloat(e.target.value)
-                if (videoRef.current) videoRef.current.playbackRate = v
-                setSpeed(v)
-              }}
-            />
-            <span className="mono text-[11px] text-ink-400">{speed.toFixed(1)}x</span>
-            <Button size="sm" variant={loop ? 'primary' : 'ghost'} onClick={() => setLoop((v) => !v)}>循环选中</Button>
+            <Tooltip content={playing ? tr('annotate.pause') : tr('annotate.play')} kbd="Space">
+              <Button size="sm" variant="primary" onClick={togglePlay}>
+                {playing ? <Pause size={13} /> : <Play size={13} />}
+                {playing ? tr('annotate.pause') : tr('annotate.play')}
+              </Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.stepBack')} kbd="←">
+              <Button size="sm" variant="ghost" onClick={() => step(-1)}>{tr('annotate.stepBack')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.stepForward')} kbd="→">
+              <Button size="sm" variant="ghost" onClick={() => step(1)}>{tr('annotate.stepForward')}</Button>
+            </Tooltip>
+            <span className="mx-1 text-[11px] text-ink-500">{tr('annotate.speed')}</span>
+            <SpeedMenu value={speed} onChange={setSpeed} title={tr('annotate.speed')} direction="down" />
+            <Button size="sm" variant={loop ? 'primary' : 'ghost'} onClick={() => setLoop((v) => !v)}>{tr('annotate.loopSelected')}</Button>
             <div className="flex-1" />
-            <Button size="sm" onClick={newSeg}>[ 起点</Button>
-            <Button size="sm" onClick={finishSeg}>] 终点</Button>
-            <Button size="sm" variant="subtle" onClick={() => acceptAuto(true)}>c 确认自动</Button>
-            <Button size="sm" variant="ghost" onClick={() => jumpAuto(-1)}>p 上一自动</Button>
-            <Button size="sm" variant="ghost" onClick={() => jumpAuto(1)}>n 下一自动</Button>
-            <Button size="sm" variant="danger" onClick={delSel}>删除选中</Button>
-            <Button size="sm" variant="ghost" onClick={undo}>撤销</Button>
+            <Tooltip content={tr('annotate.markStart')} kbd={['[', 'i']}>
+              <Button size="sm" onClick={newSeg}>{tr('annotate.markStart')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.markEnd')} kbd={[']', 'o']}>
+              <Button size="sm" onClick={finishSeg}>{tr('annotate.markEnd')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.confirmAuto')} kbd="c">
+              <Button size="sm" variant="subtle" onClick={() => acceptAuto(true)}>{tr('annotate.confirmAuto')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.prevAuto')} kbd="p">
+              <Button size="sm" variant="ghost" onClick={() => jumpAuto(-1)}>{tr('annotate.prevAuto')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.nextAuto')} kbd="n">
+              <Button size="sm" variant="ghost" onClick={() => jumpAuto(1)}>{tr('annotate.nextAuto')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.deleteSelected')} kbd="d">
+              <Button size="sm" variant="danger" onClick={delSel}>{tr('annotate.deleteSelected')}</Button>
+            </Tooltip>
+            <Tooltip content={tr('annotate.undoScoped')} kbd="z">
+              <Button size="sm" variant="ghost" onClick={undo}>{tr('annotate.undoScoped')}</Button>
+            </Tooltip>
           </div>
 
           <div className="px-3 pt-2">
@@ -777,13 +982,13 @@ export default function AnnotatePage() {
           </div>
 
           <div className="px-3 py-1 text-[10.5px] text-ink-500">
-            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#4b5563]" /> 自动切分</span>
-            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#22c55e]" /> 我的标注</span>
-            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#facc15]" /> 选中</span>
-            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#fb923c]" /> 标记中</span>
+            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#4b5563]" /> {tr('annotate.legendAuto')}</span>
+            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#22c55e]" /> {tr('annotate.legendMine')}</span>
+            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#facc15]" /> {tr('annotate.legendSelected')}</span>
+            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#fb923c]" /> {tr('annotate.legendMarking')}</span>
             <span className="float-right">
-              <button className="mr-1 rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 1.4, 2, Math.max(4, duration)))}>缩小</button>
-              <button className="rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 0.7, 2, Math.max(4, duration)))}>放大</button>
+              <button className="mr-1 rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 1.4, 2, Math.max(4, duration)))}>{tr('annotate.zoomOut')}</button>
+              <button className="rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 0.7, 2, Math.max(4, duration)))}>{tr('annotate.zoomIn')}</button>
             </span>
           </div>
 
@@ -837,17 +1042,60 @@ export default function AnnotatePage() {
                 <div className="absolute top-0 bottom-0 w-[2px] bg-[#f43f5e]" style={{ left: t2x(time) }} />
               </div>
             </div>
+
+            {/* 击球标注：点击切换「我方 / 邻场」 */}
+            <div className="mt-2">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <span className="text-[11px] text-ink-300">{tr('annotate.hitTitle')}</span>
+                <span className="text-[10px] text-ink-500">{tr('annotate.hitHint')}</span>
+                <div className="flex-1" />
+                <span className="text-[10px] text-ink-500">
+                  {tr('annotate.hitStats', {
+                    ours: hits.filter((h) => h.ours).length,
+                    other: hits.filter((h) => !h.ours).length,
+                  })}
+                </span>
+                <button className="rounded border border-white/10 px-1.5 py-[1px] text-[10px] hover:border-court-500/60" onClick={markAllHitsOurs}>
+                  {tr('annotate.hitAllOurs')}
+                </button>
+                <button className="rounded border border-white/10 px-1.5 py-[1px] text-[10px] hover:border-court-500/60" onClick={seedHits}>
+                  {tr('annotate.hitSeed')}
+                </button>
+                <button className="rounded border border-white/10 px-1.5 py-[1px] text-[10px] hover:border-rose-hot/60" onClick={clearHits}>
+                  {tr('annotate.hitClear')}
+                </button>
+              </div>
+              <div className="relative h-[34px] select-none overflow-hidden rounded-lg border border-white/8 bg-ink-950/40" style={{ width: geom.W }}>
+                {hits.map((h) => {
+                  const x = t2x(h.t)
+                  if (x < -6 || x > geom.W + 6) return null
+                  return (
+                    <button
+                      key={h.id}
+                      title={fmt(h.t)}
+                      onClick={() => toggleHit(h.id)}
+                      className={cn(
+                        'absolute top-[4px] h-[26px] w-[3px] rounded-sm transition-colors',
+                        h.ours ? 'bg-[#22c55e] hover:bg-[#4ade80]' : 'bg-[#f43f5e] hover:bg-[#fb7185]',
+                      )}
+                      style={{ left: x }}
+                    />
+                  )
+                })}
+                <div className="pointer-events-none absolute top-0 bottom-0 w-[2px] bg-[#f43f5e]/70" style={{ left: t2x(time) }} />
+              </div>
+            </div>
           </div>
 
           <div className="px-3 py-2 text-[10.5px] leading-relaxed text-ink-500">
-            <b>← →</b> 移动时间轴（Shift 0.1s / Alt 5s） · <b>[ ]</b> 标记新回合起止 · <b>c</b> 确认自动回合并跳下一个 ·
-            <b> n / p</b> 下一 / 上一自动回合 · <b>d</b> 删除 · <b>z</b> 撤销 · <b>s</b> 保存 · 拖动色块边缘可微调
+            <b>← →</b> {tr('annotate.helpSeek')} · <b>- / =</b> {tr('annotate.helpSpeed')} · <b>[ ]</b> {tr('annotate.helpMark')} · <b>c</b> {tr('annotate.helpConfirm')} ·
+            <b> n / p</b> {tr('annotate.helpJump')} · <b>d</b> {tr('annotate.helpDelete')} · <b>z</b> {tr('annotate.undo')} · <b>s</b> {tr('common.save')} · {tr('annotate.helpDrag')}
           </div>
         </section>
 
         <aside className="flex w-[360px] shrink-0 flex-col border-l border-white/7 bg-ink-950/35">
           <div className="flex gap-1 border-b border-white/7 p-2">
-            {([['auto', `自动回合 (${auto.length})`], ['ann', `我的标注 (${ann.length})`]] as const).map(([id, label]) => (
+            {([['auto', tr('annotate.tabAuto', { n: auto.length })], ['ann', tr('annotate.tabMine', { n: ann.length })]] as const).map(([id, label]) => (
               <button
                 key={id}
                 onClick={() => setTab(id)}
@@ -861,7 +1109,7 @@ export default function AnnotatePage() {
           <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
             {rows.length === 0 ? (
               <div className="p-6 text-center text-[12px] text-ink-500">
-                {tab === 'auto' ? '没有自动切分数据（先跑一次 AI 分析）' : '还没有标注，按 [ 开始'}
+                {tab === 'auto' ? tr('annotate.emptyAuto') : tr('annotate.emptyMine')}
               </div>
             ) : (
               rows.map((r, i) => (
@@ -875,6 +1123,8 @@ export default function AnnotatePage() {
                   <span className="shrink-0 text-[10.5px] text-ink-500">{r.meta}</span>
                   {r.id != null && (
                     <button
+                      aria-label={tr('annotate.deleteSelected')}
+                      title={tr('annotate.deleteSelected')}
                       className="shrink-0 text-ink-600 hover:text-rose-hot"
                       onClick={(e) => {
                         e.stopPropagation()
@@ -896,37 +1146,70 @@ export default function AnnotatePage() {
           <div className="border-t border-white/7 p-3">
             <div className="mb-2 flex items-center gap-2">
               <Wand2 size={13} className="text-court-300" />
-              <span className="text-[12px] font-semibold text-white">用标注优化切分参数</span>
+              <span className="text-[12px] font-semibold text-white">{tr('annotate.optimizeTitle')}</span>
               <div className="flex-1" />
+              <Button size="sm" variant="ghost" onClick={openPresetDialog} title={tr('annotate.savePresetTooltip')}>
+                {tr('annotate.saveAsPreset')}
+              </Button>
               <Button size="sm" variant="primary" loading={optimizing} disabled={!canOptimize} onClick={() => void runOptimize()}>
-                优化
+                {tr('annotate.optimize')}
               </Button>
             </div>
             {!opt ? (
               <div className="text-[11px] leading-relaxed text-ink-500">
-                标好一段（建议 ≥20 个回合）后点「优化」：系统会用标注当标准答案，在参数网格上重跑切分并按 F1 排序。
-                选中结果里的任一参数组都能直接「应用」，无需重跑 AI。
+                {tr('annotate.optimizeDesc')}
               </div>
             ) : (
               <div className="space-y-2">
                 <div className="flex gap-3">
-                  <MetricBar label="当前参数" m={opt.baseline} color="#8b96ad" />
-                  {opt.best && <MetricBar label="最优" m={opt.best} color="#38e0a2" />}
+                  <MetricBar label={tr('annotate.baseline')} m={opt.baseline} color="#8b96ad" />
+                  {opt.best && <MetricBar label={tr('annotate.best')} m={opt.best} color="#38e0a2" />}
                 </div>
                 <div className="text-[10.5px] text-ink-500">
-                  标注 {opt.gt_count} 回合 · 试了 {opt.tried} 组 · IoU≥{opt.iou_threshold}
+                  {tr('annotate.optStats', { gt: opt.gt_count, tried: opt.tried, iou: opt.iou_threshold })}
                 </div>
+                {(opt.best?.hit || opt.baseline?.hit) && (
+                  <div className="rounded-lg border border-white/8 bg-white/[0.02] p-2 text-[10.5px] text-ink-300">
+                    <div className="mb-0.5 text-ink-500">{tr('annotate.hitMetricsTitle')}</div>
+                    <div className="mono flex flex-wrap gap-x-3 gap-y-0.5">
+                      <span>
+                        {tr('annotate.hitBaseline')} P {(opt.baseline.hit?.precision ?? 0).toFixed(2)} · R{' '}
+                        {(opt.baseline.hit?.recall ?? 0).toFixed(2)} · F1 {(opt.baseline.hit?.f1 ?? 0).toFixed(3)}
+                      </span>
+                      {opt.best?.hit && (
+                        <span className="text-court-200">
+                          {tr('annotate.hitBest')} P {opt.best.hit.precision.toFixed(2)} · R{' '}
+                          {opt.best.hit.recall.toFixed(2)} · F1 {opt.best.hit.f1.toFixed(3)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {opt.stages && (
+                  <div className="flex flex-wrap gap-1.5 text-[10px]">
+                    {(['segment', 'gate', 'sensitivity'] as const).map((st) => {
+                      const s = opt.stages?.[st]
+                      if (!s) return null
+                      return (
+                        <span key={st} className="rounded border border-white/10 px-1.5 py-[1px] text-ink-400">
+                          {tr(`annotate.stage.${st}`)} · F1 {(s.best?.f1 ?? 0).toFixed(3)}
+                          {s.best?.hit ? ` · hitF1 ${s.best.hit.f1.toFixed(3)}` : ''}
+                        </span>
+                      )
+                    })}
+                  </div>
+                )}
                 {opt.best && (
                   <div className="rounded-lg border border-court-500/25 bg-court-500/[0.06] p-2">
                     <div className="mb-1 flex items-center gap-2">
-                      <span className="text-[11px] text-court-200">建议参数</span>
+                      <span className="text-[11px] text-court-200">{tr('annotate.suggested')}</span>
                       <div className="flex-1" />
-                      <Button size="sm" variant="primary" onClick={() => void applyBest()}>应用并重切分</Button>
+                      <Button size="sm" variant="primary" onClick={() => void applyBest()}>{tr('annotate.applyResegment')}</Button>
                     </div>
                     <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
                       {Object.entries(opt.best.params).map(([k, v]) => (
                         <div key={k} className="mono flex justify-between text-[10.5px] text-ink-300">
-                          <span className="truncate text-ink-500">{SEG_LABELS[k] || k}</span>
+                          <span className="truncate text-ink-500">{tr(SEG_LABEL_KEYS[k] || k)}</span>
                           <span>{v}</span>
                         </div>
                       ))}
@@ -942,20 +1225,60 @@ export default function AnnotatePage() {
                     >
                       <Badge color={i === 0 ? '#38e0a2' : undefined}>F1 {m.f1.toFixed(3)}</Badge>
                       <span className="mono flex-1 truncate text-ink-500">
-                        {Object.entries(m.params).map(([k, v]) => `${SEG_LABELS[k] || k}=${v}`).join(' · ')}
+                        {Object.entries(m.params).map(([k, v]) => `${tr(SEG_LABEL_KEYS[k] || k)}=${v}`).join(' · ')}
                       </span>
                       <span className="text-ink-500">n{m.n}</span>
                     </button>
                   ))}
                 </div>
                 <div className="text-[10.5px] leading-relaxed text-ink-500">
-                  点某一行会用那组参数立即重切分（复用已存信号，秒级）。不满意可以再选一组。
+                  {tr('annotate.resegmentHint')}
                 </div>
               </div>
             )}
           </div>
         </aside>
       </div>
+
+      {/* 保存为场景预设 */}
+      <Modal
+        open={presetOpen}
+        onClose={() => setPresetOpen(false)}
+        title={tr('annotate.presetTitle')}
+        subtitle={tr('annotate.presetSubtitle')}
+        width={460}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setPresetOpen(false)}>
+              {tr('common.cancel')}
+            </Button>
+            <Button variant="primary" loading={presetSaving} disabled={!presetName.trim()} onClick={() => void doSavePreset()}>
+              {tr('common.save')}
+            </Button>
+          </div>
+        }
+      >
+        <label className="mb-1.5 block text-[12px] text-ink-300">{tr('annotate.presetNameLabel')}</label>
+        <input
+          autoFocus
+          value={presetName}
+          onChange={(e) => setPresetName(e.target.value)}
+          className="field"
+          placeholder={tr('annotate.presetNamePlaceholder')}
+        />
+        <label className="mt-3 mb-1.5 block text-[12px] text-ink-300">{tr('annotate.presetNoteLabel')}</label>
+        <input
+          value={presetNote}
+          onChange={(e) => setPresetNote(e.target.value)}
+          className="field"
+          placeholder={tr('annotate.presetNotePlaceholder')}
+        />
+        <div className="mt-3 space-y-1 text-[11px] leading-relaxed text-ink-500">
+          <div>· {tr('annotate.presetParamsLabel')}{opt ? tr('annotate.presetParamsOptimized') : tr('annotate.presetParamsCurrent')}</div>
+          <div>· {tr('annotate.presetCourtLabel')}{courtPoly ? tr('annotate.presetCourtManual', { n: courtPoly.length }) : tr('annotate.presetCourtNone')}</div>
+          <div>· {tr('annotate.presetFrameLabel', { time: fmt(time) })}</div>
+        </div>
+      </Modal>
     </div>
   )
 }

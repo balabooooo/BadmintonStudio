@@ -1,7 +1,7 @@
-"""HTTP Range 视频流。
+"""HTTP Range video streaming.
 
-浏览器 ``<video>`` 拖动进度条依赖 206 分段响应，Starlette 的 FileResponse
-不支持 Range，所以这里自己实现。
+The browser ``<video>`` progress bar relies on 206 partial responses; Starlette's FileResponse
+does not support Range, so it is implemented here.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from ..i18n import tr
+
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 CHUNK = 1024 * 512
 
@@ -25,7 +27,7 @@ def content_type(path: Path) -> str:
 
 def range_response(request: Request, path: Path, cache_seconds: int = 0, extra_headers: dict | None = None):
     if not path.is_file():
-        raise HTTPException(404, "文件不存在")
+        raise HTTPException(404, tr("api.file_not_found"))
     size = path.stat().st_size
     ctype = content_type(path)
     headers = {
@@ -47,7 +49,7 @@ def range_response(request: Request, path: Path, cache_seconds: int = 0, extra_h
 
     start_s, end_s = m.group(1), m.group(2)
     if start_s == "":
-        # 后缀范围：最后 N 字节
+        # Suffix range: the last N bytes
         n = int(end_s or 0)
         start = max(0, size - n)
         end = size - 1
@@ -56,7 +58,7 @@ def range_response(request: Request, path: Path, cache_seconds: int = 0, extra_h
         end = int(end_s) if end_s else size - 1
     end = min(end, size - 1)
     if start > end or start >= size:
-        raise HTTPException(416, "范围无效", headers={"Content-Range": f"bytes */{size}"})
+        raise HTTPException(416, tr("api.invalid_range"), headers={"Content-Range": f"bytes */{size}"})
 
     length = end - start + 1
     headers["Content-Length"] = str(length)

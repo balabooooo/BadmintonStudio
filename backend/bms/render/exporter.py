@@ -1,13 +1,15 @@
-"""时间线导出。
+"""Timeline export.
 
-策略
-----
-- **单趟滤镜图**：同一素材、片段数适中（<= 80）时，用一条 ``trim`` +
-  ``concat`` 的 filter_complex 一次编码输出，速度最快、画质最好。
-- **分段回退**：跨素材或片段过多时，先渲染每段统一参数的中间文件，再用
-  concat 分离器合并，避免一条超长命令爆掉。
-- **竖屏自动跟随**：利用分析阶段得到的逐帧主体横向中心 ``subject_x``，
-  生成平滑的裁剪路径表达式，把超广角画面裁成 9:16 并始终跟着球员。
+Strategy
+--------
+- **Single-pass filter graph**: with a single media source and a moderate number of clips (<= 80),
+  use one ``trim`` + ``concat`` filter_complex to encode and output in one go: fastest and best quality.
+- **Segmented fallback**: when crossing media or with too many clips, first render an intermediate
+  file per segment with uniform parameters, then merge them with the concat demuxer, to avoid one
+  overly long command blowing up.
+- **Automatic vertical follow**: use the per-frame subject horizontal center ``subject_x`` obtained
+  during analysis to generate a smooth crop-path expression, cropping the ultra-wide frame to 9:16
+  while always following the players.
 """
 
 from __future__ import annotations
@@ -20,7 +22,8 @@ from pathlib import Path
 from typing import Callable
 
 from ..core import ffmpeg as ff
-from ..core.models import Clip, ExportPreset, MediaInfo, Project, Timeline
+from ..core.models import Clip, ExportPreset, MediaInfo, Project, Timeline, Track
+from ..i18n import tr
 
 Progress = Callable[[float, str], None]
 
@@ -29,17 +32,19 @@ def _noop(p: float, m: str = "") -> None:
     pass
 
 
-# ------------------------------------------------------------------ 工具
+# ------------------------------------------------------------------ Utilities
 
 
 def pick_encoder(preset: ExportPreset, caps: dict[str, bool]) -> tuple[list[str], str]:
-    """挑选编码器参数。
+    """Pick encoder parameters.
 
-    返回 ``(编码器参数, 滤镜链尾部)``。第二个值用来把像素格式接到该编码器能吃的样子：
+    Returns ``(encoder args, filter chain tail)``. The second value adapts the pixel format to what
+    that encoder can consume:
 
-    - NVENC 需要帧在 CUDA 显存里（实测这个构建的 h264_nvenc 拿到系统内存帧会报
-      "No capable devices found"），所以尾部要 ``format=nv12,hwupload_cuda``；
-    - 软件编码只要 ``format=yuv420p``。
+    - NVENC needs frames in CUDA memory (measured: this build's h264_nvenc reports
+      "No capable devices found" when given system-memory frames), so the tail must be
+      ``format=nv12,hwupload_cuda``;
+    - software encoding just needs ``format=yuv420p``.
     """
     want = preset.encoder
     if want == "auto":
@@ -68,17 +73,17 @@ def pick_encoder(preset: ExportPreset, caps: dict[str, bool]) -> tuple[list[str]
 
 
 def encoder_plans(preset: ExportPreset, caps: dict[str, bool]) -> list[tuple[str, list[str], str]]:
-    """给出可依次尝试的编码方案，硬件失败时自动退回软件编码。"""
+    """Provide the encoding plans to try in order, falling back to software encoding when hardware fails."""
     venc, vtail = pick_encoder(preset, caps)
     codec = venc[1] if len(venc) > 1 else ""
     is_hw = ("nvenc" in codec) or ("qsv" in codec)
     plans: list[tuple[str, list[str], str]] = [
-        ("硬件编码" if is_hw else "软件编码", venc, vtail)
+        (tr("render.hw_encode") if is_hw else tr("render.sw_encode"), venc, vtail)
     ]
     if is_hw:
         fallback_v = "libx265" if preset.vcodec == "hevc" else "libx264"
         plans.append((
-            "软件编码（回退）",
+            tr("render.sw_encode_fallback"),
             ["-c:v", fallback_v, "-preset", "medium", "-crf", str(preset.crf or 21),
              "-b:v", preset.video_bitrate],
             "format=yuv420p",
@@ -98,15 +103,16 @@ def has_audio(media: MediaInfo) -> bool:
     return bool(media.has_audio)
 
 
-# ------------------------------------------------------------------ 竖屏跟随路径
+# ------------------------------------------------------------------ Vertical follow path
 
 
 def _subject_path(proj: Project, media_id: str, t0: float, t1: float) -> tuple[float, float, float] | None:
-    """返回该时间段内主体的横向中心、左右跨度（归一化 0~1）。
+    """Return the subject's horizontal center and left/right span within the time range (normalized 0~1).
 
-    用**左右包络**而不是「所有球员框中心的均值」：侧方机位下两名球员分别
-    在画面两端，均值正好落在他们中间，按均值裁切等于谁都没对准。
-    包络还能让「两个人都进画面」这条规则真正生效（双打同理）。
+    Use the **left/right envelope** rather than "the mean of all player box centers": under a side
+    camera setup the two players are at opposite ends of the frame, the mean falls exactly between
+    them, and cropping by the mean aligns with neither. The envelope also makes the rule "both
+    players are in frame" actually work (same for doubles).
     """
     res = proj.analyses.get(media_id)
     if res is None:
@@ -143,20 +149,21 @@ def _subject_path(proj: Project, media_id: str, t0: float, t1: float) -> tuple[f
 def _crop_expr_for_clip(preset: ExportPreset, src_w: int, src_h: int,
                         subject: tuple[float, float, float] | None,
                         margin: float = 0.08) -> str | None:
-    """生成 crop 滤镜字符串；返回 None 表示不需要裁切。
+    """Generate the crop filter string; returning None means no cropping is needed.
 
-    **裁切框必须严格等于目标宽高比。** 旧实现在「双打放不下」时会把裁切框
-    横向加宽到超过目标比例，再由 ``_to_target_size`` 直接缩放成目标尺寸 ——
-    那等于把画面横向拉伸了，人会被拉胖。正确做法是要么**等比放大裁切框**
-    （左右、上下都还有余量），要么在确实装不下时退回「以两人中点为轴」，
-    而不是改变裁切框的形状。
+    **The crop box must exactly match the target aspect ratio.** The old implementation, when
+    "doubles does not fit", widened the crop box horizontally beyond the target ratio and then
+    ``_to_target_size`` scaled it directly to the target size -- that stretched the image
+    horizontally and made people look fat. The correct approach is either to **scale the crop box
+    proportionally** (leaving margin on all sides) or, when it truly does not fit, fall back to
+    "pivot on the midpoint of the two players", rather than changing the shape of the crop box.
     """
     if not preset.auto_reframe:
         return None
     ar = preset.width / preset.height
     src_ar = src_w / max(1, src_h)
     if src_ar <= ar:
-        return None  # 源本身够窄，无需横向裁
+        return None  # the source is already narrow enough, no horizontal crop needed
 
     def clamp_box(cw: int, ch: int, cx_norm: float) -> str:
         cw = max(2, min(int(cw), src_w) // 2 * 2)
@@ -167,7 +174,7 @@ def _crop_expr_for_clip(preset: ExportPreset, src_w: int, src_h: int,
         y = max(0, min(y, src_h - ch))
         return f"crop={cw}:{ch}:{x}:{y}"
 
-    # 以满高度为基准的裁切框
+    # Crop box based on full height
     ch = src_h
     cw = min(src_w, int(round(ch * ar / 2)) * 2)
     if cw < 2:
@@ -179,12 +186,12 @@ def _crop_expr_for_clip(preset: ExportPreset, src_w: int, src_h: int,
     cx, left, right = subject
     need = (right - left) + margin
     if need > cw / max(src_w, 1):
-        # 需要更宽的视野：**等比**放大，直到够宽或顶到源画面
+        # A wider field of view is needed: scale up **proportionally** until wide enough or limited by the source frame
         k = min(need / (cw / max(src_w, 1)), src_h / max(ch, 1) * 1.0)
         k = max(1.0, k)
         nw = min(src_w, cw * k)
         nh = min(src_h, ch * k)
-        # 保持比例
+        # Preserve the aspect ratio
         if nw / max(nh, 1) > ar:
             nh = min(src_h, nw / ar)
         else:
@@ -194,36 +201,36 @@ def _crop_expr_for_clip(preset: ExportPreset, src_w: int, src_h: int,
 
 
 def _fit_chain(preset: ExportPreset, is_vertical_src: bool) -> str:
-    """把任意尺寸的画面塞进目标分辨率。"""
+    """Fit a frame of any size into the target resolution."""
     if preset.auto_reframe and preset.height > preset.width:
-        # 已经按目标宽高比裁过，直接缩放到目标尺寸
+        # Already cropped to the target aspect ratio, scale directly to the target size
         return f"scale={preset.width}:{preset.height}:flags=lanczos,setsar=1,fps={preset.fps:g}"
     return (f"scale={preset.width}:{preset.height}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={preset.width}:{preset.height}:(ow-iw)/2:(oh-ih)/2:color=black,"
             f"setsar=1,fps={preset.fps:g}")
 
 
-# ------------------------------------------------------------------ 单趟导出
+# ------------------------------------------------------------------ Single-pass export
 
 
 def _single_pass(proj: Project, timeline: Timeline, preset: ExportPreset, out: Path,
                  on: Progress, cancel) -> tuple[bool, str]:
     track = next((t for t in timeline.tracks if t.kind == "video" and t.clips), None)
     if track is None:
-        return False, "时间线为空"
+        return False, tr("render.empty_timeline")
     clips: list[Clip] = sorted(track.clips, key=lambda c: c.tl_start)
     if len(clips) > 80:
-        return False, "片段过多"
+        return False, tr("render.too_many_clips")
     media_ids = {c.media_id for c in clips}
     if len(media_ids) != 1:
-        return False, "跨素材"
+        return False, tr("render.cross_media")
     media = next((m for m in proj.media if m.id == next(iter(media_ids))), None)
     if media is None:
-        return False, "找不到素材"
+        return False, tr("render.media_not_found")
 
     src = Path(media.path)
     if not src.is_file():
-        return False, "源文件不存在"
+        return False, tr("render.source_missing")
     src_w, src_h = media.width or 1920, media.height or 1080
     has_a = has_audio(media)
     total = sum(max(0.05, (c.src_out - c.src_in) / max(c.speed, 1e-3)) for c in clips)
@@ -274,16 +281,16 @@ def _single_pass(proj: Project, timeline: Timeline, preset: ExportPreset, out: P
                        "-c:a", "aac", "-b:a", preset.audio_bitrate, "-ac", "2",
                        "-progress", "pipe:1", "-loglevel", "error", str(out)]
         out.unlink(missing_ok=True)
-        res = ff.run_with_progress(cmd, total, lambda p, lb=label: on(0.05 + 0.9 * p, f"编码中（{lb}）"), cancel)
+        res = ff.run_with_progress(cmd, total, lambda p, lb=label: on(0.05 + 0.9 * p, tr("render.encoding", mode=lb)), cancel)
         if res.ok and out.is_file() and out.stat().st_size > 1024:
             return True, ""
         last_err = (res.stdout or "")[-2500:]
-        on(0.05, f"{label}失败，尝试其他编码器")
+        on(0.05, tr("render.encoder_retry", mode=label))
     return False, last_err
 
 
 def _to_target_size(preset: ExportPreset) -> str:
-    """片段级缩放：竖屏且已裁切时直接缩放，否则等比缩放（外层不再 pad）。"""
+    """Clip-level scaling: scale directly when vertical and already cropped, otherwise scale proportionally (no outer pad)."""
     if preset.auto_reframe and preset.height > preset.width:
         return f"scale={preset.width}:{preset.height}:flags=lanczos,setsar=1"
     return (f"scale={preset.width}:{preset.height}:force_original_aspect_ratio=decrease:flags=lanczos,"
@@ -291,7 +298,7 @@ def _to_target_size(preset: ExportPreset) -> str:
 
 
 def _atempo_chain(speed: float) -> str:
-    """atempo 单次只支持 0.5~2.0，超出的串接。"""
+    """atempo supports only 0.5~2.0 per instance; chain multiple for values beyond that."""
     s = float(speed)
     parts: list[str] = []
     while s > 2.0:
@@ -304,14 +311,14 @@ def _atempo_chain(speed: float) -> str:
     return ",".join(parts)
 
 
-# ------------------------------------------------------------------ 分段回退
+# ------------------------------------------------------------------ Segmented fallback
 
 
 def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Path,
                on: Progress, cancel) -> tuple[bool, str]:
     track = next((t for t in timeline.tracks if t.kind == "video" and t.clips), None)
     if track is None:
-        return False, "时间线为空"
+        return False, tr("render.empty_timeline")
     clips: list[Clip] = sorted(track.clips, key=lambda c: c.tl_start)
     media_by_id = {m.id: m for m in proj.media}
     tmp = Path(tempfile.mkdtemp(prefix="bms_seg_"))
@@ -321,12 +328,13 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
     try:
         total = sum(max(0.05, (c.src_out - c.src_in) / max(c.speed, 1e-3)) for c in clips)
         done = 0.0
-        # 统一编码方案：`-c copy` 合并要求所有中间片段编码参数一致，
-        # 逐段回退会让某一段变成 libx264、另一段是 nvenc，最后合并直接失败。
+        # Uniform encoding plan: `-c copy` merging requires all intermediate segments to have the
+        # same encoding parameters; per-segment fallback would make one segment libx264 and another
+        # nvenc, and the final merge would fail outright.
         chosen: tuple[str, list[str], str] | None = None
         for i, c in enumerate(clips):
             if cancel and cancel():
-                return False, "已取消"
+                return False, tr("job.cancelled")
             m = media_by_id.get(c.media_id)
             if m is None:
                 continue
@@ -345,8 +353,9 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
                 base_vf.append(f"setpts=PTS/{spd:.4f}")
             base_vf.append(f"fps={preset.fps:g}")
 
-            # 每个片段都必须带音轨，且参数一致：以前这里是 `-an`，合并出来的成片
-            # 完全没有声音（稀疏高光走的正是这条路）。源没有音轨时补一段静音。
+            # Every segment must carry an audio track with consistent parameters: this used to be
+            # `-an`, and the merged output had no sound at all (sparse highlights take exactly this
+            # path). Fill in silence when the source has no audio track.
             has_a = has_audio(m)
             audio_in: list[str] = []
             if has_a:
@@ -366,9 +375,9 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
             err = ""
             for label, venc, vtail in ([chosen] if chosen else plans):
                 vf = ",".join(base_vf + [vtail])
-                # -progress pipe:1 不能省：这段命令用的是 -loglevel error，
-                # 没有它就不会有 out_time_us 输出，on_progress 永远不回调，
-                # 任务面板上的进度条会一直停在 4% 不动。
+                # -progress pipe:1 cannot be omitted: this command uses -loglevel error, and without
+                # it there is no out_time_us output, on_progress is never called, and the progress bar
+                # on the job panel stays stuck at 4% forever.
                 cmd = [ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin",
                        "-ss", f"{c.src_in:.4f}", "-i", str(src)] + audio_in + [
                        "-t", f"{clip_dur:.4f}",
@@ -379,7 +388,7 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
                 seg.unlink(missing_ok=True)
                 r = ff.run_with_progress(
                     cmd, clip_dur,
-                    lambda p, lb=label: on(0.02 + 0.75 * (done + p * clip_dur) / total, f"分段渲染（{lb}）"),
+                    lambda p, lb=label: on(0.02 + 0.75 * (done + p * clip_dur) / total, tr("render.segment_rendering", mode=lb)),
                     cancel,
                 )
                 if r.ok and seg.is_file() and seg.stat().st_size > 1024:
@@ -388,39 +397,31 @@ def _segmented(proj: Project, timeline: Timeline, preset: ExportPreset, out: Pat
                     break
                 err = (r.stdout or "")[-1200:]
             if not ok:
-                return False, f"片段 {i} 渲染失败: {err}"
+                return False, tr("render.segment_failed", index=i, err=err)
             segs.append(seg)
             done += clip_dur
 
         if not segs:
-            return False, "没有可渲染的片段"
+            return False, tr("render.no_renderable_clips")
         lst = tmp / "list.txt"
         lst.write_text("".join(f"file '{ff.ffconcat_escape(str(s))}'\n" for s in segs), encoding="utf-8")
         cmd = [ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin", "-f", "concat", "-safe", "0",
                "-i", str(lst), "-c", "copy", "-movflags", "+faststart",
                "-progress", "pipe:1", "-loglevel", "error", str(out)]
-        r = ff.run_with_progress(cmd, 1.0, lambda p: on(0.8 + 0.18 * p, "合并片段"))
+        r = ff.run_with_progress(cmd, 1.0, lambda p: on(0.8 + 0.18 * p, tr("render.merging")), cancel)
         if not r.ok or not out.is_file():
-            return False, f"合并失败: {(r.stdout or '')[-1500:]}"
+            return False, tr("render.merge_failed", err=(r.stdout or '')[-1500:])
         return True, ""
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------------ 入口
+# ------------------------------------------------------------------ Entry point
 
 
-def export_timeline(proj: Project, timeline: Timeline, preset: ExportPreset, out: Path,
-                    on_progress: Progress = _noop, cancel=None) -> dict:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    on_progress(0.01, "准备导出")
-
-    track = next((t for t in timeline.tracks if t.kind == "video" and t.clips), None)
-    clips = sorted(track.clips, key=lambda c: c.tl_start) if track else []
-
-    # 单趟滤镜图必须从一个输入顺序解码到最后一个片段（trim 不能跳读），
-    # 所以「片段稀疏」时解码量会远超实际输出。片段之间的空隙越大，
-    # 分段导出（每段各自 -ss 快速定位）越划算。
+def _render_clips(proj: Project, clips: list[Clip], preset: ExportPreset, out: Path,
+                  on_progress: Progress, cancel) -> Path:
+    """Render a group of clips into one file: single-pass preferred, segmented fallback when sparse/failed."""
     span = 0.0
     content = 0.0
     if clips:
@@ -428,17 +429,67 @@ def export_timeline(proj: Project, timeline: Timeline, preset: ExportPreset, out
         content = sum(max(0.05, (c.src_out - c.src_in) / max(c.speed, 1e-3)) for c in clips)
     sparse = bool(clips) and content > 1 and span > content * 1.5
 
-    ok, err = (False, "片段稀疏，直接分段导出")
+    one = Timeline(tracks=[Track(name=tr("timeline.track_default", n=1), kind="video", clips=list(clips))], fps=preset.fps)
+    ok, err = (False, tr("render.sparse_direct"))
     if not sparse:
-        ok, err = _single_pass(proj, timeline, preset, out, on_progress, cancel)
+        ok, err = _single_pass(proj, one, preset, out, on_progress, cancel)
     else:
-        on_progress(0.03, f"片段较稀疏（解码跨度是输出的 {span / max(content, 1e-6):.1f} 倍），走分段导出")
+        on_progress(0.03, tr("render.sparse_ratio", ratio=f"{span / max(content, 1e-6):.1f}"))
 
     if not ok:
-        on_progress(0.04, f"改用分段导出（{str(err)[:60]}）")
-        ok, err2 = _segmented(proj, timeline, preset, out, on_progress, cancel)
+        if cancel and cancel():
+            raise RuntimeError(tr("job.cancelled"))
+        on_progress(0.04, tr("render.switch_segmented", reason=str(err)[:60]))
+        ok, err2 = _segmented(proj, one, preset, out, on_progress, cancel)
         if not ok:
-            raise RuntimeError(f"导出失败：{err2}")
-    on_progress(1.0, "完成")
+            raise RuntimeError(tr("render.export_failed", err=err2))
+    return out
+
+
+def _export_separate(proj: Project, clips: list[Clip], preset: ExportPreset, out: Path,
+                     on_progress: Progress, cancel) -> dict:
+    """Export each clip to its own file (flattened in the same directory), named ``<name>_01.mp4``."""
+    n = len(clips)
+    paths: list[Path] = []
+    for i, c in enumerate(clips):
+        if cancel and cancel():
+            raise RuntimeError(tr("job.cancelled"))
+        seg_out = out.with_name(f"{out.stem}_{i + 1:02d}{out.suffix}")
+        base = i / n
+
+        def on(p: float, m: str, b: float = base, idx: int = i + 1) -> None:
+            on_progress(min(0.99, b + p / n), tr("render.separate_progress", index=idx, total=n, message=m))
+
+        _render_clips(proj, [c], preset, seg_out, on, cancel)
+        paths.append(seg_out)
+    on_progress(1.0, tr("render.done"))
+    return {
+        "paths": [str(p) for p in paths],
+        "count": n,
+        "preset": preset.model_dump(mode="json"),
+        "dir": str(out.parent),
+    }
+
+
+def export_timeline(proj: Project, timeline: Timeline, preset: ExportPreset, out: Path,
+                    on_progress: Progress = _noop, cancel=None, separate: bool = False) -> dict:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    on_progress(0.01, tr("render.preparing"))
+
+    track = next((t for t in timeline.tracks if t.kind == "video" and t.clips), None)
+    clips = sorted(track.clips, key=lambda c: c.tl_start) if track else []
+    if not clips:
+        raise RuntimeError(tr("render.export_failed", err=tr("render.empty_timeline")))
+
+    if separate:
+        return _export_separate(proj, clips, preset, out, on_progress, cancel)
+
+    _render_clips(proj, clips, preset, out, on_progress, cancel)
+    on_progress(1.0, tr("render.done"))
     size = out.stat().st_size if out.is_file() else 0
-    return {"path": str(out), "size": size, "preset": preset.model_dump(mode="json")}
+    return {
+        "path": str(out),
+        "size": size,
+        "preset": preset.model_dump(mode="json"),
+        "dir": str(out.parent),
+    }

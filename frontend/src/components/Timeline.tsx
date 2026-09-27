@@ -4,6 +4,7 @@ import {
   ZoomOut,
   Scissors,
   Trash2,
+  Eraser,
   Magnet,
   ChevronsLeftRight,
   Plus,
@@ -15,6 +16,7 @@ import {
 import { cn, scoreColor, timecode } from '../lib/format'
 import { Button, ContextMenu, Tooltip } from './ui'
 import { useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
 
 const RULER_H = 26
 const LANE_H = 30
@@ -27,7 +29,7 @@ type DragState =
   | { kind: 'none' }
   | { kind: 'playhead' }
   | { kind: 'move'; clipId: string; grabOffset: number; origStart: number }
-  | { kind: 'trim-in'; clipId: string; origIn: number; origOut: number; startX: number }
+  | { kind: 'trim-in'; clipId: string; origIn: number; origOut: number; origStart: number; startX: number }
   | { kind: 'trim-out'; clipId: string; origIn: number; origOut: number; startX: number }
 
 export default function Timeline() {
@@ -38,28 +40,34 @@ export default function Timeline() {
   const currentTime = useStore((s) => s.currentTime)
   const seek = useStore((s) => s.seek)
   const selectedClipId = useStore((s) => s.selectedClipId)
+  const selectedClipIds = useStore((s) => s.selectedClipIds)
   const selectClip = useStore((s) => s.selectClip)
   const selectedRallyId = useStore((s) => s.selectedRallyId)
   const selectRally = useStore((s) => s.selectRally)
   const setPreviewMode = useStore((s) => s.setPreviewMode)
   const updateClip = useStore((s) => s.updateClip)
-  const removeClip = useStore((s) => s.removeClip)
+  const removeClips = useStore((s) => s.removeClips)
   const splitClipAt = useStore((s) => s.splitClipAt)
   const splitClipAtSourceTime = useStore((s) => s.splitClipAtSourceTime)
   const previewMode = useStore((s) => s.previewMode)
   const reorder = useStore((s) => s.reorderTrack)
   const undo = useStore((s) => s.undo)
   const redo = useStore((s) => s.redo)
+  const canUndo = useStore((s) => s.history.length > 0)
+  const canRedo = useStore((s) => s.future.length > 0)
   const clearTimeline = useStore((s) => s.clearTimeline)
   const addClipFromRally = useStore((s) => s.addClipFromRally)
   const setUserSeeking = useStore((s) => s.setUserSeeking)
   const pushHistory = useStore((s) => s.pushHistory)
+  const tr = useT()
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const railRef = useRef<HTMLDivElement>(null)
   const [snap, setSnap] = useState(true)
   const [drag, setDrag] = useState<DragState>({ kind: 'none' })
   const [menu, setMenu] = useState<{ x: number; y: number; clipId: string } | null>(null)
+  // 一次拖动只在第一次真正移动时压入撤销栈，单击选中不再产生空的撤销记录
+  const movedRef = useRef(false)
 
   const timeline = project?.timeline
   const track = timeline?.tracks?.[0]
@@ -103,10 +111,13 @@ export default function Timeline() {
     const pts = [0]
     if (previewMode === 'timeline') pts.push(currentTime)
     clips.forEach((c) => {
+      // 排除正在拖的片段自身：否则它的当前边缘一直在吸附容忍范围内，
+      // 拖动会被自己「吸住」，表现为每 8px 卡一下、根本拖不快。
+      if (drag.kind === 'move' && drag.clipId === c.id) return
       pts.push(c.tl_start, c.tl_start + (c.src_out - c.src_in) / c.speed)
     })
     return pts
-  }, [snap, currentTime, previewMode, clips])
+  }, [snap, currentTime, previewMode, clips, drag])
 
   const applySnap = useCallback(
     (t: number, tolPx = 8) => {
@@ -134,28 +145,43 @@ export default function Timeline() {
       const x = e.clientX - rect.left + scrollRef.current.scrollLeft
       const t = pxToTime(x)
 
+      // 第一次真正移动时才存撤销快照：单击选中不该产生一条空的撤销记录
+      const beginDrag = () => {
+        if (!movedRef.current) {
+          pushHistory()
+          movedRef.current = true
+        }
+      }
       if (drag.kind === 'playhead') {
         seek(Math.max(0, t))
       } else if (drag.kind === 'move') {
         let ns = Math.max(0, pxToTime(x - drag.grabOffset))
         ns = applySnap(ns)
+        beginDrag()
         updateClip(drag.clipId, { tl_start: Number(ns.toFixed(3)) }, false)
       } else if (drag.kind === 'trim-in') {
         const c = clips.find((v) => v.id === drag.clipId)
         if (!c) return
+        // 按片段自己所属素材的长度裁剪：跨素材成片时用当前素材会裁错边界
+        const lim = project?.media.find((m) => m.id === c.media_id)?.duration ?? media?.duration ?? 1e9
         const delta = (e.clientX - drag.startX) / zoom
-        let nIn = Math.max(0, Math.min(drag.origOut - 0.2, drag.origIn + delta * c.speed))
-        if (media) nIn = Math.min(nIn, media.duration - 0.2)
-        updateClip(drag.clipId, { src_in: Number(nIn.toFixed(3)) }, false)
+        const nIn = Math.max(0, Math.min(drag.origOut - 0.2, Math.min(lim - 0.2, drag.origIn + delta * c.speed)))
+        // 左端裁剪必须同时挪 tl_start：片段占位是 [tl_start, tl_start+(src_out-src_in)/speed]，
+        // 只改 src_in 会让右端跟着缩、左把手不跟手，看起来像在裁尾部。
+        const newStart = Math.max(0, drag.origStart + (nIn - drag.origIn) / c.speed)
+        beginDrag()
+        updateClip(drag.clipId, { src_in: Number(nIn.toFixed(3)), tl_start: Number(newStart.toFixed(3)) }, false)
       } else if (drag.kind === 'trim-out') {
         const c = clips.find((v) => v.id === drag.clipId)
         if (!c) return
+        const lim = project?.media.find((m) => m.id === c.media_id)?.duration ?? media?.duration ?? 1e9
         const delta = (e.clientX - drag.startX) / zoom
-        let nOut = Math.min(media?.duration ?? 1e9, Math.max(drag.origIn + 0.2, drag.origOut + delta * c.speed))
+        const nOut = Math.min(lim, Math.max(drag.origIn + 0.2, drag.origOut + delta * c.speed))
+        beginDrag()
         updateClip(drag.clipId, { src_out: Number(nOut.toFixed(3)) }, false)
       }
     },
-    [drag, pxToTime, seek, applySnap, updateClip, clips, zoom, media],
+    [drag, pxToTime, seek, applySnap, updateClip, clips, zoom, media, pushHistory, project],
   )
 
   const onPointerUp = useCallback(() => {
@@ -223,11 +249,10 @@ export default function Timeline() {
       return
     }
     if (lastClipRef.current === selectedClipId) return
+    // 拖动 / 菜单打开时先别滚：拖动时自动滚动会把播放头甩走，菜单则会被滚动事件关掉。
+    // 必须在这些早退之后再写 lastClipRef——否则本次没滚成，之后同 id 就永远不滚了。
+    if (drag.kind !== 'none' || menu) return
     lastClipRef.current = selectedClipId
-    if (drag.kind !== 'none') return
-    // 右键菜单开着的时候别滚：滚动事件会把菜单关掉，
-    // 于是「右键第二个片段」看起来就是菜单一闪而过
-    if (menu) return
     const el = scrollRef.current
     const c = clips.find((v) => v.id === selectedClipId)
     if (!el || !c) return
@@ -245,20 +270,20 @@ export default function Timeline() {
       {/* 工具栏 */}
       <div className="flex items-center gap-1.5 border-b border-white/7 px-3 py-1.5">
         <span className="mr-1 shrink-0 text-[10.5px] font-semibold tracking-[0.14em] whitespace-nowrap text-ink-400 uppercase">
-          时间线
+          {tr('timeline.title')}
         </span>
-        <Tooltip content="撤销 (Ctrl+Z)">
-          <Button variant="ghost" size="icon" onClick={undo}>
+        <Tooltip content={tr('timeline.undoHint')} kbd="Ctrl+Z">
+          <Button variant="ghost" size="icon" onClick={undo} disabled={!canUndo}>
             <Undo2 size={13} />
           </Button>
         </Tooltip>
-        <Tooltip content="重做 (Ctrl+Y)">
-          <Button variant="ghost" size="icon" onClick={redo}>
+        <Tooltip content={tr('timeline.redoHint')} kbd="Ctrl+Y">
+          <Button variant="ghost" size="icon" onClick={redo} disabled={!canRedo}>
             <Redo2 size={13} />
           </Button>
         </Tooltip>
         <div className="mx-1 h-4 w-px bg-white/10" />
-        <Tooltip content="在播放头处分割选中片段 (S)">
+        <Tooltip content={tr('timeline.splitAtPlayheadHint')} kbd="S">
           <Button
             variant="ghost"
             size="icon"
@@ -273,22 +298,35 @@ export default function Timeline() {
             <Scissors size={13} />
           </Button>
         </Tooltip>
-        <Tooltip content="删除选中片段 (Delete)">
+        <Tooltip
+          kbd="Delete"
+          content={
+            selectedClipIds.length > 1
+              ? tr('timeline.deleteSelectedHint', { n: selectedClipIds.length })
+              : tr('timeline.deleteClipHint')
+          }
+        >
           <Button
             variant="ghost"
             size="icon"
-            disabled={!selectedClipId}
-            onClick={() => selectedClipId && removeClip(selectedClipId)}
+            className="relative"
+            disabled={!selectedClipIds.length}
+            onClick={() => removeClips(selectedClipIds)}
           >
             <Trash2 size={13} />
+            {selectedClipIds.length > 1 && (
+              <span className="absolute -top-1 -right-1 grid h-[13px] min-w-[13px] place-items-center rounded-full bg-rose-hot px-[3px] text-[8.5px] leading-none font-bold text-white">
+                {selectedClipIds.length}
+              </span>
+            )}
           </Button>
         </Tooltip>
-        <Tooltip content="首尾相接：去掉片段之间留下的黑屏空隙">
+        <Tooltip content={tr('timeline.joinClipsHint')}>
           <Button variant="ghost" size="icon" onClick={reorder} disabled={!clips.length}>
             <ChevronsLeftRight size={13} />
           </Button>
         </Tooltip>
-        <Tooltip content={snap ? '吸附：开' : '吸附：关'}>
+        <Tooltip content={snap ? tr('timeline.snapOn') : tr('timeline.snapOff')}>
           <Button
             variant="ghost"
             size="icon"
@@ -302,9 +340,9 @@ export default function Timeline() {
         <div className="flex-1" />
 
         <span className="mono mr-1 shrink-0 text-[10.5px] whitespace-nowrap text-ink-400">
-          {clips.length} 片段 · {timecode(contentDuration, false)}
+          {tr('timeline.clipCountDuration', { n: clips.length, duration: timecode(contentDuration, false) })}
         </span>
-        <Tooltip content="缩小 (Ctrl+滚轮)">
+        <Tooltip content={tr('timeline.zoomOutHint')}>
           <Button variant="ghost" size="icon" onClick={() => setZoom(zoom * 0.8)}>
             <ZoomOut size={13} />
           </Button>
@@ -312,20 +350,20 @@ export default function Timeline() {
         <input
           type="range"
           min={6}
-          max={400}
+          max={600}
           step={1}
           value={zoom}
           onChange={(e) => setZoom(parseFloat(e.target.value))}
           className="w-[110px]"
         />
-        <Tooltip content="放大 (Ctrl+滚轮)">
+        <Tooltip content={tr('timeline.zoomInHint')}>
           <Button variant="ghost" size="icon" onClick={() => setZoom(zoom * 1.25)}>
             <ZoomIn size={13} />
           </Button>
         </Tooltip>
-        <Tooltip content="清空时间线">
+        <Tooltip content={tr('timeline.clearTimeline')}>
           <Button variant="ghost" size="icon" onClick={clearTimeline} disabled={!clips.length}>
-            <Trash2 size={13} className="text-rose-hot/75" />
+            <Eraser size={13} className="text-rose-hot/75" />
           </Button>
         </Tooltip>
       </div>
@@ -335,11 +373,13 @@ export default function Timeline() {
         {clips.length === 0 && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
             <div className="rounded-xl border border-dashed border-white/12 bg-ink-900/70 px-5 py-4 text-center backdrop-blur">
-              <div className="text-[12.5px] text-ink-200">成片轨还是空的</div>
+              <div className="text-[12.5px] text-ink-200">{tr('timeline.emptyTitle')}</div>
               <div className="mt-1 text-[11.5px] text-ink-400">
-                在左侧「回合」里点 <Plus size={11} className="inline" /> 加入成片，按顺序排在这里，
+                {tr('timeline.emptyHintBefore')}{' '}
+                <Plus size={11} className="inline" />{' '}
+                {tr('timeline.emptyHintAfter')}
                 <br />
-                导出出来的就是这条轨的内容；也可以用「把筛选出的加入成片」一次排满
+                {tr('timeline.emptyHintSecond')}
               </div>
             </div>
           </div>
@@ -364,20 +404,22 @@ export default function Timeline() {
               >
                 <LaneChip
                   icon={<Sparkles size={11} />}
-                  title="原片里 AI 找到的回合"
+                  title={tr('timeline.rallyLaneTitle')}
                   tone="#ffb020"
                   content={
                     <span>
-                      <b className="text-amber-glow">原片里 AI 找到的回合</b>
+                      <b className="text-amber-glow">{tr('timeline.rallyLaneTitle')}</b>
                       {'\n\n'}
-                      这条带子用的是<b>原片时间轴</b>（0 到素材总长），
-                      上面每一块都是 AI 判定「这一段在打球」的区间。
+                      {tr('timeline.rallyLaneIntroBefore')}
+                      <b>{tr('timeline.rallyLaneIntroBold')}</b>
+                      {tr('timeline.rallyLaneIntroAfter')}
                       {'\n\n'}
-                      <b>颜色 = 评分</b>：绿=高分、黄=中等、红=低分；灰色 = 你已排除。
+                      <b>{tr('timeline.rallyLaneColorBold')}</b>
+                      {tr('timeline.rallyLaneColorAfter')}
                       {'\n\n'}
-                      单击定位到该回合，双击直接加进下面的成片轨。
+                      {tr('timeline.rallyLaneClick')}
                       {'\n'}
-                      注意它和下面的成片轨不是同一条时间轴。
+                      {tr('timeline.rallyLaneNote')}
                     </span>
                   }
                 />
@@ -389,22 +431,24 @@ export default function Timeline() {
             >
               <LaneChip
                 icon={<Clapperboard size={11} />}
-                title="要导出的成片"
+                title={tr('timeline.exportTrackTitle')}
                 tone="#5c9dff"
                 content={
                   <span>
-                    <b className="text-flux-400">要导出的成片</b>
+                    <b className="text-flux-400">{tr('timeline.exportTrackTitle')}</b>
                     {'\n\n'}
-                    这里是你实际会导出成片的内容，按<b>成片时间轴</b>顺序排列。
+                    {tr('timeline.exportTrackIntroBefore')}
+                    <b>{tr('timeline.exportTrackIntroBold')}</b>
+                    {tr('timeline.exportTrackIntroAfter')}
                     {'\n\n'}
-                    <b>左侧回合卡片上的 + 、上面那条带子的双击</b>，
-                    都是往这条轨里追加一段；同一个回合只能加一次。
+                    <b>{tr('timeline.exportTrackAddBold')}</b>
+                    {tr('timeline.exportTrackAddAfter')}
                     {'\n\n'}
-                    拖动片段移动位置、拖两端裁剪长度、右键分割或变速。
+                    {tr('timeline.exportTrackEdit')}
                     {'\n'}
-                    改速度会改变它占的长度（2× 就占一半），这是正常的。
+                    {tr('timeline.exportTrackSpeed')}
                     {'\n\n'}
-                    上面那条是「原片里 AI 找到的回合」，这一条是「你决定留下的」。
+                    {tr('timeline.exportTrackNote')}
                   </span>
                 }
               />
@@ -426,10 +470,18 @@ export default function Timeline() {
                 className="sticky top-0 z-30 cursor-ew-resize border-b border-white/7 bg-ink-900/92 backdrop-blur"
                 style={{ height: RULER_H }}
                 onPointerDown={(e) => {
-                  const rect = e.currentTarget.getBoundingClientRect()
+                  // 右键不定位、也不进入拖播放头
+                  if (e.button !== 0) return
+                  // 用滚动容器（视口内固定不动）的矩形换算内容坐标，再加 scrollLeft。
+                  // 不能用 ruler 自身：它横向随内容滚动，rect.left 已经减掉了 scrollLeft，
+                  // 再加一次就多算一个 scrollLeft——滚得越远点击越靠后，直接跳到片尾。
+                  const el = scrollRef.current
+                  if (!el) return
+                  const rect = el.getBoundingClientRect()
                   setDrag({ kind: 'playhead' })
-                  seek(Math.max(0, pxToTime(e.clientX - rect.left + (scrollRef.current?.scrollLeft ?? 0))))
+                  seek(Math.max(0, pxToTime(e.clientX - rect.left + el.scrollLeft)))
                 }}
+                onContextMenu={(e) => e.preventDefault()}
               >
                 <Ruler zoom={zoom} duration={contentDuration} />
               </div>
@@ -456,7 +508,20 @@ export default function Timeline() {
                     >
                       <Tooltip
                         width={300}
-                        content={`回合 #${r.index} · ${r.scores.total.toFixed(0)} 分 · ${r.duration.toFixed(1)}s · ${r.features.shot_count} 拍\n原片时间 ${timecode(r.start, false)} – ${timecode(r.end, false)}\n单击：定位预览并选中\n双击：把这个回合剪进下面的成片轨`}
+                        content={[
+                          tr('timeline.rallyTooltipLine1', {
+                            index: r.index,
+                            score: r.scores.total.toFixed(0),
+                            duration: r.duration.toFixed(1),
+                            shots: r.features.shot_count,
+                          }),
+                          tr('timeline.rallyTooltipLine2', {
+                            start: timecode(r.start, false),
+                            end: timecode(r.end, false),
+                          }),
+                          tr('timeline.rallyTooltipLine3'),
+                          tr('timeline.rallyTooltipLine4'),
+                        ].join('\n')}
                       >
                         <div
                           className={cn(
@@ -476,7 +541,7 @@ export default function Timeline() {
                           {w > 26 && (
                             <span className="pointer-events-none truncate px-1 text-[9.5px] font-semibold text-ink-950/75">
                               #{r.index}
-                              {w > 92 && ` · ${r.scores.total.toFixed(0)}分`}
+                              {w > 92 && ` · ${tr('timeline.scoreSuffix', { n: r.scores.total.toFixed(0) })}`}
                             </span>
                           )}
                         </div>
@@ -491,13 +556,14 @@ export default function Timeline() {
             <div
               className="relative"
               style={{ height: TRACK_H, background: 'rgb(92 157 255 / 0.045)' }}
+              onContextMenu={(e) => e.preventDefault()}
             >
               <div className="absolute inset-x-0 top-[18px] bottom-1.5 rounded-md bg-white/[0.022]" />
               {clips.map((c) => {
                 const dur = (c.src_out - c.src_in) / c.speed
                 const left = timeToPx(c.tl_start)
                 const w = Math.max(6, timeToPx(dur))
-                const selected = c.id === selectedClipId
+                const selected = selectedClipIds.includes(c.id)
                 const rally = analysis?.rallies.find((r) => r.id === c.rally_id)
                 const col = rally ? scoreColor(rally.scores.total) : '#3b7ff0'
                 return (
@@ -519,15 +585,19 @@ export default function Timeline() {
                       // 否则按住右键拖一下就把片段挪走了
                       if (e.button !== 0) return
                       e.stopPropagation()
-                      selectClip(c.id)
-                      // 拖动前先存一次撤销快照：pointermove 期间用 pushHistory=false
-                      // 只改状态，这样一次拖动在撤销栈里只占一步。
-                      pushHistory()
+                      // Ctrl/Cmd = 点选累加，Shift = 连选；这两种只改选区，不进入拖拽，
+                      // 否则用修饰键多选时一按下去片段就被拖走了。
+                      const mode = e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace'
+                      selectClip(c.id, mode)
+                      if (mode !== 'replace') return
+                      // 撤销快照留到第一次真正 pointermove 时再存：只单击选中的话，
+                      // 以前也会压一条「什么都不发生」的撤销记录，还会清空重做栈。
+                      movedRef.current = false
                       const rect = scrollRef.current!.getBoundingClientRect()
                       const x = e.clientX - rect.left + scrollRef.current!.scrollLeft
                       const grab = x - left
                       if (grab < 10 && w > 26) {
-                        setDrag({ kind: 'trim-in', clipId: c.id, origIn: c.src_in, origOut: c.src_out, startX: e.clientX })
+                        setDrag({ kind: 'trim-in', clipId: c.id, origIn: c.src_in, origOut: c.src_out, origStart: c.tl_start, startX: e.clientX })
                       } else if (w - grab < 10 && w > 26) {
                         setDrag({ kind: 'trim-out', clipId: c.id, origIn: c.src_in, origOut: c.src_out, startX: e.clientX })
                       } else {
@@ -537,13 +607,14 @@ export default function Timeline() {
                     onContextMenu={(e) => {
                       e.preventDefault()
                       e.stopPropagation()
-                      selectClip(c.id)
+                      // 右键已在选区里的片段时保留多选，菜单里的删除就会作用在整个选区上
+                      if (!selectedClipIds.includes(c.id)) selectClip(c.id)
                       setMenu({ x: e.clientX, y: e.clientY, clipId: c.id })
                     }}
                     onDoubleClick={() => setPreviewMode('timeline')}
                   >
                     <div className="pointer-events-none flex h-full flex-col justify-center px-1.5">
-                      <div className="truncate text-[10.5px] font-medium text-white/95">{c.label || '片段'}</div>
+                      <div className="truncate text-[10.5px] font-medium text-white/95">{c.label || tr('timeline.clipFallbackLabel')}</div>
                       <div className="mono truncate text-[9.5px] text-white/65">
                         {timecode(c.src_in, false)} → {timecode(c.src_out, false)}
                         {c.speed !== 1 && ` · ${c.speed}×`}
@@ -579,7 +650,7 @@ export default function Timeline() {
           onClose={() => setMenu(null)}
           items={[
             {
-              label: '在播放头处分割',
+              label: tr('timeline.menuSplit'),
               hint: 'S',
               onClick: () => {
                 if (previewMode === 'source') splitClipAtSourceTime(menu.clipId, currentTime)
@@ -587,22 +658,26 @@ export default function Timeline() {
               },
             },
             {
-              label: '全片特效：0.5× 慢放',
+              label: tr('timeline.menuSpeedHalf'),
               onClick: () => updateClip(menu.clipId, { speed: 0.5 }),
             },
             {
-              label: '全片特效：2× 快放',
+              label: tr('timeline.menuSpeedDouble'),
               onClick: () => updateClip(menu.clipId, { speed: 2 }),
             },
             {
-              label: '恢复正常速度',
+              label: tr('timeline.menuSpeedNormal'),
               onClick: () => updateClip(menu.clipId, { speed: 1 }),
             },
             {
-              label: '删除片段',
+              label:
+                selectedClipIds.length > 1 && selectedClipIds.includes(menu.clipId)
+                  ? tr('timeline.menuDeleteSelected', { n: selectedClipIds.length })
+                  : tr('timeline.menuDelete'),
               hint: 'Del',
               danger: true,
-              onClick: () => removeClip(menu.clipId),
+              onClick: () =>
+                removeClips(selectedClipIds.includes(menu.clipId) ? selectedClipIds : [menu.clipId]),
             },
           ]}
         />

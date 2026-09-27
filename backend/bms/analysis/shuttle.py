@@ -1,72 +1,92 @@
-"""羽毛球（shuttlecock）候选检测与轨迹跟踪 —— 纯 CV，不用神经网络。
+"""Badminton shuttlecock candidate detection and trajectory tracking — pure CV, no neural network.
 
-设计出发点
-----------
-机位**完全静止**（本工程素材实测帧间全局位移中位数 0.04 px、最大 < 1 px），
-因此不做光流/配准，直接用**时序统计**做背景建模。羽毛球在画面里是一个
-**很小的亮白色快速移动点**：4K 原始上约 8~20 px，480p 代理上只有 1~2.5 px。
-所以本模块的核心不是"找亮的东西"（球馆里有大量常亮的白线、灯、白墙、白鞋），
-而是"找**刚刚才变亮**的**孤立**小白点，并且要求它**连成一条物理上合理的抛物线轨迹**"。
+Design rationale
+----------------
+The camera is **completely static** (measured inter-frame global displacement median 0.04 px, max < 1 px
+on this project's footage), so no optical flow / registration is done; instead **temporal statistics**
+are used for background modeling. In the frame the shuttlecock is a **very small, bright white, fast-moving point**:
+about 8~20 px on 4K original, only 1~2.5 px on a 480p proxy. So the core of this module is not "find
+bright things" (a gym has lots of constantly bright white lines, lights, white walls, white shoes),
+but "find a **just-brightened**, **isolated** small white dot, and require it to form **a physically
+plausible parabolic trajectory**".
 
-四道串联的筛子
---------------
-1. **白色度通道**：``W = min(R, G, B)``。羽毛球是消色差的（三通道同时高），
-   而场地是饱和绿（R、B 很低）。实测绿场地 ``W ≈ 33``、白线/白鞋 ``W ≈ 200~255``，
-   所以在 ``W`` 上找"亮白点"比在灰度上干净得多（灰度里白线与绿场地的对比只有 ~120，
-   ``W`` 上是 ~170，且绿场地的纹理被整体压平）。
-2. **时序新颖度**：以该像素在前后各 K 帧窗口里的 85 分位作为参考，
-   ``NOV = W - p85``。常亮物体（白线、灯）的 ``NOV ≈ 0``；快速掠过的球 ``NOV`` 很大。
-   参考值会先做**全局亮度对齐**，抵消相机自动曝光的漂移
-   （本素材开头实测有 +22 灰阶的爬升，不做对齐会在前 15 帧爆出上百个假候选）。
-3. **场地先验 + 孤立性**（三条互补的"像不像一个孤立的球"判据）：
-   * **周围是绿场地**：候选点自身是**白**的（不能用"绿"去要求它！），
-     但它周围一圈的背景必须是绿场地。球馆里的球员皮肤、木墙、地板反光会被
-     场地的绿光染色而带上绿偏量，只看候选点本身的颜色是分不开的 ——
-     实测只看候选点颜色会有 1144 个候选（1.3 个/帧），改成看周围背景后只剩 68 个
-     （0.08 个/帧），是本模块最强的一条降噪判据。
-   * **亮度孤立性**：邻居里"与候选点亮度相当"的比例要低。白鞋、白衣服会形成大片白区，
-     孤立性差，被丢掉。
-   * **novelty 孤立性**：邻居里 novelty 同样高的比例要低。整块白色物体移动时
-     novelty 到处都是，孤立小白点只有它自己高。
-4. **速度门控 + 抛物线拟合**：羽毛球是全场最快的物体；候选点按速度外推做帧间关联，
-   再对轨迹做二次曲线拟合，残差大的丢掉。随机噪声几乎不可能连续 5 帧同时满足
-   "位置、速度、曲率"三重要求，这是最后也是最强的过滤器。
+Four filters in series
+----------------------
+1. **Whiteness channel**: ``W = min(R, G, B)``. The shuttle is achromatic (all three channels high),
+   while the court is saturated green (R and B very low). Measured green court ``W ≈ 33``, white
+   line/shoe ``W ≈ 200~255``, so finding "bright white dots" on ``W`` is much cleaner than on
+   grayscale (on grayscale the contrast between a white line and green court is only ~120, on
+   ``W`` it is ~170, and the green court's texture is flattened overall).
+2. **Temporal novelty**: take the 85th percentile of the pixel in a window of K frames before and
+   after as a reference, ``NOV = W - p85``. Constantly bright objects (white lines, lights) have
+   ``NOV ≈ 0``; a fast-passing shuttle has a large ``NOV``. The reference is first **globally
+   brightness-aligned** to cancel camera auto-exposure drift (this footage measurably has a +22
+   gray-level rise at the start; without alignment hundreds of false candidates explode in the
+   first 15 frames).
+3. **Court prior + isolation** (three complementary criteria for "does it look like an isolated shuttle"):
+   * **Green court around it**: the candidate point itself is **white** (do NOT require it to be green!),
+     but the ring of background around it must be green court. In a gym, players' skin, wooden walls,
+     and floor reflections get tinted by the court's green light and carry a green excess, so looking
+     only at the candidate's own color cannot separate them — measured, looking only at the candidate
+     color gives 1144 candidates (1.3/frame), while looking at the surrounding background leaves only
+     68 (0.08/frame), the single strongest denoising criterion in this module.
+   * **Brightness isolation**: the fraction of neighbors with brightness comparable to the candidate
+     must be low. White shoes and white clothes form large white regions, have poor isolation, and are dropped.
+   * **Novelty isolation**: the fraction of neighbors with equally high novelty must be low. When a
+     whole white object moves, novelty is everywhere, while an isolated small white dot has high
+     novelty only at itself.
+4. **Speed gating + parabola fitting**: the shuttle is the fastest object in the scene; candidate
+   points are associated frame to frame by velocity extrapolation, then a quadratic curve is fitted
+   to the trajectory and large residuals are dropped. Random noise can hardly satisfy the three
+   requirements "position, velocity, curvature" simultaneously for 5 consecutive frames, which is
+   the final and strongest filter.
 
-已知局限（重要，请如实对待）
-----------------------------
-* **不是 100% 准确的跟踪**。目标只是提供辅助信号（估计击球时刻、球速、回合激烈程度），
-  用于给音频击球检测做交叉验证，不要当作真值。
-* **白色球场线是原理性盲区**：球飞到白线上方时 ``W`` 背景本身就是亮的，
-  ``NOV`` 接近 0，必然漏检。模块用"静态白区掩码"直接把这些区域排除（宁漏不误）。
-* 球贴着球员身体、球拍或白鞋时，与"移动白色大物体"无法区分，会漏检或误检。
-* **低码率代理上本模块基本失效 —— 这一点已实测确认，请不要误以为它总能工作。**
-  本工程唯一可用的测试素材是 480x270 / 15fps / **441 字节/帧** 的代理：
-  8 倍下采样把任何 1~2 px 的小白点都跟绿场地"浆"在一起，导致
-  * 候选点的白色度 ``W`` 全部挤在 151~174 的窄带里（球与远场白鞋完全重叠，
-    没有任何一个候选 ``W >= 190``，见模块顶部注释的迭代记录）；
-  * 平坦场地的时序噪声标准差 p90 就有 11 灰阶、p99 达 37 灰阶，与目标幅度同量级；
-  * 该 60 秒里音频检测到 **91 次真实击球**（球确实在飞），
-    但灵敏度调到 0.8/1.0 时检出的 presence 帧与真实击球时刻
-    **在 0.2 s 内对齐的比例只有 12%/31%，低于随机猜的 ~61%** —— 即
-    检出的都是噪声而不是球。
-  结论：**这份代理不足以支撑羽毛球的视觉检测**，需要更高分辨率/码率的素材
-  （描述里的 4K 原始素材：球有 8~20 px，本模块的设计目标就是它）。
-* 仅适用于**静止机位**。手持/摇镜素材必须先做全局配准，否则本模块无意义。
-* 速度门控默认上限 0.6 画面高/秒是按规格给的保守值；真实杀球的画面速度远超它，
-  在 4K 素材上应把 ``max_speed`` 调到 3~6（并相应放宽 ``max_gap``），否则杀球会被门控丢掉。
+Known limitations (important, please treat honestly)
+----------------------------------------------------
+* **Not 100% accurate tracking**. The goal is only to provide auxiliary signals (estimating hit
+  moments, shuttle speed, rally intensity) for cross-validating audio hit detection; do not treat it as ground truth.
+* **White court lines are a fundamental blind spot**: when the shuttle flies above a white line the
+  ``W`` background itself is bright, ``NOV`` is close to 0, and a miss is inevitable. The module uses
+  a "static white region mask" to exclude these regions directly (prefer a miss over a false positive).
+* When the shuttle is against a player's body, racket, or white shoes, it cannot be distinguished from
+  "a moving large white object", causing misses or false detections.
+* **On a low-bitrate proxy this module is essentially ineffective — this has been confirmed by
+  measurement, so please do not assume it always works.** The only test footage available to this
+  project is a 480x270 / 15fps / **441 bytes/frame** proxy: the 8x downsampling "smears" any 1~2 px
+  small white dot together with the green court, so that
+  * the candidate points' whiteness ``W`` all bunch into the narrow band 151~174 (the shuttle
+    completely overlaps with far-field white shoes, and not a single candidate has ``W >= 190``, see
+    the iteration log in the module header comments);
+  * the temporal noise standard deviation of a flat court is already 11 gray levels at p90 and 37 at
+    p99, the same order as the target amplitude;
+  * in those 60 seconds the audio detected **91 real hits** (the shuttle really is flying), but when
+    the sensitivity was tuned to 0.8/1.0 the fraction of detected presence frames aligned to real hit
+    moments **within 0.2 s was only 12%/31%, lower than the ~61% of random guessing** — i.e. what is
+    detected is noise, not the shuttle.
+  Conclusion: **this proxy is not enough to support visual shuttlecock detection**; higher
+  resolution/bitrate footage is needed (the described 4K original: the shuttle is 8~20 px, which is
+  exactly what this module is designed for).
+* Applies only to a **static camera**. Handheld/panning footage must be globally registered first,
+  otherwise this module is meaningless.
+* The default speed gate upper limit 0.6 frame-heights/second is a conservative value per
+  specification; a real smash's frame speed far exceeds it, and on 4K footage ``max_speed`` should be
+  raised to 3~6 (with ``max_gap`` relaxed accordingly), otherwise smashes are dropped by the gate.
 
-迭代记录（在 480x270 测试代理上实测，用于说明这些阈值是怎么来的）
-------------------------------------------------------------------
-* 第 1 轮：时序中值背景 + 亮度阈值 + 小连通域。**失败**：候选几乎全打在白场线、
-  天花板灯和白墙上（一帧 130~180 个候选）。
-* 第 2 轮：加入"时序 85 分位新颖度"与全局亮度对齐。开头因自动曝光爬升爆出的
-  上百个假候选被压掉，候选降到 p50=0 / p90=2；但 top 事件全部落在**移动的白鞋**上。
-* 第 3 轮：加入孤立性判据。第一次写错了 —— 用"候选点自身要偏绿"做场地先验，
-  而球是白的、绿偏量≈0，等于把真目标先排除掉了，结果 0 候选；改成
-  **"候选点周围一圈背景要是绿场地"** 后，候选从 1144 个（1.3/帧）降到 72 个（0.08/帧）。
-* 第 4 轮：加入轨迹级物理约束（最小跨度 + 拟合加速度下限）。走动球员的白鞋
-  只能拟合出匀速直线（加速度≈0），被正确拒绝 → 轨迹数 0。
-  这正是本素材的诚实结论：剩下的候选里没有球。
+Iteration log (measured on the 480x270 test proxy, to explain where these thresholds come from)
+------------------------------------------------------------------------------------------------
+* Round 1: temporal median background + brightness threshold + small connected components. **Failed**:
+  candidates almost all landed on white court lines, ceiling lights, and white walls (130~180 candidates per frame).
+* Round 2: added "temporal 85th percentile novelty" and global brightness alignment. The hundreds of
+  false candidates that exploded at the start due to auto-exposure rise were suppressed, candidates
+  dropped to p50=0 / p90=2; but the top events all landed on **moving white shoes**.
+* Round 3: added isolation criteria. First wrote it wrong — used "the candidate point itself should be
+  greenish" as the court prior, but the shuttle is white with green excess ≈ 0, which excluded the true
+  target first, giving 0 candidates; after changing to **"the ring of background around the candidate
+  must be green court"**, candidates dropped from 1144 (1.3/frame) to 72 (0.08/frame).
+* Round 4: added trajectory-level physical constraints (minimum span + fitted acceleration lower bound).
+  The white shoes of a walking player can only fit a uniform straight line (acceleration ≈ 0) and were
+  correctly rejected → 0 trajectories. This is precisely the honest conclusion for this footage: there
+  is no shuttle among the remaining candidates.
 """
 
 from __future__ import annotations
@@ -77,29 +97,31 @@ from typing import Callable
 
 import numpy as np
 
-# ---------------------------------------------------------------- 公开数据结构
+from ..i18n import tr
+
+# ---------------------------------------------------------------- public data structures
 
 
 @dataclass
 class ShuttlePoint:
     frame: int
     time: float
-    x: float          # 归一化 0~1
-    y: float          # 归一化 0~1
-    score: float      # 0~1 置信度
+    x: float          # normalized 0~1
+    y: float          # normalized 0~1
+    score: float      # 0~1 confidence
 
 
 @dataclass
 class ShuttleTrack:
-    """一段连续的羽毛球飞行轨迹。"""
+    """A continuous shuttlecock flight trajectory."""
 
     points: list[ShuttlePoint] = field(default_factory=list)
     start: float = 0.0
     end: float = 0.0
-    #: 平均/最大像素速度（按画面高度归一化，单位 画面高/秒）
+    #: Mean/max pixel speed (normalized by frame height, unit: frame-heights/second)
     mean_speed: float = 0.0
     max_speed: float = 0.0
-    #: 轨迹起点到终点的总位移（归一化）
+    #: Total displacement from track start to end (normalized)
     span: float = 0.0
     confidence: float = 0.0
 
@@ -109,53 +131,56 @@ class ShuttleSignal:
     fps: float
     duration: float
     tracks: list[ShuttleTrack] = field(default_factory=list)
-    #: 每帧「画面中存在羽毛球」的置信度 0~1
+    #: Confidence 0~1 that "a shuttlecock is present in the frame" for each frame
     presence: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 每帧检出的候选点数量
+    #: Number of candidate points detected per frame
     candidate_count: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    #: 每帧所有候选点的最大速度（归一化/秒）
+    #: Maximum speed among all candidate points per frame (normalized/second)
     max_candidate_speed: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
 
-# ---------------------------------------------------------------- 常量 / 默认值
+# ---------------------------------------------------------------- constants / defaults
 
-#: 阈值标定参考高度。尺度相关阈值都以该高度为基准按工作分辨率等比缩放。
+#: Reference height for threshold calibration. Scale-related thresholds are scaled proportionally to the working resolution based on this height.
 REF_HEIGHT = 480.0
-#: 默认时序窗口半径 K（前后各 K 帧参与统计）
+#: Default temporal window radius K (K frames before and after participate in the statistics)
 DEFAULT_WINDOW = 15
-#: 轨迹至少需要多少个点
+#: Minimum number of points required for a track
 DEFAULT_MIN_POINTS = 5
-#: 关联时允许丢失的最大帧数
+#: Maximum number of frames allowed to be lost during association
 DEFAULT_MAX_GAP = 2
-#: 速度门控（画面高/秒）。羽毛球是全场最快的物体：低于下限的是静止白点，
-#: 高于上限的在物理上不可能是球。高速杀球场景把这个值调大。
+#: Speed gate (frame-heights/second). The shuttle is the fastest object in the scene: below the
+#: lower bound it is a static white dot, and above the upper bound it is physically impossible for a
+#: shuttle. Increase this value for high-speed smash scenes.
 DEFAULT_MIN_SPEED = 0.02
 DEFAULT_MAX_SPEED = 0.60
-#: 抛物线拟合允许的最大 RMS 残差（画面高）
+#: Maximum RMS residual allowed for the parabola fit (frame heights)
 DEFAULT_MAX_RESID = 0.035
-#: 轨迹最小跨度（画面高）：短到几乎原地不动的"轨迹"不是球
+#: Minimum track span (frame heights): a "trajectory" short enough to be almost motionless in place is not a shuttle
 DEFAULT_MIN_SPAN = 0.04
-#: 拟合轨迹的最小加速度（画面高/秒²）。
-#: 物理依据：羽毛球在飞行中受重力（~9.8 m/s²）+ 空气阻力，轨迹必然有明显弯曲；
-#: 而"在场地上走动的球员的白鞋"只会产生近似匀速的直线。
-#: 按典型机位换算（画幅高度约覆盖 8 m），9.8 m/s² ≈ 1.2 画面高/秒²，
-#: 一次高远球/平抽的拟合加速度落在 0.3~1.5 之间。默认 0.25 是留了余量的下限。
-#: **注意**：这个值依赖机位与画幅覆盖的真实距离，换机位需要标定；
-#: 设为 0 可关闭该判据。
+#: Minimum fitted acceleration of a track (frame-heights/second²).
+#: Physical basis: in flight a shuttle is subject to gravity (~9.8 m/s²) plus air resistance, so its
+#: trajectory necessarily curves noticeably; while "the white shoes of a player walking on court"
+#: only produce an approximately uniform straight line.
+#: Converted for a typical camera angle (frame height covers about 8 m), 9.8 m/s² ≈ 1.2
+#: frame-heights/second², and the fitted acceleration of a high clear / flat drive falls between
+#: 0.3~1.5. The default 0.25 is a lower bound with margin left.
+#: **Note**: this value depends on the camera angle and the real distance covered by the frame;
+#: changing the camera angle requires calibration. Set it to 0 to disable this criterion.
 DEFAULT_MIN_ACCEL = 0.25
-#: 工作分辨率宽度上限。4K 原生逐像素处理太慢且没必要，缩到这个宽度足够
-#: （3840 -> 1280 后球仍有 2.5~6.5 px）。
+#: Upper bound on the working resolution width. Native 4K per-pixel processing is too slow and
+#: unnecessary; scaling to this width suffices (after 3840 -> 1280 the shuttle is still 2.5~6.5 px).
 DEFAULT_WORK_WIDTH = 1280
-#: 连通域面积的标定范围（@480 行高，单位 px²）
+#: Calibrated range of connected-component area (@480 row height, unit px²)
 _AREA_MIN_REF = 1.0
 _AREA_MAX_REF = 80.0
 
 
-# ---------------------------------------------------------------- 底层工具
+# ---------------------------------------------------------------- low-level utilities
 
 
 def _white_map(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """由 BGR 帧算「白色度」W 与「绿偏量」GEX。"""
+    """Compute "whiteness" W and "green excess" GEX from a BGR frame."""
     b = frame[:, :, 0].astype(np.float32)
     g = frame[:, :, 1].astype(np.float32)
     r = frame[:, :, 2].astype(np.float32)
@@ -174,10 +199,11 @@ def _odd(v: float, lo: int = 3) -> int:
 
 
 def _pctl_axis0(stack: np.ndarray, q: float) -> np.ndarray:
-    """对 (T, H, W) 沿时间轴求每像素 q 分位。
+    """Compute the per-pixel q-th percentile along the time axis for a (T, H, W) stack.
 
-    用 :func:`numpy.partition`（O(T)）而不是 :func:`numpy.percentile`（要排序），
-    在本模块的窗口长度（T≈31）上快 3~4 倍；不做插值，误差远小于阈值余量。
+    Uses :func:`numpy.partition` (O(T)) rather than :func:`numpy.percentile` (which sorts): 3~4x
+    faster at this module's window length (T≈31); no interpolation is done, and the error is far
+    smaller than the threshold margin.
     """
     t = stack.shape[0]
     k = int(round((t - 1) * q / 100.0))
@@ -187,41 +213,44 @@ def _pctl_axis0(stack: np.ndarray, q: float) -> np.ndarray:
 
 def _sensitivity_thresholds(sensitivity: float, scale: float, work_h: int,
                             court_gex: float | None = None) -> dict:
-    """把 sensitivity(0~1) 与分辨率换算成一组实际阈值。
+    """Convert sensitivity(0~1) and the resolution into a set of actual thresholds.
 
-    分辨率自适应：面积按 ``scale**2`` 缩放（面积是二维量，所以是平方缩放，
-    而不是线性缩放 —— 线性缩放会让高分辨率下的面积上限过小而丢球），
-    孤立性窗口与开运算核按 ``scale`` 线性缩放。
+    Resolution adaptation: area is scaled by ``scale**2`` (area is a 2D quantity, so it scales as the
+    square rather than linearly — linear scaling would make the area upper bound too small at high
+    resolution and drop the shuttle), while the isolation window and opening kernel scale linearly
+    with ``scale``.
 
-    默认值是在本工程的 480x270 测试代理上实测标定的（见模块文档的迭代记录）。
+    The defaults were calibrated by measurement on this project's 480x270 test proxy (see the
+    iteration log in the module docstring).
     """
     s = float(np.clip(sensitivity, 0.0, 1.0))
     area_min = max(1, int(round(_AREA_MIN_REF * scale * scale)))
     area_max = max(area_min + 1, int(round(_AREA_MAX_REF * scale * scale)))
     return {
-        # 绝对白色度下限。球是白的：实测白线/白鞋 200~255，而球员皮肤、
-        # 木墙、地板反光都在 100~160，所以这条把绝大部分杂波挡在外面。
+        # Absolute whiteness lower bound. The shuttle is white: measured white lines/shoes are
+        # 200~255, while player skin, wooden walls, and floor reflections are all 100~160, so this
+        # keeps the vast majority of clutter out.
         "w": 170.0 - 40.0 * s,
-        # 新颖度阈值（相对时序 85 分位参考）
+        # Novelty threshold (relative to the temporal 85th-percentile reference)
         "nov": 36.0 - 18.0 * s,
-        # 局部对比：候选点必须明显亮于周围一圈的中值
+        # Local contrast: the candidate must be clearly brighter than the median of the surrounding ring
         "contrast": 58.0 - 26.0 * s,
-        # 场地先验：候选点**周围一圈**背景的绿偏量中值下限（注意不是候选点自己）
+        # Court prior: lower bound on the median green excess of the background **ring around** the candidate (note: not the candidate itself)
         "bg_gex": 55.0 - 20.0 * s if court_gex is None else float(court_gex),
-        # 开运算核尺寸；分辨率太低时目标本身只有 1~2 px，开运算会把它一起吃掉，
-        # 所以低分辨率下退化为 0（不做开运算）
+        # Opening kernel size; at too low a resolution the target itself is only 1~2 px and the
+        # opening would eat it too, so it degenerates to 0 at low resolution (no opening)
         "open": 3 if work_h >= 360 else 0,
         "area_min": area_min,
         "area_max": area_max,
         "iso_win": _odd(11.0 * scale, 5),
-        # 亮度孤立性：与候选点亮度相当的邻居占比上限（白鞋/白衣服内部会接近 1）
+        # Brightness isolation: upper bound on the fraction of neighbors with brightness comparable to the candidate (inside white shoes/clothes it approaches 1)
         "iso_w": 0.20 + 0.30 * s,
-        # novelty 孤立性：novelty 同样高的邻居占比上限
+        # novelty isolation: upper bound on the fraction of neighbors with equally high novelty
         "iso_n": 0.05 + 0.20 * s,
     }
 
 
-# ---------------------------------------------------------------- 候选检测
+# ---------------------------------------------------------------- candidate detection
 
 
 def _detect_candidates(
@@ -232,11 +261,12 @@ def _detect_candidates(
     mask_roi: np.ndarray | None,
     th: dict,
 ) -> list[tuple[float, float, float, float]]:
-    """单帧候选点提取，返回 [(x, y, score, novelty), ...]（像素坐标）。
+    """Extract candidate points from a single frame, returning [(x, y, score, novelty), ...] (pixel coordinates).
 
-    ``gex`` 是**本帧的绿偏量图**，只用来判断候选点**周围**是不是绿场地。
-    注意不能用它去要求候选点自身 —— 羽毛球是白色的，绿偏量接近 0，
-    早期版本正是栽在这个反了的先验上（详见模块文档的迭代记录）。
+    ``gex`` is **this frame's green-excess map**, used only to judge whether the area **around** the
+    candidate is green court. Note that it must not be used to require the candidate itself to be
+    green — the shuttle is white with green excess near 0, and an early version fell into exactly this
+    reversed prior (see the iteration log in the module docstring).
     """
     import cv2
 
@@ -274,7 +304,7 @@ def _detect_candidates(
         x1 = x0 + int(st[j, cv2.CC_STAT_WIDTH])
         y1 = y0 + int(st[j, cv2.CC_STAT_HEIGHT])
 
-        # 亚像素质心：连通域内用新颖度做灰度加权
+        # Sub-pixel centroid: gray-weighted by novelty within the connected component
         sub = excess[y0:y1, x0:x1]
         tot = float(sub.sum())
         if tot <= 1e-6:
@@ -290,7 +320,7 @@ def _detect_candidates(
         nov_peak = float(nov[iy, ix])
         lvl = float(w[iy, ix])
 
-        # 以候选点为中心的局部窗口
+        # Local window centered on the candidate
         ax0, ax1 = max(0, ix - half), min(wd, ix + half + 1)
         ay0, ay1 = max(0, iy - half), min(h, iy + half + 1)
         pw = w[ay0:ay1, ax0:ax1]
@@ -300,31 +330,31 @@ def _detect_candidates(
             continue
         bg = float(np.median(pw))
 
-        # ---- 局部对比：候选点必须明显亮于它周围一圈的中值
+        # ---- local contrast: the candidate must be clearly brighter than the median of the surrounding ring
         contrast = lvl - bg
         if contrast < th["contrast"]:
             continue
 
-        # 去掉中心 3x3 核心区，避免候选点自己算进"邻居"
+        # Remove the central 3x3 core so the candidate itself is not counted as a "neighbor"
         core = np.zeros_like(pw, dtype=bool)
         core[max(0, iy - ay0 - 1):min(pw.shape[0], iy - ay0 + 2),
              max(0, ix - ax0 - 1):min(pw.shape[1], ix - ax0 + 2)] = True
         n_out = float(max(1, int((~core).sum())))
 
-        # ---- 场地先验：周围一圈背景是否为绿场地
+        # ---- court prior: whether the surrounding ring of background is green court
         ring = pg[~core]
         if ring.size < 4 or float(np.median(ring)) < th["bg_gex"]:
             continue
 
-        # ---- 亮度孤立性：邻居里"与候选点亮度相当"的比例
-        # （阈值取 bg~lvl 的 60% 处，因而与绝对亮度无关，暗背景亮背景都适用）
+        # ---- brightness isolation: fraction of neighbors "comparable in brightness to the candidate"
+        # (threshold taken at 60% between bg~lvl, hence independent of absolute brightness, applicable to dark and bright backgrounds)
         iso_w = float(((pw > bg + 0.60 * contrast) & ~core).sum()) / n_out
         if iso_w > th["iso_w"]:
             continue
 
-        # ---- novelty 孤立性：邻居里 novelry 同样高的比例
-        # 白鞋/白衣整块移动时 novelty 到处都是，这条把它们整体否掉；
-        # 孤立小白点周围 novelty ≈ 0，比值接近 0。
+        # ---- novelty isolation: fraction of neighbors with equally high novelty
+        # When white shoes/clothes move as a whole, novelty is everywhere, and this rejects them
+        # entirely; around an isolated small white dot novelty ≈ 0, so the ratio is near 0.
         nbg = float(np.median(pn))
         iso_n = float(((pn > nbg + 0.5 * (nov_peak - nbg)) & ~core).sum()) / n_out
         if iso_n > th["iso_n"]:
@@ -339,7 +369,7 @@ def _detect_candidates(
     return out
 
 
-# ---------------------------------------------------------------- 轨迹关联
+# ---------------------------------------------------------------- trajectory association
 
 
 def _associate(
@@ -350,9 +380,9 @@ def _associate(
     max_gap: int,
     max_speed: float,
 ) -> list[list[tuple[int, float, float, float]]]:
-    """按「速度外推 + 最近邻」把逐帧候选点串成轨迹。
+    """String per-frame candidate points into trajectories by "velocity extrapolation + nearest neighbor".
 
-    返回 ``[[(frame, x, y, score), ...], ...]``，每条已按帧号升序。
+    Returns ``[[(frame, x, y, score), ...], ...]``, each sorted by frame number ascending.
     """
     frames = sorted(per_frame)
     active: list[list[tuple[int, float, float, float]]] = []
@@ -361,17 +391,17 @@ def _associate(
     for f in frames:
         cands = per_frame[f]
         used = [False] * len(cands)
-        # 先处理"停得最久"的轨迹，避免新轨迹把老轨迹的目标抢走
+        # Process the "longest-stalled" trajectories first, so new trajectories do not steal an old one's target
         active.sort(key=lambda tr: tr[-1][0])
         still: list[list[tuple[int, float, float, float]]] = []
         for tr in active:
             gap = f - tr[-1][0]
-            if gap > max_gap + 1:          # 断太久，轨迹终结
+            if gap > max_gap + 1:          # gap too long, terminate the trajectory
                 if len(tr) >= min_points:
                     done.append(tr)
                 continue
 
-            # 用最后两点的速度外推预测位置
+            # Extrapolate the predicted position using the velocity of the last two points
             if len(tr) >= 2:
                 pf, px, py, _ = tr[-2]
                 lf, lx, ly, _ = tr[-1]
@@ -382,7 +412,7 @@ def _associate(
             else:
                 pred_x, pred_y = tr[-1][1], tr[-1][2]
 
-            # 搜索半径由速度上限决定，再给一个 2 px 的地板值防止亚像素抖动被卡死
+            # The search radius is determined by the speed upper bound, plus a 2 px floor to keep sub-pixel jitter from stalling it
             radius = max(2.0, max_speed * height * (gap / fps))
             best, best_cost = -1, 1e18
             for k, (cx, cy, sc, _nv) in enumerate(cands):
@@ -391,7 +421,7 @@ def _associate(
                 d = float(np.hypot(cx - pred_x, cy - pred_y))
                 if d > radius:
                     continue
-                cost = d / radius - 0.25 * sc      # 越近越好，候选置信度越高越好
+                cost = d / radius - 0.25 * sc      # the closer the better and the higher the candidate confidence the better
                 if cost < best_cost:
                     best, best_cost = k, cost
             if best >= 0:
@@ -401,7 +431,7 @@ def _associate(
             still.append(tr)
         active = still
 
-        # 未被认领的候选点开新轨迹
+        # Unclaimed candidate points start new trajectories
         for k, (cx, cy, sc, _nv) in enumerate(cands):
             if not used[k]:
                 active.append([(f, cx, cy, sc)])
@@ -424,13 +454,14 @@ def _fit_track(
     min_span: float = DEFAULT_MIN_SPAN,
     min_accel: float = DEFAULT_MIN_ACCEL,
 ) -> tuple[ShuttleTrack | None, float]:
-    """二次曲线（抛物线）拟合并打分；返回 ``(轨迹, RMS残差/画面高)``。
+    """Quadratic (parabola) fit and scoring; returns ``(track, RMS residual / frame height)``.
 
-    物理依据：羽毛球受重力 + 空气阻力，短时段内轨迹在画面里近似抛物线，
-    位置对时间做二次拟合即可。除了残差要小，还要求**拟合出的加速度"不能太小"**：
-    匀速直线运动（走动的人、缓慢移动的白色物件）虽然残差也小，但它的二次项
-    接近 0；真正的球一定带着重力造成的弯曲。这条把"物理上像球"和
-    "数学上拟合得好"区分开了。
+    Physical basis: subject to gravity + air resistance, over a short period the shuttle's trajectory
+    is approximately a parabola in the frame, so a quadratic fit of position against time suffices.
+    Besides a small residual, it also requires that **the fitted acceleration "not be too small"**:
+    uniform straight-line motion (a walking person, a slowly moving white object) also has a small
+    residual, but its quadratic term is close to 0; a real shuttle necessarily carries the curvature
+    caused by gravity. This separates "physically like a shuttle" from "mathematically fits well".
     """
     n = len(pts)
     if n < min_points:
@@ -458,7 +489,7 @@ def _fit_track(
     speeds = dist / np.maximum(dt, 1e-6) / max(1.0, height)
     mean_speed = float(speeds.mean()) if speeds.size else 0.0
     obs_max_speed = float(speeds.max()) if speeds.size else 0.0
-    # 平均速度低于下限 => 静止白点（场地线、灯）而非羽毛球
+    # mean speed below the lower bound => a static white dot (court line, light) rather than a shuttlecock
     if mean_speed < min_speed or mean_speed > max_speed * 1.5:
         return None, resid
 
@@ -466,13 +497,13 @@ def _fit_track(
     if span < min_span:
         return None, resid
 
-    # 拟合出的加速度（二次项 2a）：球一定被重力"弯"过
+    # Fitted acceleration (quadratic term 2a): the shuttle must have been "bent" by gravity
     accel = 0.0
     if deg == 2:
         accel = float(np.hypot(2.0 * cx[0], 2.0 * cy[0]) / max(1.0, height))
     if min_accel > 0 and accel < min_accel:
         return None, resid
-    # 加速度大得离谱（多半是拟合被噪声带跑）也丢掉
+    # An absurdly large acceleration (most likely the fit was dragged off by noise) is also dropped
     if accel > 12.0:
         return None, resid
 
@@ -500,7 +531,7 @@ def _fit_track(
     return track, resid
 
 
-# ---------------------------------------------------------------- 主入口
+# ---------------------------------------------------------------- main entry point
 
 
 def analyze_shuttle(
@@ -523,33 +554,34 @@ def analyze_shuttle(
     min_accel: float = DEFAULT_MIN_ACCEL,
     court_gex: float | None = None,
 ) -> ShuttleSignal:
-    """分析视频，返回羽毛球候选轨迹与逐帧辅助信号。
+    """Analyze the video, returning shuttlecock candidate trajectories and per-frame auxiliary signals.
 
-    ``work_width`` 及其后的参数是可选调参项（都有默认值，不影响规格给定的调用方式）。
+    ``work_width`` and the parameters after it are optional tuning knobs (all have defaults and do not affect the call style given in the specification).
 
     Args:
-        video_path: 输入视频。**机位必须静止**，否则结果无意义。
-        sample_fps: 目标采样帧率；源帧率更低时不会上采样。
-        roi: 归一化 ``(x0, y0, x1, y1)``，只在其中找球；None 表示全画面。
-        max_seconds: 只分析前 N 秒；0 表示全片。
-        sensitivity: 0~1，越大越灵敏（阈值越低、候选越多、噪声也越多）。
-        on_progress: ``callable(progress: float, stage: str)``。
-        cancel: ``callable() -> bool``，返回 True 时尽快停止并返回已有结果。
-        work_width: 工作分辨率宽度；0 表示自动（不超过 :data:`DEFAULT_WORK_WIDTH`）。
-        window: 时序窗口半径 K，参考值取前后各 K 帧。
-        min_points: 轨迹最少点数，少于该值的轨迹丢弃。
-        max_gap: 关联时允许丢失的最大帧数。
-        min_speed / max_speed: 速度门控（画面高/秒）。
-        max_resid: 抛物线拟合允许的最大 RMS 残差（画面高）。
-        min_span: 轨迹最小跨度（画面高）。
-        min_accel: 拟合轨迹的最小加速度（画面高/秒²），用于排除匀速直线运动
-            （走动的人）；0 表示关闭。
-        court_gex: 场地先验阈值（候选点周围一圈背景的绿偏量中值下限）。
-            None 表示按 sensitivity 自动取值（s=0.5 时为 45）。设为 -999 可关闭该先验，
-            让模块在全画面找球（适合球常常飞在深色天花板/墙体前的机位）。
+        video_path: Input video. **The camera must be static**, otherwise the results are meaningless.
+        sample_fps: Target sampling frame rate; when the source frame rate is lower it will not upsample.
+        roi: Normalized ``(x0, y0, x1, y1)``; only look for the shuttle inside it; None means the whole frame.
+        max_seconds: Only analyze the first N seconds; 0 means the whole video.
+        sensitivity: 0~1; larger is more sensitive (lower thresholds, more candidates, more noise).
+        on_progress: ``callable(progress: float, stage: str)``.
+        cancel: ``callable() -> bool``; when it returns True, stop as soon as possible and return the results so far.
+        work_width: Working resolution width; 0 means automatic (not exceeding :data:`DEFAULT_WORK_WIDTH`).
+        window: Temporal window radius K; the reference uses K frames before and after.
+        min_points: Minimum number of points for a track; tracks with fewer are dropped.
+        max_gap: Maximum number of frames allowed to be lost during association.
+        min_speed / max_speed: Speed gate (frame-heights/second).
+        max_resid: Maximum RMS residual allowed for the parabola fit (frame heights).
+        min_span: Minimum track span (frame heights).
+        min_accel: Minimum fitted acceleration of a track (frame-heights/second²), used to exclude
+            uniform straight-line motion (a walking person); 0 means disabled.
+        court_gex: Court prior threshold (lower bound on the median green excess of the background ring around the candidate).
+            None means it is taken automatically from sensitivity (45 when s=0.5). Set to -999 to disable
+            this prior and let the module look for the shuttle over the whole frame (suited to a camera
+            where the shuttle often flies against a dark ceiling/wall).
 
     Returns:
-        :class:`ShuttleSignal`。``fps`` 是**实际采样帧率**（源帧率低时低于 ``sample_fps``）。
+        :class:`ShuttleSignal`. ``fps`` is the **actual sampling frame rate** (lower than ``sample_fps`` when the source frame rate is low).
     """
     sig, _dbg = _run(
         video_path, sample_fps, roi, max_seconds, sensitivity, on_progress, cancel,
@@ -570,11 +602,11 @@ def analyze_shuttle_debug(
     cancel=None,
     **kw,
 ) -> tuple[ShuttleSignal, dict]:
-    """诊断辅助入口（规格之外的附加函数）：额外返回逐帧候选点与轨迹归属。
+    """Diagnostic helper entry point (an extra function beyond the specification): additionally returns per-frame candidate points and track membership.
 
-    debug 字典含 ``candidates``（每帧归一化 ``(x, y, score)``）、
-    ``tracked``（每帧属于有效轨迹的归一化 ``(x, y)``）、``width``/``height``/``step``/``frames``。
-    ``analyze_shuttle`` 的行为与返回值不受影响。
+    The debug dict contains ``candidates`` (per-frame normalized ``(x, y, score)``), ``tracked``
+    (per-frame normalized ``(x, y)`` belonging to valid tracks), ``width``/``height``/``step``/``frames``.
+    The behavior and return value of ``analyze_shuttle`` are unaffected.
     """
     return _run(
         video_path, sample_fps, roi, max_seconds, sensitivity, on_progress, cancel,
@@ -628,19 +660,19 @@ def _run(
         cap.release()
         return empty, {}
 
-    # ---- 工作分辨率
+    # ---- working resolution
     ww = int(work_width) if work_width and work_width > 0 else min(src_w, DEFAULT_WORK_WIDTH)
     ww = max(64, min(ww, src_w))
     scale = ww / float(src_w)
     wh = max(2, int(round(src_h * scale)))
-    wf = float(wh) / REF_HEIGHT            # 相对参考高度的缩放
+    wf = float(wh) / REF_HEIGHT            # scaling relative to the reference height
     thr = _sensitivity_thresholds(sensitivity, wf, wh, court_gex)
 
     step = max(1, int(round(src_fps / max(1e-3, float(sample_fps)))))
     eff_fps = src_fps / step
     limit_frames = int(max_seconds * src_fps) if max_seconds and max_seconds > 0 else (total or 10 ** 9)
 
-    # ---- ROI 掩码
+    # ---- ROI mask
     mask_roi = None
     if roi is not None:
         x0, y0, x1, y1 = roi
@@ -656,23 +688,24 @@ def _run(
 
     K = max(1, int(window))
     WIN = 2 * K + 1
-    emit(0.02, "分析羽毛球候选点")
+    emit(0.02, tr("shuttle.detect_candidates"))
 
-    # 环形缓冲只存 uint8：W = min(R,G,B) 天然在 0..255，GEX 加 128 偏移后也够用
-    # （场地先验只关心 gex 是否大于 ~35，裁剪到 [-128,127] 不影响判断）。
+    # The ring buffer stores only uint8: W = min(R,G,B) is naturally in 0..255, and GEX with a 128
+    # offset also fits (the court prior only cares whether gex is greater than ~35, so clipping to
+    # [-128,127] does not affect the decision).
     wq: collections.deque = collections.deque(maxlen=WIN)
     gq: collections.deque = collections.deque(maxlen=WIN)
-    bright_acc = np.zeros((wh, ww), np.float32)             # 静态白区累计
-    n_read = 0          # 已读取的源帧数
-    n_samp = 0          # 已采样的帧数（= 输出时间轴长度）
+    bright_acc = np.zeros((wh, ww), np.float32)             # static white-region accumulation
+    n_read = 0          # number of source frames read
+    n_samp = 0          # number of frames sampled (= output timeline length)
     per_frame: dict[int, list[tuple[float, float, float, float]]] = {}
     top_frames: list[tuple[int, int]] = []
 
     def process(target_local: int, frame_no: int) -> None:
-        """对窗口内第 target_local 帧做候选提取，结果归到时间轴第 frame_no 帧。"""
+        """Extract candidates for the target_local-th frame in the window, attributing the result to frame_no on the timeline."""
         stack = np.stack(wq).astype(np.float32)
         gimg = gq[target_local].astype(np.float32) - 128.0
-        # 全局亮度对齐，抵消自动曝光漂移
+        # Global brightness alignment to cancel auto-exposure drift
         gm = np.median(stack.reshape(stack.shape[0], -1), axis=1)
         off = gm[target_local]
         if np.any(np.abs(gm - off) > 0.5):
@@ -714,34 +747,35 @@ def _run(
         else:
             frame_w = frame
         w, gex = _white_map(frame_w)
-        # GEX 加 128 后存 uint8（省内存）；场地先验只关心它是否超过 ~35
+        # GEX is stored as uint8 after adding 128 (saves memory); the court prior only cares whether it exceeds ~35
         gq.append(np.clip(gex + 128.0, 0, 255).astype(np.uint8))
         bright_acc += (w > 150.0)
         wq.append(np.clip(w, 0, 255).astype(np.uint8))
 
         if len(wq) < WIN:
-            # 预热：时序参考还没建立，此时任何"新颖度"都不可信。
-            # 素材开头实测有自动曝光爬升（+22 灰阶/8 帧），预热期强行出候选
-            # 会一次性爆出上百个假点，所以干脆等窗口填满再开始。
+            # Warm-up: the temporal reference has not been established yet, so any "novelty" is
+            # untrustworthy. The footage measurably has an auto-exposure rise at the start (+22 gray
+            # levels / 8 frames), and forcing candidates during warm-up would explode hundreds of
+            # false points at once, so simply wait for the window to fill before starting.
             n_samp += 1
             continue
 
-        cur = n_samp                      # 当前帧在时间轴上的序号
+        cur = n_samp                      # index of the current frame on the timeline
         n_samp += 1
-        # 窗口满了：目标取正中帧，即 K 帧之前的那一帧
+        # Window full: the target is the center frame, i.e. the frame K frames back
         process(K, cur - K)
 
         if n_read % 16 == 0:
             p = n_read / float(min(total, limit_frames)) if total else 0.5
-            emit(0.02 + 0.73 * min(1.0, p), "分析羽毛球候选点")
+            emit(0.02 + 0.73 * min(1.0, p), tr("shuttle.detect_candidates"))
 
-    # 收尾：窗口满了以后，最后 K 帧还没被处理过，在最终窗口里从中心往后补完
+    # Wrap-up: once the window is full, the last K frames have not been processed; finish them in the final window from the center onward
     done_all = cancel is None or not cancel()
     if done_all and len(wq) == WIN and n_samp > K:
         for r in range(K + 1, WIN):
             process(r, n_samp - (WIN - 1 - r))
     cap.release()
-    emit(0.78, "关联轨迹")
+    emit(0.78, tr("shuttle.associate_tracks"))
 
     n_frames = n_samp
     duration = n_frames / eff_fps if eff_fps > 0 else 0.0
@@ -752,9 +786,10 @@ def _run(
         if 0 <= f < n_frames:
             cand_count[f] = len(pts)
 
-    # ---- 逐帧「最大候选速度」：候选点与前一采样帧候选点的最近邻位移
-    # 只在物理上合理的搜索半径内才算数（超出的视为「无法关联」，记 0 而不是无穷大），
-    # 因此它是一个**下界意义上的**上界估计：真实球速超过门控时这里会被截断。
+    # ---- per-frame "maximum candidate speed": nearest-neighbor displacement from the previous sampled frame's candidates
+    # Only counts within a physically reasonable search radius (anything beyond is treated as "cannot
+    # associate" and recorded as 0 rather than infinity), so it is a **lower-bound** upper-bound
+    # estimate: when the real shuttle speed exceeds the gate it is truncated here.
     gate = max(float(max_speed), 1e-3)
     dt = 1.0 / max(eff_fps, 1e-6)
     radius = gate * float(wh) * dt
@@ -772,7 +807,7 @@ def _run(
         if pts:
             prev_pts = pts
 
-    # ---- 关联 + 抛物线拟合
+    # ---- association + parabola fitting
     wf_h = float(wh)
     chains = _associate(per_frame, eff_fps, wh, min_points, max_gap, max_speed)
     tracks: list[ShuttleTrack] = []
@@ -787,12 +822,12 @@ def _run(
             tracked_by_frame.setdefault(p[0], []).append((p[1] / ww, p[2] / wf_h))
 
     tracks.sort(key=lambda t: (-t.confidence, t.start))
-    for tr in tracks:
-        for p in tr.points:
+    for tk in tracks:
+        for p in tk.points:
             if 0 <= p.frame < n_frames:
-                presence[p.frame] = max(presence[p.frame], float(np.clip(tr.confidence, 0.0, 1.0)))
+                presence[p.frame] = max(presence[p.frame], float(np.clip(tk.confidence, 0.0, 1.0)))
 
-    emit(1.0, "完成")
+    emit(1.0, tr("shuttle.done"))
     sig = ShuttleSignal(
         fps=float(eff_fps),
         duration=float(duration),

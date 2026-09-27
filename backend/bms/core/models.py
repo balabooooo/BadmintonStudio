@@ -1,4 +1,4 @@
-"""领域数据模型（Pydantic v2）。"""
+"""Domain data models (Pydantic v2)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _uid(prefix: str = "") -> str:
@@ -17,7 +17,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# ------------------------------------------------------------------ 媒体
+# ------------------------------------------------------------------ Media
 
 
 class MediaInfo(BaseModel):
@@ -34,7 +34,7 @@ class MediaInfo(BaseModel):
     acodec: str | None = None
     has_audio: bool = False
     created_at: int = Field(default_factory=now_ms)
-    # 派生资源（分析用）
+    # Derived assets (for analysis)
     proxy_path: str | None = None
     proxy_fps: float | None = None
     proxy_width: int | None = None
@@ -47,95 +47,102 @@ class MediaInfo(BaseModel):
         return (self.width / self.height) if self.height else 16 / 9
 
 
-# ------------------------------------------------------------------ 回合与击球
+# ------------------------------------------------------------------ Rallies and shots
 
 PlayerSide = Literal["near", "far", "unknown"]
 ShotKind = Literal["serve", "receive", "clear", "drop", "smash", "drive", "net", "lift", "unknown"]
 
 
 class ShotEvent(BaseModel):
-    """一次击球（球拍触球时刻）。"""
+    """A single shot (the moment the racket touches the shuttle)."""
 
     time: float
     player: PlayerSide = "unknown"
     kind: ShotKind = "unknown"
     confidence: float = 0.5
-    #: 触球后球速估计（场地坐标，m/s），未知为 None
+    #: Estimated shuttle speed after contact (court coordinates, m/s), None if unknown
     speed: float | None = None
-    #: 该拍是否伴随明显起跳（杀球/跳杀）
+    #: Whether this shot was accompanied by a clear jump (smash/jump smash)
     airborne: bool = False
-    #: 触球点相对场地的高度（m），未知为 None
+    #: Height of the contact point relative to the court (m), None if unknown
     height: float | None = None
 
 
 class RallyFeatures(BaseModel):
-    """用于评分的客观特征量。"""
+    """Objective feature quantities used for scoring."""
 
     duration: float = 0.0
     shot_count: int = 0
-    #: 每秒拍数
+    #: Shots per second
     tempo: float = 0.0
-    #: 球速分位（像素/秒，已按场地尺度归一）
+    #: Shuttle speed percentile (pixels/second, normalized to court scale)
     shuttle_speed_p50: float = 0.0
     shuttle_speed_p95: float = 0.0
-    #: 回合内场地运动能量均值（0~1 归一）
+    #: Mean court motion energy within the rally (normalized 0~1)
     motion_energy: float = 0.0
     motion_peak: float = 0.0
-    #: 双方跑动距离（米）
+    #: Running distance of each side (meters)
     travel_near: float = 0.0
     travel_far: float = 0.0
-    #: 杀球次数
+    #: Number of smashes
     smash_count: int = 0
-    #: 最大连续多拍（= shot_count）
+    #: Longest consecutive exchange (= shot_count)
     longest_exchange: int = 0
-    #: 回合结束前最后 2 秒是否激烈
+    #: Whether the last 2 seconds before the rally ended were intense
     finish_intensity: float = 0.0
-    #: 是否出现极限救球（球员瞬时加速度峰值）
+    #: Whether an extreme retrieval occurred (peak instantaneous player acceleration)
     scramble: float = 0.0
-    #: 比分接近度 0~1（有记分牌识别时可用）
+    #: Score closeness 0~1 (available when scoreboard recognition is enabled)
     closeness: float | None = None
-    #: 是否关键分（局点/赛点/平分）
+    #: Whether it is a key point (game point/match point/deuce)
     clutch: bool = False
-    #: 分析置信度
+    #: Analysis confidence
     confidence: float = 0.5
 
-    # ---- 下面这些是评分直接用到的中间量。
-    # 只存分项分是算不出「换一套口径」的分数的：换口径时要用同样的原始特征重算，
-    # 所以这里把评分用到的量都留下来（老的分析结果里它们是默认值）。
-    #: 击球力度 90 分位
+    # ---- The following are intermediate quantities used directly by scoring.
+    # Storing only the per-category scores cannot produce scores for "a different weighting": switching the
+    # weighting requires recomputing from the same raw features, so all quantities used for scoring are kept
+    # here (in older analysis results they are the default values).
+    #: Hit strength 90th percentile
     hit_strength_p90: float = 0.0
-    #: 球员跑动速度均值 / 峰值（像素每秒，已按场地尺度归一）
+    #: Player movement speed mean / peak (pixels per second, normalized to court scale)
     player_speed_mean: float = 0.0
     player_speed_max: float = 0.0
-    #: 羽毛球在画面里出现的比例 0~1
+    #: Fraction of frames in which the shuttle appears 0~1
     shuttle_presence: float = 0.0
-    #: 画面质量：清晰度 / 抖动 / 主体大小
+    #: Image quality: sharpness / shake / subject size
     quality_sharpness: float = 0.6
     quality_shake: float = 0.3
     quality_subject_size: float = 0.25
+    #: Voice command bonus: added directly to the total score when a configured phrase is detected (0 = no hit).
+    #: It is an **absolute bonus** rather than a category, so it is not part of the five-way weighting and is
+    #: capped at 100 on its own.
+    speech_bonus: float = 0.0
+    #: Voice phrases hit in this rally (at most 2); the UI uses them to tag / explain the bonus
+    speech_phrases: list[str] = Field(default_factory=list)
 
 
 class RallyScores(BaseModel):
-    """分项评分（0~100）。"""
+    """Category scores (0~100)."""
 
     total: float = 0.0
     length: float = 0.0
     intensity: float = 0.0
     technique: float = 0.0
     excitement: float = 0.0
-    production: float = 0.0  # 画面/取景质量（清晰度、抖动、遮挡）
+    production: float = 0.0  # image/framing quality (sharpness, shake, occlusion)
 
 
 class Rally(BaseModel):
     id: str = Field(default_factory=lambda: _uid("r_"))
     index: int = 0
-    #: 回合本体（发球开始 -> 死球）
+    #: The rally itself (serve start -> dead ball)
     start: float = 0.0
     end: float = 0.0
-    #: 建议剪辑区间（含准备动作留白）
+    #: Suggested clip range (including pre-action padding)
     clip_start: float = 0.0
     clip_end: float = 0.0
-    #: 发球 / 接发球
+    #: Serve / receive
     serve_time: float | None = None
     serve_player: PlayerSide = "unknown"
     receive_time: float | None = None
@@ -144,124 +151,192 @@ class Rally(BaseModel):
     features: RallyFeatures = Field(default_factory=RallyFeatures)
     scores: RallyScores = Field(default_factory=RallyScores)
     tags: list[str] = Field(default_factory=list)
-    #: 用户干预
+    #: User intervention
     keep: bool = True
     starred: bool = False
     note: str = ""
-    #: 自动判定该回合结果（有记分牌时）
+    #: Automatically determined rally result (when a scoreboard is present)
     winner: PlayerSide | None = None
-    #: 回合本体时长（= end - start），随序列化一起下发，方便前端直接使用
+    #: Duration of the rally itself (= end - start); sent along with serialization for direct use by the frontend
     duration: float = 0.0
 
 
 class AnalysisParams(BaseModel):
-    """分析可调参数。"""
+    """Tunable analysis parameters."""
 
-    #: 击球检测灵敏度 0~1（越大越灵敏）
+    #: Hit detection sensitivity 0~1 (larger = more sensitive)
     hit_sensitivity: float = 0.5
-    #: 判断回合结束的静音时长（秒）
+    #: Silence duration that marks the end of a rally (seconds)
     gap_seconds: float = 3.2
-    #: 最短回合时长（秒），低于此丢弃
+    #: Minimum rally duration (seconds); shorter ones are dropped
     min_rally_seconds: float = 2.0
-    #: 最长回合时长（秒），超出则截断
+    #: Maximum rally duration (seconds); longer ones are truncated
     max_rally_seconds: float = 120.0
-    #: 典型回合时长（秒）。连续训练/多球练习时，球员在两个回合之间只停几秒，
-    #: 活跃度曲线不会塌陷，光靠阈值会把好几个回合粘成一条。
-    #: 超过这个长度的区间会继续在「活跃度最低点」递归切开。
+    #: Typical rally duration (seconds). During continuous training / multi-shuttle drills, players pause only
+    #: a few seconds between rallies, the activity curve does not collapse, and a threshold alone would glue
+    #: several rallies into one. Intervals longer than this are recursively split at the "lowest activity point".
     target_rally_seconds: float = 28.0
-    #: 切分积极程度 0~1：越大越倾向切细（映射到更短的目标时长与更早的退出阈值）
+    #: Segmentation aggressiveness 0~1: larger values favor finer splits (mapped to a shorter target duration and an earlier exit threshold)
     split_sensitivity: float = 0.5
-    #: 低于这个置信度的回合在界面上默认标灰（可在界面上再调）
+    #: Rallies below this confidence are grayed out by default in the UI (adjustable there)
     confidence_min: float = 0.0
-    #: 剪辑时在回合前后各保留的留白。
-    #: ``pre_roll`` 是发球准备（球员走到位置、抛球前的停顿）；
-    #: ``post_roll`` 是终点之后额外留的一点呼吸，加了它才是最终导出的
-    #: ``clip_end``。因为 ``hit_tail_seconds`` 已经把「球落地」算进去了，
-    #: 这里默认给得很小 —— 旧默认 1.6 会让每回合凭空多出一秒半的死球画面。
+    #: Padding kept before and after each rally when editing.
+    #: ``pre_roll`` is the serve preparation (player walks into position, pause before the toss);
+    #: ``post_roll`` is a little extra breathing room after the end point, which is what makes the final
+    #: exported ``clip_end``. Because ``hit_tail_seconds`` already accounts for "the shuttle landing", the
+    #: default here is very small -- the old default of 1.6 added a second and a half of dead-ball footage
+    #: to every rally out of thin air.
     pre_roll: float = 1.2
     post_roll: float = 0.5
-    #: **最后一拍之后保留多久**（秒），用于把回合终点锚定到「球落地」。
-    #: 一拍打出去之后球还要飞一会儿才落地，所以终点不能直接等于最后一拍。
-    #: 实测业余素材这段飞行多数在 0.4~1.2 秒；给 0.9 能覆盖常见情况，
-    #: 同时把「球落地后还留很久」和「吃进下一个回合」一起消掉。
-    #: 调大 = 更保险但更松，调小 = 更紧但可能吃掉大力高远球的落地瞬间。
+    #: **How long to keep after the last shot** (seconds), used to anchor the rally end to "the shuttle landing".
+    #: After a shot is hit the shuttle still flies for a while before landing, so the end cannot simply equal
+    #: the last shot. In amateur footage this flight segment is mostly 0.4~1.2 seconds; 0.9 covers the common
+    #: cases and simultaneously removes both "lingering long after the shuttle lands" and "eating into the
+    #: next rally". Larger = safer but looser, smaller = tighter but may eat the landing moment of a powerful
+    #: clear.
     hit_tail_seconds: float = 0.9
-    #: 启用各分析模块
+    #: Enable individual analysis modules
     use_audio: bool = True
     use_motion: bool = True
     use_players: bool = True
-    #: 姿态辅助（YOLO-pose）：给音频击球做「是不是我们这场比赛打的」归属判定。
-    #: 多球场球馆里音频无法区分「谁在击球」，而我们的球员只在真击球时挥拍，
-    #: 所以这是解决「回合被粘长 / 吃进下一个回合」的关键证据。
-    #: 失败（没有 GPU / 权重缺失 / 球员太小）会自动降级，行为与该开关关闭时一致。
+    #: Pose assistance (YOLO-pose): attributes audio hits to "whether it was our match".
+    #: In a multi-court gym, audio cannot distinguish "who is hitting", while our players swing only on real
+    #: hits, so this is the key evidence for solving "rallies glued too long / eating into the next rally".
+    #: Failures (no GPU / missing weights / players too small) degrade automatically, matching the behavior
+    #: when this switch is off.
     use_pose: bool = True
-    #: 羽毛球轨迹跟踪：计算量与「帧数 × 像素数 × 时间窗」成正比，
-    #: 30 分钟 4K 素材能跑到小时级，所以默认关闭，长视频按需开启。
+    #: ---- Hit attribution gate (cross-court rejection) ----
+    #: Pose evidence threshold 0~1: an audio hit is kept only when a swing peak explains it. Larger =
+    #: stricter (drops more neighboring-court sounds); smaller = keeps more. This is the "cross-court
+    #: suppression strength" slider in the rally panel and can be re-applied instantly via resegment.
+    pose_gate_threshold: float = 0.45
+    #: Matching window (seconds) around a swing peak that can explain a hit.
+    pose_gate_window: float = 0.35
+    #: One swing can explain only one hit. This one-to-one constraint is the main reason the gate works
+    #: (it removes the extra neighboring-court sounds that happen to coincide with our swing).
+    pose_gate_one_to_one: bool = True
+    #: Force-apply the gate even when the retention ratio falls outside the safe band. By default an
+    #: out-of-band ratio makes the gate silently pass all hits through (protection against a broken pose
+    #: signal); turning this on lets the user insist on filtering anyway.
+    pose_gate_force: bool = False
+    #: Shuttle trajectory tracking: the compute cost is proportional to "frames x pixels x time window", so
+    #: 30 minutes of 4K footage can take hours; disabled by default, enable on demand for long videos.
     use_shuttle: bool = False
     use_scoreboard: bool = False
-    #: 羽毛球跟踪的采样帧率（比球员检测更高才好抓快速飞行的球）
+    #: Sampling frame rate for shuttle tracking (higher than player detection to catch fast-flying shuttles)
     shuttle_fps: float = 10.0
-    #: 羽毛球跟踪的时间预算（秒，0 = 全片）。覆盖不足 60% 时整路信号会被丢弃，
-    #: 避免「只在前半段有数据」把融合结果带偏。
+    #: Time budget for shuttle tracking (seconds, 0 = full clip). If coverage is below 60% the whole signal
+    #: is dropped, to avoid "data only in the first half" skewing the fusion result.
     shuttle_budget_seconds: float = 420.0
-    #: 场地朝向：自动 | 横屏 | 竖屏
+    #: Voice command bonus (optional): recognizes short phrases shouted by spectators / fellow players
+    #: (e.g. "nice shot") with faster-whisper and raises the corresponding rally's score on a hit.
+    #: Missing dependency / models (and a bad audio track) degrade silently, matching the behavior
+    #: when this switch is off.
+    use_speech: bool = False
+    #: Voice phrases to detect, at most 2, at most 3 characters each; extra items are truncated / dropped.
+    speech_phrases: list[str] = Field(default_factory=list)
+    #: How many points to add to the total per phrase hit (added after the confidence discount, total capped at 100)
+    speech_bonus_points: float = 10.0
+    #: faster-whisper model size (larger = more accurate but slower and a bigger download).
+    speech_model: Literal["tiny", "base", "small", "medium", "large-v3"] = "medium"
+    #: Tolerate near-homophone mis-recognition (e.g. Whisper hears 到球/倒球 for 好球). Needs pypinyin;
+    #: without it only exact matches are kept.
+    speech_fuzzy: bool = True
+    #: Court orientation: auto | landscape | portrait
     court_orientation: Literal["auto", "landscape", "portrait"] = "auto"
-    #: 机位/拍法。``auto`` = 自动识别；其余用于用户明确知道自己的拍法时跳过猜测。
-    #:   rear   = 场地后方（底线后，最常见）
-    #:   side   = 边线侧方
-    #:   elevated = 高机位斜俯（看台/二楼）
-    #:   overhead = 正俯拍
-    #: 不同机位下「谁离相机近」「球员框该多大」完全不同，识别出来才能选对先验。
+    #: Camera setup / shooting style. ``auto`` = detect automatically; the rest skip guessing when the user
+    #: knows their own setup.
+    #:   rear   = behind the court (behind the baseline, most common)
+    #:   side   = to the side of the sideline
+    #:   elevated = high angled downward view (stands / second floor)
+    #:   overhead = straight top-down shot
+    #: Under different camera setups "who is closer to the camera" and "how large the player box should be"
+    #: are completely different; detecting it lets us pick the right prior.
     viewpoint: Literal["auto", "rear", "side", "elevated", "overhead"] = "auto"
-    #: 是否自动标定场地（颜色 + 多边形 + 单应变换）。关掉则全程用全画幅，
-    #: 也就等于退回旧行为（多球场/颜色异常时可用）。
+    #: Whether to auto-calibrate the court (color + polygon + homography). Turning it off uses the full frame
+    #: throughout, which amounts to falling back to the old behavior (useful with multiple courts / abnormal colors).
     auto_calibrate: bool = True
-    #: **手动标定的场地边界**（归一化 0~1，4~24 个点，顺序不限）。
-    #: 用户在预览画面上点一圈即可；给了它就不再猜测，直接用它建标定。
-    #: 颜色标定在多球场 / 地胶颜色异常 / 场地只占画面一角时会失败，
-    #: 这时候手动标一次比继续调算法有效得多。
-    #: **全景 / 鱼眼素材请多加几个点**：弯掉的边界用四个角描述会切掉边角，
-    #: 而边角正是背景人员最密集的地方。
+    #: **Manually calibrated court boundary** (normalized 0~1, 4~24 points, order irrelevant).
+    #: The user just clicks around it on the preview image; when provided, no guessing is done and it is used
+    #: directly to build the calibration. Color calibration fails with multiple courts / abnormal mat colors /
+    #: a court occupying only a corner of the frame; in those cases calibrating once manually is far more
+    #: effective than continuing to tune the algorithm.
+    #: **For panoramic / fisheye footage, add more points**: describing a curved boundary with four corners
+    #: cuts off the edges, and the edges are exactly where background people are densest.
     court_poly: list[list[float]] | None = None
-    #: 旧字段：手动标定的四角（等价于 ``court_poly`` 只给 4 个点）。
-    #: 保留是为了让已经存过的旧工程继续生效；新代码请写 ``court_poly``。
+    #: Legacy field: the manually calibrated four corners (equivalent to ``court_poly`` with only 4 points).
+    #: Kept so that already-saved old projects keep working; new code should write ``court_poly``.
     court_quad: list[list[float]] | None = None
-    #: ---- 人物框尺寸筛选 ----
-    #: 检测到的人框按尺寸过滤的模式：
-    #:   ``off``      不筛选（只保留原有的几何门限）
-    #:   ``absolute`` 按「框高占画面高度的比例」筛选（min/max 是绝对比例）
-    #:   ``relative`` 按「框高 ÷ 同帧最大框高」筛选（比值）
-    #: 全景 / 鱼眼素材里同一个人在画面中心与边角的框高能差一倍以上，
-    #: 这时 ``absolute`` 很容易把靠边的真球员筛掉，``relative`` 更稳。
+    #: ---- Person box size filtering ----
+    #: Mode for filtering detected person boxes by size:
+    #:   ``off``      no filtering (keep only the existing geometric thresholds)
+    #:   ``absolute`` filter by "box height as a fraction of frame height" (min/max are absolute fractions)
+    #:   ``relative`` filter by "box height / largest box height in the same frame" (a ratio)
+    #: In panoramic / fisheye footage the box height of the same person can differ by more than 2x between
+    #: the center and the edges of the frame; ``absolute`` easily filters out real players near the edges,
+    #: while ``relative`` is more robust.
     player_size_mode: Literal["off", "absolute", "relative"] = "off"
-    #: 框高下限（absolute = 占画面高度比例；relative = 相对同帧最大框的比值）
+    #: Box height lower bound (absolute = fraction of frame height; relative = ratio to the largest box in the frame)
     player_min_height: float = 0.05
-    #: 框高上限（0 = 不限）
+    #: Box height upper bound (0 = unlimited)
     player_max_height: float = 0.0
-    #: 框面积下限（归一化面积 0~1，0 = 不限）。畸变下框会变宽，
-    #: 想更细地卡「贴到镜头前的人」时用面积比高度准。
+    #: Box area lower bound (normalized area 0~1, 0 = unlimited). Under distortion boxes get wider, so area
+    #: is more accurate than height when trying to tightly exclude "people right in front of the lens".
     player_min_area: float = 0.0
-    #: 框面积上限（0 = 不限）
+    #: Box area upper bound (0 = unlimited)
     player_max_area: float = 0.0
-    #: 回合切分方式：``auto`` 优先用球员运动切分（推荐），``activity`` 用旧的
-    #: 融合活跃度 + 迟滞状态机，``hybrid`` 两种都跑再择优。
+    #: Rally segmentation method: ``auto`` prefers player-motion segmentation (recommended), ``activity``
+    #: uses the old fused activity + hysteresis state machine, ``hybrid`` runs both and picks the better one.
     segment_mode: Literal["auto", "activity", "hybrid"] = "auto"
-    #: ---- 静默段切分尺度（人工标注校准的目标参数）----
-    #: 这些是「球员运动 × 击球密度」证据曲线上找静默谷的内部尺度。它们不在旧
-    #: 参数里是因为以前没有 ground truth 可依据（见 HANDOVER 8.6）。有了标注
-    #: 之后它们就是最值得校准的量，所以提升为可持久化、可被优化器写入的参数。
-    #: 单个静默谷的最短宽度：太短会把曲线抖动当成停顿。
-    seg_min_quiet: float = 0.7
-    #: 静默谷的显著度门限（相对 p95-p20）；越大要求谷越深。
-    seg_prominence: float = 0.18
-    #: 两段静默之间至少隔多久才算「回合结束」。
-    seg_min_rest: float = 0.8
-    #: 允许的最短连续移动段，比它短的候选丢掉。
-    seg_min_core: float = 1.0
-    #: 逐帧 AI 分析的最大帧数（用于长视频限速；0 = 不限）
+    #: ---- Quiet-segment segmentation scales (target params for manual-annotation calibration) ----
+    #: These are the internal scales for finding quiet valleys on the "player motion x hit density" evidence
+    #: curve. They were not in the old parameters because there was no ground truth to rely on (see HANDOVER
+    #: 8.6). With annotations available they are the quantities most worth calibrating, so they were promoted
+    #: to persistable parameters that the optimizer can write.
+    #: Minimum width of a single quiet valley: too short treats curve jitter as a pause.
+    seg_min_quiet: float = 0.6
+    #: Prominence threshold of a quiet valley (relative to p95-p20); larger requires a deeper valley.
+    seg_prominence: float = 0.10
+    #: Minimum separation between two quiet segments to count as a "rally end".
+    seg_min_rest: float = 0.6
+    #: Minimum allowed continuous movement segment; shorter candidates are dropped.
+    seg_min_core: float = 2.5
+    #: Maximum number of frames for per-frame AI analysis (to rate-limit long videos; 0 = unlimited)
     max_frames: int = 0
-    #: 分析帧率
+    #: Analysis frame rate
     sample_fps: float = 15.0
+
+    @field_validator("speech_phrases", mode="before")
+    @classmethod
+    def _clean_speech_phrases(cls, v: object) -> list[str]:
+        # Lazy import to avoid core depending on the analysis subpackage at import time
+        from ..analysis.speech import sanitize_phrases
+
+        return sanitize_phrases(v)
+
+    @field_validator("speech_bonus_points")
+    @classmethod
+    def _clamp_speech_bonus(cls, v: float) -> float:
+        return float(min(30.0, max(0.0, v)))
+
+    @field_validator("speech_model", mode="before")
+    @classmethod
+    def _clean_speech_model(cls, v: object) -> str:
+        # Lazy import to avoid core depending on the analysis subpackage at import time
+        from ..analysis.speech import DEFAULT_MODEL, WHISPER_SIZES
+
+        s = str(v or "").strip().lower()
+        return s if s in WHISPER_SIZES else DEFAULT_MODEL
+
+    @field_validator("pose_gate_threshold")
+    @classmethod
+    def _clamp_gate_threshold(cls, v: float) -> float:
+        return float(min(0.95, max(0.0, v)))
+
+    @field_validator("pose_gate_window")
+    @classmethod
+    def _clamp_gate_window(cls, v: float) -> float:
+        return float(min(2.0, max(0.05, v)))
 
 
 class AnalysisResult(BaseModel):
@@ -274,23 +349,23 @@ class AnalysisResult(BaseModel):
     params: AnalysisParams = Field(default_factory=AnalysisParams)
     started_at: int | None = None
     finished_at: int | None = None
-    #: 时间序列信号（下采样后返回前端画波形）
+    #: Time-series signals (downsampled before returning to the frontend for waveform plotting)
     signals: dict[str, list[float]] = Field(default_factory=dict)
     signal_fps: float = 0.0
     hits: list[ShotEvent] = Field(default_factory=list)
     rallies: list[Rally] = Field(default_factory=list)
     court: dict[str, Any] | None = None
-    #: 场地标定与机位识别结果（``court_calib.CourtCalibration.as_payload()``）
+    #: Court calibration and camera setup detection result (``court_calib.CourtCalibration.as_payload()``)
     calibration: dict[str, Any] | None = None
     stats: dict[str, Any] = Field(default_factory=dict)
 
 
-# ------------------------------------------------------------------ 工程 / 时间线
+# ------------------------------------------------------------------ Project / timeline
 
 
 class Transform(BaseModel):
     scale: float = 1.0
-    x: float = 0.0  # 归一化偏移
+    x: float = 0.0  # normalized offset
     y: float = 0.0
     rotation: float = 0.0
 
@@ -298,20 +373,20 @@ class Transform(BaseModel):
 class Clip(BaseModel):
     id: str = Field(default_factory=lambda: _uid("c_"))
     media_id: str
-    #: 源素材内的入点 / 出点（秒）
+    #: In point / out point within the source media (seconds)
     src_in: float = 0.0
     src_out: float = 0.0
-    #: 时间线上的起点；为 None 时按顺序排列
+    #: Start point on the timeline; when None, clips are arranged in order
     tl_start: float = 0.0
     speed: float = 1.0
     volume: float = 1.0
     transform: Transform = Field(default_factory=Transform)
-    #: 关联的回合（AI 切出来的片段）
+    #: Associated rally (a segment cut out by the AI)
     rally_id: str | None = None
     label: str = ""
-    #: 竖屏自动裁切
+    #: Automatic vertical crop
     vertical_crop: bool = False
-    #: 保持原速的部分（变速时保护，未使用则空）
+    #: Portion kept at original speed (protected during speed changes; empty when unused)
     protected: bool = False
 
     @property
@@ -321,7 +396,8 @@ class Clip(BaseModel):
 
 class Track(BaseModel):
     id: str = Field(default_factory=lambda: _uid("t_"))
-    name: str = "视频轨 1"
+    #: Language-neutral default; callers fill the display name via ``tr("timeline.track_default", ...)``.
+    name: str = ""
     kind: Literal["video", "audio", "overlay"] = "video"
     muted: bool = False
     locked: bool = False
@@ -348,19 +424,20 @@ class ExportPreset(BaseModel):
     audio_bitrate: str = "192k"
     crf: int | None = None
     container: str = "mp4"
-    #: 竖屏自动跟随裁切
+    #: Automatic vertical follow crop
     auto_reframe: bool = False
 
 
 class Project(BaseModel):
     id: str = Field(default_factory=lambda: _uid("p_"))
-    name: str = "未命名工程"
+    #: Language-neutral default; ``store.create_project`` fills it via ``tr("project.untitled")``.
+    name: str = ""
     created_at: int = Field(default_factory=now_ms)
     updated_at: int = Field(default_factory=now_ms)
     media: list[MediaInfo] = Field(default_factory=list)
     analyses: dict[str, AnalysisResult] = Field(default_factory=dict)
     timeline: Timeline = Field(default_factory=Timeline)
-    #: 播放器/界面状态
+    #: Player/UI state
     ui: dict[str, Any] = Field(default_factory=dict)
     version: int = 1
 
@@ -377,13 +454,15 @@ class ProjectSummary(BaseModel):
     analyzed: bool = False
 
 
-# ------------------------------------------------------------------ 任务
+# ------------------------------------------------------------------ Jobs
 
 
 class JobInfo(BaseModel):
     id: str = Field(default_factory=lambda: _uid("j_"))
     kind: str
     title: str = ""
+    #: The media this job serves (used by media-triggered jobs like prepare), so the UI can attach progress to the right card
+    media_id: str | None = None
     status: Literal["queued", "running", "done", "error", "cancelled"] = "queued"
     progress: float = 0.0
     stage: str = ""

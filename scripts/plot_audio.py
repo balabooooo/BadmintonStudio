@@ -1,6 +1,6 @@
-"""音频信号诊断图：波形 / 高频通量 / 自适应阈值 / 检出的击球 / 频谱图。
+"""Audio signal diagnostic charts: waveform / high-frequency flux / adaptive threshold / detected hits / spectrogram.
 
-用法:
+Usage:
     python scripts/plot_audio.py <wav> [--from 0] [--to 60] [--out out.png]
 """
 

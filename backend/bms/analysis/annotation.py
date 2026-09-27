@@ -1,18 +1,19 @@
-"""人工标注的读写，以及「用标注自动优化切分参数」。
+"""Reading/writing manual annotations, and "using annotations to automatically optimize segmentation parameters".
 
-为什么需要它
-------------
-切分参数（静默段尺度、最短回合等）过去只能靠肉眼看结果、凭感觉调 ——
-HANDOVER 第 8.6 节明确说「没有 ground truth 就无法判断调参对不对」。
-有了人工标注之后，这件事变成一个可量化的问题：
+Why it is needed
+----------------
+Segmentation parameters (quiet-segment scale, minimum rally length, etc.) used to be tunable
+only by eyeballing the results and tuning by feel — HANDOVER section 8.6 explicitly says "without
+ground truth you cannot tell whether tuning is correct". With manual annotations this becomes a
+quantifiable problem:
 
-1. 把标注当作 ground truth；
-2. 在参数网格上重跑切分（复用已存好的信号，毫秒级，不重跑 AI）；
-3. 用 IoU 匹配算 Precision / Recall / F1，挑 F1 最高的一组；
-4. 把最优参数写回 ``AnalysisParams``，再走一次 resegment 就应用到工程上。
+1. treat the annotations as ground truth;
+2. re-run segmentation over a parameter grid (reusing the stored signals, in milliseconds, without re-running AI);
+3. use IoU matching to compute Precision / Recall / F1, and pick the set with the highest F1;
+4. write the best parameters back into ``AnalysisParams``, then one more resegment applies them to the project.
 
-本模块只做「读标注 / 存标注 / 评估 / 搜参」，不碰 HTTP；路由见
-:mod:`bms.api.annotations`。
+This module only does "read annotations / save annotations / evaluate / search parameters" and
+does not touch HTTP; for routes see :mod:`bms.api.annotations`.
 """
 
 from __future__ import annotations
@@ -20,22 +21,24 @@ from __future__ import annotations
 import itertools
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
 from ..config import ANNOTATIONS_DIR
+from ..i18n import tr
 from . import pipeline as P
 from . import rally as RA
 from . import rally_vision as RV
 from ..core.models import AnalysisParams, AnalysisResult, MediaInfo
 
-#: 参数搜索网格。每一项是 (字段名, 候选值)。
-#: 只搜真正影响切分的量：静默段四个尺度 + 最短回合。``pre_roll`` / ``post_roll``
-#: / ``hit_tail_seconds`` 影响的是边界回贴，对 IoU 也有影响，但维度一多组合爆炸，
-#: 先固定为工程当前值。
+#: Parameter search grid. Each item is (field name, candidate values).
+#: Only the quantities that truly affect segmentation are searched: the four quiet-segment scales
+#: + minimum rally length. ``pre_roll`` / ``post_roll`` / ``hit_tail_seconds`` affect boundary
+#: snapping and also affect IoU, but more dimensions cause a combinatorial explosion, so they are
+#: fixed to the project's current values for now.
 SEARCH_GRID: list[tuple[str, list[float]]] = [
     ("seg_prominence", [0.10, 0.15, 0.22, 0.30]),
     ("seg_min_core", [0.8, 1.2, 1.8, 2.5]),
@@ -45,36 +48,45 @@ SEARCH_GRID: list[tuple[str, list[float]]] = [
 ]
 
 
-# ------------------------------------------------------------------ 标注读写
+# ------------------------------------------------------------------ Annotation I/O
 
 
 def annotation_path(media: MediaInfo) -> Path:
-    """标注文件按「代理视频名」命名（与旧的独立标注工具保持一致）。
+    """Annotation files are named after the "proxy video name" (kept consistent with the old standalone annotation tool).
 
-    用代理名而不是原名：分析实际处理的是代理，标注也是对着代理画面标的；
-    而且旧工具已经按代理名存过一批标注，沿用名字能直接读到。
+    Use the proxy name rather than the original name: the analysis actually processes the proxy,
+    and annotations are made against the proxy frames; moreover the old tool has already saved a
+    batch of annotations under the proxy name, so reusing the name lets them be read directly.
+
+    ``proxy_path`` may be cleared together with the cache, so reconstruct the (deterministic)
+    proxy name from the media instead of falling back to the source name -- otherwise existing
+    annotations would suddenly appear missing.
     """
-    for raw in (media.proxy_path, media.path):
-        if raw:
-            return ANNOTATIONS_DIR / f"{Path(raw).stem}.anno.json"
+    if media.proxy_path:
+        return ANNOTATIONS_DIR / f"{Path(media.proxy_path).stem}.anno.json"
+    if media.path:
+        from ..core.media import proxy_stem
+
+        return ANNOTATIONS_DIR / f"{proxy_stem(media)}.anno.json"
     return ANNOTATIONS_DIR / f"{media.id}.anno.json"
 
 
 def load_annotation(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {"rallies": [], "focus": None, "note": ""}
+        return {"rallies": [], "hits": [], "focus": None, "note": ""}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"rallies": [], "focus": None, "note": ""}
+        return {"rallies": [], "hits": [], "focus": None, "note": ""}
     if not isinstance(data, dict):
-        return {"rallies": [], "focus": None, "note": ""}
+        return {"rallies": [], "hits": [], "focus": None, "note": ""}
     data.setdefault("rallies", [])
+    data.setdefault("hits", [])
     return data
 
 
 def normalize_rallies(raw: Iterable[dict]) -> list[dict[str, Any]]:
-    """清洗标注回合：丢掉起止非法 / 倒置的项，按起点排序。"""
+    """Sanitize annotated rallies: drop items with illegal / inverted start-end, sort by start."""
     out: list[dict[str, Any]] = []
     for r in raw or []:
         try:
@@ -94,9 +106,25 @@ def normalize_rallies(raw: Iterable[dict]) -> list[dict[str, Any]]:
     return out
 
 
+def normalize_hits(raw: Iterable[dict]) -> list[dict[str, Any]]:
+    """Sanitize hit-level labels ``{t, ours}`` (``ours=True`` = our court, ``False`` = neighboring court)."""
+    out: list[dict[str, Any]] = []
+    for h in raw or []:
+        try:
+            t = float(h["t"])
+        except Exception:
+            continue
+        if not np.isfinite(t) or t < 0:
+            continue
+        out.append({"t": round(t, 3), "ours": bool(h.get("ours", True))})
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
 def save_annotation(path: Path, media: MediaInfo, payload: dict, duration: float,
                     fps: float) -> dict[str, Any]:
     rallies = normalize_rallies(payload.get("rallies") or [])
+    hits = normalize_hits(payload.get("hits") or [])
     focus = payload.get("focus")
     doc = {
         "video": str(media.proxy_path or media.path),
@@ -105,9 +133,11 @@ def save_annotation(path: Path, media: MediaInfo, payload: dict, duration: float
         "fps": round(float(fps), 4),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rallies),
+        "hit_count": len(hits),
         "focus": focus,
         "note": str(payload.get("note") or ""),
         "rallies": rallies,
+        "hits": hits,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -127,7 +157,7 @@ def annotation_to_csv(doc: dict, fps: float) -> str:
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------ 评估
+# ------------------------------------------------------------------ Evaluation
 
 
 def iou(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -138,7 +168,7 @@ def iou(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 def match_pairs(preds: list[tuple[float, float]], gt: list[tuple[float, float]],
                 thr: float = 0.5) -> list[tuple[int, int, float]]:
-    """贪心 IoU 匹配（按 IoU 从高到低配对，一对一）。"""
+    """Greedy IoU matching (pair from highest to lowest IoU, one-to-one)."""
     cand: list[tuple[float, int, int]] = []
     for i, p in enumerate(preds):
         for j, g in enumerate(gt):
@@ -171,13 +201,55 @@ def metrics(preds: list[tuple[float, float]], gt: list[tuple[float, float]],
             "precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
 
 
-# ------------------------------------------------------------------ 搜参
+def _nearest_label(t: float, labels: list[tuple[float, bool]], tol: float) -> bool | None:
+    best: bool | None = None
+    bd = tol
+    for lt, ours in labels:
+        d = abs(lt - t)
+        if d <= bd:
+            bd, best = d, ours
+    return best
+
+
+def hit_metrics(preds: Iterable[float], labels: Iterable[tuple[float, bool]],
+                tol: float = 0.12) -> dict[str, float]:
+    """Precision / recall / F1 of the *hit attribution gate* against hit-level labels.
+
+    ``labels`` carry ``(time, ours)`` where ``ours=False`` marks a neighboring-court sound. A kept
+    hit that matches a "neighbor" label (or matches nothing) is a false positive; an "ours" label
+    with no kept hit near it is a false negative.
+    """
+    lab = [(float(t), bool(o)) for t, o in labels]
+    if not lab:
+        return {}
+    ours = [t for t, o in lab if o]
+    preds = [float(t) for t in preds]
+    tp = fp = fn = 0
+    for t in preds:
+        if _nearest_label(t, lab, tol) is True:
+            tp += 1
+        else:
+            fp += 1
+    for t in ours:
+        if not any(abs(p - t) <= tol for p in preds):
+            fn += 1
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return {"tp": tp, "fp": fp, "fn": fn,
+            "precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
+
+
+# ------------------------------------------------------------------ Parameter search
 
 
 @dataclass
 class _Context:
     fused: RA.FusedSignal
-    hits: Any
+    sig: dict[str, Any]
+    hits_raw: Any
+    pose: Any
+    has_raw: bool
     player_motion: np.ndarray | None
     player_coverage: np.ndarray | None
     fps: float
@@ -190,7 +262,7 @@ def _build_context(res: AnalysisResult, lo: float, hi: float) -> _Context:
     sig = res.signals or {}
     act = np.asarray(sig.get("activity_full") or [], dtype=np.float32)
     if act.size == 0:
-        raise ValueError("分析结果里没有 activity_full；请先用新版跑一次 AI 分析")
+        raise ValueError(tr("analysis.annotation.no_activity"))
     fps = float((sig.get("fps") or [12.0])[0]) or 12.0
     duration = float((sig.get("duration") or [0.0])[0]) or (act.size / fps)
     med = float(np.median(act))
@@ -200,20 +272,34 @@ def _build_context(res: AnalysisResult, lo: float, hi: float) -> _Context:
         threshold_lo=max(float(np.percentile(act, 55)) * 0.92, med * 1.05),
         audio_reliability=float(res.stats.get("audio_reliability", 1.0) or 1.0),
     )
-    hits = P._rebuild_hits(sig)
+    has_raw = bool(sig.get("hit_times_raw"))
+    hits_raw = P._rebuild_hits_raw(sig) if has_raw else P._rebuild_hits(sig)
+    pose = P._rebuild_pose_signal(sig)
     pfps = float((sig.get("player_fps") or [0.0])[0]) or 0.0
     pm_raw = sig.get("player_motion_full") or []
     cov_raw = sig.get("player_coverage_full") or []
     player_motion = np.asarray(pm_raw, dtype=np.float32) if pm_raw and pfps > 0 else None
     player_coverage = (np.asarray(cov_raw, dtype=np.float32)
                        if cov_raw and len(cov_raw) == len(pm_raw) else None)
-    return _Context(fused=fused, hits=hits, player_motion=player_motion,
-                    player_coverage=player_coverage, fps=fps, duration=duration,
-                    lo=lo, hi=hi)
+    return _Context(fused=fused, sig=sig, hits_raw=hits_raw, pose=pose, has_raw=has_raw,
+                    player_motion=player_motion, player_coverage=player_coverage,
+                    fps=fps, duration=duration, lo=lo, hi=hi)
 
 
-def _predict(ctx: _Context, params: AnalysisParams) -> list[tuple[float, float]]:
-    """用一组参数跑一次切分 + 收尾，返回落在标注窗口内的回合。"""
+def _gated_hits(ctx: _Context, params: AnalysisParams):
+    """Apply the (possibly re-tuned) hit attribution gate to the raw candidates."""
+    hits, _trace = P.regate_hits(ctx.sig, params, hits_raw=ctx.hits_raw, pose=ctx.pose)
+    return hits
+
+
+def _predict(ctx: _Context, params: AnalysisParams, hits=None) -> list[tuple[float, float]]:
+    """Run one segmentation + finishing pass with a set of parameters, returning rallies that fall within the annotation window.
+
+    ``hits`` may be supplied when the caller already gated the raw candidates (e.g. the segmentation
+    stage, where the gate parameters are constant), avoiding a redundant re-gate for every combo.
+    """
+    if hits is None:
+        hits = _gated_hits(ctx, params)
     opt = RV.SegmentOptions(
         min_rally=float(params.min_rally_seconds),
         max_rally=float(params.max_rally_seconds),
@@ -226,14 +312,14 @@ def _predict(ctx: _Context, params: AnalysisParams) -> list[tuple[float, float]]
     intervals, trace = P._segment_rallies(
         ctx.fused, params, ctx.duration,
         player_motion=ctx.player_motion, player_coverage=ctx.player_coverage,
-        hits=ctx.hits, opt_override=opt)
+        hits=hits, opt_override=opt)
     method = str(trace.get("method") or "")
-    if ctx.hits is not None and getattr(ctx.hits, "times", np.zeros(0)).size:
+    if hits is not None and getattr(hits, "times", np.zeros(0)).size:
         intervals = RA.refine_with_hits(
-            intervals, ctx.hits, pre_roll=params.pre_roll, post_roll=params.post_roll,
+            intervals, hits, pre_roll=params.pre_roll, post_roll=params.post_roll,
             tail_seconds=params.hit_tail_seconds,
             trim_start=method != "player_motion")
-    intervals = RA.dedupe_overlaps(intervals, hits=ctx.hits, fps=ctx.fps,
+    intervals = RA.dedupe_overlaps(intervals, hits=hits, fps=ctx.fps,
                                    activity=ctx.fused.activity)
     intervals = [iv for iv in intervals if iv.end - iv.start >= params.min_rally_seconds]
     intervals.sort(key=lambda v: v.start)
@@ -242,59 +328,207 @@ def _predict(ctx: _Context, params: AnalysisParams) -> list[tuple[float, float]]
             if iv.end > ctx.lo and iv.start < ctx.hi]
 
 
-def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
-             focus: tuple[float, float] | None = None,
-             grid: list[tuple[str, list[float]]] | None = None,
-             iou_thr: float = 0.5) -> dict[str, Any]:
-    """在参数网格上搜 F1 最高的一组切分参数。
+def _predict_hit_times(ctx: _Context, params: AnalysisParams, hits=None) -> list[float]:
+    if hits is None:
+        hits = _gated_hits(ctx, params)
+    if hits is None or hits.times.size == 0:
+        return []
+    return [float(t) for t in hits.times]
 
-    Returns 一个字典：``baseline``（当前参数的指标）、``best``（最优参数）与
-    ``results``（每个组合的指标，按 F1 降序）。注意这**只是搜索**；要应用到
-    工程还需要把 ``best`` 写回 params 并 resegment。
-    """
-    gt = [(float(a), float(b)) for a, b in gt if b > a]
-    if not gt:
-        raise ValueError("标注为空，无法优化")
-    lo = float(focus[0]) if focus else min(a for a, _ in gt)
-    hi = float(focus[1]) if focus else max(b for _, b in gt)
-    ctx = _build_context(res, lo, hi)
-    base = res.params
-    grid = grid or SEARCH_GRID
 
+def _grid_search(ctx: _Context, gt: list[tuple[float, float]], base: AnalysisParams,
+                 grid: list[tuple[str, list[float]]], iou_thr: float,
+                 hit_labels: list[tuple[float, bool]] | None,
+                 fixed_hits=None) -> list[dict[str, Any]]:
     names = [n for n, _ in grid]
     out: list[dict[str, Any]] = []
     for combo in itertools.product(*[vals for _, vals in grid]):
         patch = dict(zip(names, combo))
         params = base.model_copy(update=patch)
         try:
-            preds = _predict(ctx, params)
-        except Exception as e:  # noqa: BLE001
+            preds = _predict(ctx, params, hits=fixed_hits)
+        except Exception:  # noqa: BLE001
             continue
         m = metrics(preds, gt, iou_thr)
         m["params"] = {k: float(v) for k, v in patch.items()}
+        if hit_labels:
+            m["hit"] = hit_metrics(_predict_hit_times(ctx, params, hits=fixed_hits), hit_labels)
         out.append(m)
+    return out
+
+
+def _pick_best(results: list[dict[str, Any]], hit_labels: bool) -> dict[str, Any] | None:
+    if not results:
+        return None
+    if hit_labels:
+        results = sorted(
+            results,
+            key=lambda m: ((m.get("hit") or {}).get("f1", 0.0),
+                           (m.get("hit") or {}).get("recall", 0.0),
+                           m.get("f1", 0.0)),
+            reverse=True)
+    else:
+        results = sorted(results,
+                         key=lambda m: (m["f1"], m["recall"], m["precision"]),
+                         reverse=True)
+    return results[0]
+
+
+#: Gate-parameter grid (stage B). The "cross-court suppression threshold" is the quantity most worth
+#: calibrating from annotations: too low keeps neighboring-court sounds (rallies get glued / extended),
+#: too high drops real hits.
+GATE_GRID: list[tuple[str, list[float]]] = [
+    ("pose_gate_threshold", [0.12, 0.18, 0.22, 0.28, 0.35, 0.45]),
+]
+
+#: Hit-detection sensitivity grid (stage C). Requires the cached audio via ``sensitivity_fn``.
+SENS_GRID: list[tuple[str, list[float]]] = [
+    ("hit_sensitivity", [0.3, 0.4, 0.5, 0.65, 0.8]),
+]
+
+
+def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
+             focus: tuple[float, float] | None = None,
+             grid: list[tuple[str, list[float]]] | None = None,
+             iou_thr: float = 0.5,
+             hit_labels: list[tuple[float, bool]] | None = None,
+             sensitivity_fn=None) -> dict[str, Any]:
+    """Search for segmentation / gate / hit-sensitivity parameters with the highest F1.
+
+    Staged coordinate descent (avoids the combinatorial explosion of a joint grid):
+
+    * **stage A — segmentation**: the quiet-valley scales + minimum rally length (rally IoU F1);
+    * **stage B — hit attribution gate**: ``pose_gate_threshold``, scored by hit-level F1 when
+      ``hit_labels`` are given, otherwise by rally F1 (re-gating from the raw candidates);
+    * **stage C — hit sensitivity**: ``hit_sensitivity`` via ``sensitivity_fn(sensitivity)`` which
+      re-detects hits from the cached audio; only meaningful with ``hit_labels``.
+
+    Returns a dict with ``baseline``, ``best`` (combined parameters), ``results`` and per-stage
+    ``stages``. This is **only a search**; applying it still requires writing ``best`` back into params
+    and resegmenting.
+    """
+    gt = [(float(a), float(b)) for a, b in gt if b > a]
+    if not gt:
+        raise ValueError(tr("analysis.annotation.empty_gt"))
+    hit_labels = [(float(t), bool(o)) for t, o in (hit_labels or [])]
+    lo = float(focus[0]) if focus else min(a for a, _ in gt)
+    hi = float(focus[1]) if focus else max(b for _, b in gt)
+    ctx = _build_context(res, lo, hi)
+    base = res.params
+    grid = grid or SEARCH_GRID
 
     baseline_preds = _predict(ctx, base)
     baseline = metrics(baseline_preds, gt, iou_thr)
-    baseline["params"] = {n: float(getattr(base, n)) for n in names}
+    baseline["params"] = {n: float(getattr(base, n)) for n, _ in grid}
+    if hit_labels:
+        baseline["hit"] = hit_metrics(_predict_hit_times(ctx, base), hit_labels)
 
-    # F1 相同再比召回 / 精度，避免选出一组「只是切得少」的参数
+    out: list[dict[str, Any]] = []
+    stages: dict[str, Any] = {}
+
+    # ---- Stage A: segmentation structure (gate fixed -> gate once, reuse across combos)
+    hits_a = _gated_hits(ctx, base)
+    res_a = _grid_search(ctx, gt, base, grid, iou_thr, hit_labels, fixed_hits=hits_a)
+    out.extend(res_a)
+    best_a = _pick_best(res_a, hit_labels=False)
+    params_a = base
+    if best_a is not None:
+        params_a = base.model_copy(update=best_a["params"])
+    stages["segment"] = {
+        "search_fields": [n for n, _ in grid],
+        "tried": len(res_a),
+        "best": best_a,
+    }
+
+    # ---- Stage B: hit attribution gate (needs candidate hits + pose)
+    params_b = params_a
+    stage_b_best = None
+    if ctx.pose is not None and ctx.hits_raw is not None \
+            and getattr(ctx.hits_raw, "times", np.zeros(0)).size:
+        res_b = _grid_search(ctx, gt, params_a, GATE_GRID, iou_thr, hit_labels)
+        out.extend(res_b)
+        stage_b_best = _pick_best(res_b, hit_labels=bool(hit_labels))
+        if stage_b_best is not None:
+            # Only accept the gate change when it actually improves the chosen objective.
+            base_key = "hit" if hit_labels else None
+            if base_key:
+                cur = (baseline.get("hit") or {}).get("f1", 0.0)
+                new = (stage_b_best.get("hit") or {}).get("f1", 0.0)
+                if new >= cur:
+                    params_b = params_a.model_copy(update=stage_b_best["params"])
+            else:
+                if stage_b_best["f1"] >= (best_a["f1"] if best_a else baseline["f1"]):
+                    params_b = params_a.model_copy(update=stage_b_best["params"])
+        stages["gate"] = {
+            "search_fields": [n for n, _ in GATE_GRID],
+            "tried": len(res_b),
+            "best": stage_b_best,
+        }
+
+    # ---- Stage C: hit sensitivity (needs cached audio to re-detect)
+    params_c = params_b
+    if sensitivity_fn is not None and hit_labels:
+        res_c: list[dict[str, Any]] = []
+        for _n, vals in SENS_GRID:
+            for sens in vals:
+                patch = {"hit_sensitivity": float(sens)}
+                try:
+                    raw = sensitivity_fn(float(sens))
+                except Exception:  # noqa: BLE001
+                    continue
+                if raw is None:
+                    continue
+                cctx = replace(ctx, hits_raw=raw, has_raw=True)
+                p = params_b.model_copy(update=patch)
+                try:
+                    preds = _predict(cctx, p)
+                except Exception:  # noqa: BLE001
+                    continue
+                m = metrics(preds, gt, iou_thr)
+                m["params"] = patch
+                m["hit"] = hit_metrics(_predict_hit_times(cctx, p), hit_labels)
+                res_c.append(m)
+                out.append(m)
+        best_c = _pick_best(res_c, hit_labels=True)
+        if best_c is not None:
+            cur = ((baseline.get("hit") or {}).get("f1", 0.0)
+                   if not stage_b_best else (stage_b_best.get("hit") or {}).get("f1", 0.0))
+            if (best_c.get("hit") or {}).get("f1", 0.0) >= cur:
+                params_c = params_b.model_copy(update=best_c["params"])
+        stages["sensitivity"] = {
+            "search_fields": [n for n, _ in SENS_GRID],
+            "tried": len(res_c),
+            "best": best_c,
+        }
+
+    # Combined best parameters re-evaluated end to end.
+    final_preds = _predict(ctx, params_c)
+    best = metrics(final_preds, gt, iou_thr)
+    patch_names = ("seg_prominence", "seg_min_core", "seg_min_rest", "seg_min_quiet",
+                   "min_rally_seconds", "pose_gate_threshold", "hit_sensitivity")
+    best["params"] = {n: float(getattr(params_c, n)) for n in patch_names
+                      if hasattr(params_c, n)}
+    if hit_labels:
+        best["hit"] = hit_metrics(_predict_hit_times(ctx, params_c), hit_labels)
+
     out.sort(key=lambda m: (m["f1"], m["recall"], m["precision"]), reverse=True)
     return {
         "gt_count": len(gt),
         "focus": [lo, hi],
         "iou_threshold": iou_thr,
         "baseline": baseline,
-        "best": out[0] if out else None,
+        "best": best,
         "results": out[:40],
         "tried": len(out),
-        "search_fields": names,
+        "search_fields": [n for n, _ in grid],
+        "stages": stages,
+        "hit_label_count": len(hit_labels),
     }
 
 
-# ------------------------------------------------------------------ 建议（默认值）
+# ------------------------------------------------------------------ Suggestions (defaults)
 
-#: 从标注里能算出来的、不依赖搜参的客观建议，用来解释「为什么这些参数更合适」。
+#: Objective suggestions computable from the annotations that do not depend on parameter search, used to explain "why these parameters are more suitable".
 def suggest(gt: list[tuple[float, float]]) -> dict[str, float]:
     gt = [(float(a), float(b)) for a, b in gt if b > a]
     if not gt:

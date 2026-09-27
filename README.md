@@ -1,843 +1,1049 @@
-# 羽毛球智能剪辑台 · Badminton Studio
+# Badminton Studio
 
-Windows 端的羽毛球视频 AI 自动剪辑软件。导入一段球馆录像，它会**自动剔除捡球、走动、
-擦汗等无效片段**，把每个回合单独切出来，对每个回合**打分**并支持**按分数筛选**，
-最后按你选中的回合**一键成片**导出。
+An AI-powered automatic editor for badminton videos on Windows. Import a recording from the court and it
+**automatically drops the dead time** (fetching shuttles, walking around, towel breaks), cuts out each rally
+separately, **scores** every rally, supports **filtering by score**, and renders a final cut from the rallies
+you selected.
 
-界面是本地网页应用（深色玻璃拟态 + 动效），AI 全部在本机跑，视频不会上传。
-
----
-
-## 目录
-
-- [它解决什么](#它解决什么)
-- [快速开始](#快速开始)
-- [界面导览](#界面导览)
-- [AI 分析是怎么做的](#ai-分析是怎么做的)
-- [回合评分规则](#回合评分规则)
-- [剪辑与导出](#剪辑与导出)
-- [命令行工具](#命令行工具)
-- [工程结构](#工程结构)
-- [常见问题](#常见问题)
+The UI is a local web app (dark glassmorphism with animations). All AI runs on your own machine; videos are
+never uploaded.
 
 ---
 
-## 它解决什么
+## Table of contents
 
-打一场球录两小时，真正有内容的回合可能只有二十分钟。手工挑片段极其费时。
-本软件把这件事自动化：
+- [What it solves](#what-it-solves)
+- [Quick start](#quick-start)
+- [UI tour](#ui-tour)
+- [How the AI analysis works](#how-the-ai-analysis-works)
+- [Rally scoring](#rally-scoring)
+- [Annotation and annotation-driven tuning](#annotation-and-annotation-driven-tuning)
+- [Scene presets](#scene-presets)
+- [Editing and exporting](#editing-and-exporting)
+- [Command-line tools](#command-line-tools)
+- [Project layout](#project-layout)
+- [FAQ](#faq)
+- [Measured performance](#measured-performance)
+- [Supported camera setups](#supported-camera-setups)
+- [Tests](#tests)
+- [Known limitations](#known-limitations)
 
-| 需求 | 实现 |
+---
+
+## What it solves
+
+A two-hour session may only contain twenty minutes of actual rallies, and picking them out by hand is
+extremely time-consuming. This app automates it:
+
+| Need | Implementation |
 | --- | --- |
-| 自动去掉无用片段 | 多模态活跃度检测（球员跑动 + 画面运动 + 击球声 + 羽毛球轨迹） |
-| 只保留接发球片段 | 每个回合都定位到「发球 → 接发球 → …」的逐拍时刻 |
-| 每个回合单独剪出来 | 回合列表 + 一键生成时间线，每回合一个片段 |
-| 按质量评分 | 长度 / 强度 / 技术 / 精彩度 / 画面质量 五维评分 + 总分 |
-| 筛选高评分片段 | 评分区间、时长、拍数、标签、星标多条件筛选 + 一键保留前 N% |
-| 常规剪辑 | 多轨时间线：拖拽、裁剪、分割、变速、吸附、撤销重做 |
-| 成品发布 | 横屏 / 竖屏 / 方形预设；竖屏自动跟随球员裁切；NVENC 硬件编码 |
+| Remove dead time automatically | Multimodal activity detection (player movement + frame motion + hit sounds + shuttle trajectory) |
+| Keep only real rallies | Every rally is located beat-by-beat as "serve → receive → …" |
+| Cut each rally separately | Rally list + one-click timeline generation, one clip per rally |
+| Score by quality | Five dimensions — length / intensity / technique / excitement / picture quality — plus a total |
+| Filter high-scoring clips | Score range, duration, shot count, tags, star rating; multi-criteria filter + "keep top N%" |
+| Media management | Multi-select bulk remove (removes from the project only, never touches the files on disk) |
+| Everyday editing | Multi-track timeline: drag, trim, split, speed change, snapping, undo/redo |
+| Reuse tuning for the same scene | Save "segmentation params + court calibration + preview frame" as a scene preset, then pick one by its screenshot |
+| Publish the result | Landscape / portrait / square presets; portrait auto-follows the players; NVENC hardware encoding |
 
 ---
 
-## 快速开始
+## Quick start
 
-### 环境要求
+### Requirements
 
 - Windows 10 / 11
-- Python 3.11+（本项目在 3.14 上验证）
-- Node.js 18+（只在需要构建前端时用到）
-- 可选：NVIDIA 显卡（有 NVENC 会让导出快 5～10 倍；分析也能用 CUDA 加速）
-- FFmpeg：**不需要手动安装**，`imageio-ffmpeg` 会带一个静态构建；
-  也可以用环境变量 `BMS_FFMPEG` 指向你自己的 ffmpeg.exe
+- Python 3.11+ (this project is verified on 3.14)
+- Node.js 18+ (only needed to build the frontend)
+- Optional: an NVIDIA GPU (NVENC makes export 5–10× faster; analysis can also use CUDA)
+- FFmpeg: **no manual install required** — `imageio-ffmpeg` ships a static build. You can also point
+  `BMS_FFMPEG` at your own `ffmpeg.exe`.
 
-### 安装
+### Install
 
 ```powershell
 cd D:\Projects\BadmintonStudio
 
-# 1) 创建虚拟环境（--system-site-packages 是为了复用已装好的 torch）
+# 1) Create the virtual environment (--system-site-packages reuses an existing torch install)
 python -m venv --system-site-packages .venv
 
-# 2) 安装后端依赖
+# 2) Install backend dependencies
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 3) 构建前端（只需一次；改了前端代码要重新构建）
+# 3) Build the frontend (once; rebuild after changing frontend code)
 cd frontend
 npm install
 npm run build
 cd ..
 ```
 
-> 如果机器上没有 `torch`，请先按 [pytorch.org](https://pytorch.org) 的指引装一个 CUDA 版本，
-> 否则球员检测会退回 CPU，速度会慢很多。
+> If `torch` is not installed on the machine, install a CUDA build following the instructions at
+> [pytorch.org](https://pytorch.org) first, otherwise player detection falls back to CPU and is much slower.
 
-### 启动
+### Model weights
 
-双击 **`启动.cmd`** 即可。它会：
+Model weights are **not committed to the repository** (they are large binaries). They are obtained
+automatically or with a small script:
 
-1. 在后台线程里启动本地服务（自动挑一个空闲端口）
-2. 用 pywebview 打开一个原生窗口（没装 pywebview 就用系统浏览器）
+- **YOLO player/pose weights** (`yolo11n.pt`, `yolo11n-pose.pt`): detected in this order — explicit path →
+  `models/` → project root → otherwise `ultralytics` downloads them into `models/` on first use. To keep a
+  machine offline, place the two `.pt` files in `models/` yourself (they are ~5.6 MB and ~6.2 MB).
+- **faster-whisper speech model** (optional, for voice-command scoring): pre-fetch it with:
 
-也可以手动启动：
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\fetch_speech_model.py            # medium (default)
+  .\.venv\Scripts\python.exe scripts\fetch_speech_model.py --size small
+  ```
+
+  It downloads `Systran/faster-whisper-<size>` into `models/faster-whisper-<size>/` (medium is ~1.5 GB).
+  If you skip this step, faster-whisper downloads the model from HuggingFace on first use. The analysis
+  finds a local model automatically, or you can point `BMS_SPEECH_MODEL` at a directory / size / repo id.
+
+`models/*.pt`, `models/*.onnx` and `models/faster-whisper-*` are git-ignored.
+
+### Run
+
+Double-click **`start.cmd`**. It will:
+
+1. start the local service in a background thread (picking a free port automatically);
+2. open a native window with pywebview (or fall back to the system browser if pywebview is missing).
+
+You can also start it manually:
 
 ```powershell
 $env:PYTHONPATH="D:\Projects\BadmintonStudio\backend"
 .\.venv\Scripts\python.exe -m uvicorn bms.main:app --host 127.0.0.1 --port 8000
-# 然后打开 http://127.0.0.1:8000
+# then open http://127.0.0.1:8000
 ```
 
-想要原生桌面窗口：
+For a native desktop window:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pywebview
 .\.venv\Scripts\python.exe desktop\app.py
 ```
 
-### 开发模式（前后端热更新）
+### Development mode (frontend/backend hot reload)
 
 ```powershell
 pwsh -File scripts\dev.ps1
-# 前端 http://127.0.0.1:5273  后端 http://127.0.0.1:8000
+# frontend http://127.0.0.1:5273  backend http://127.0.0.1:8000
 ```
 
 ---
 
-## 界面导览
+## UI tour
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 标题栏：GPU 状态 · 任务队列 · 工程名                                  │
+│ Title bar: GPU status · job queue · project name                    │
 ├──────┬──────────────────────────────────────────┬───────────────────┤
-│ 导航 │  动作条：AI 分析 / 导出 / 路径            │                   │
-│ 工程库├──────────────────────────────────────────┤    检查器          │
-│ 剪辑台│            预览播放器                     │   · 回合评分明细   │
-│ 导出 │  源片 / 成片预览 · 逐帧 · 变速 · 回合循环   │   · 逐拍时间轴     │
-│ 设置 │──────────────────────────────────────────┤   · 剪辑区间       │
-│      │  时间线：源片回合标记带 + 视频轨 + 播放头   │   · AI 信号曲线    │
+│ Nav  │  Action bar: AI analysis / export         │                   │
+│ 库   ├──────────────────────────────────────────┤    Inspector      │
+│ 台   │            Preview player                 │   · rally scores  │
+│ 出   │  source / cut preview · frame step ·      │   · per-shot      │
+│ 置   │  speed · rally loop                       │     timeline      │
+│ 注   ├──────────────────────────────────────────┤   · clip range    │
+│      │  Timeline: source rally band + video      │   · AI signals    │
+│      │  track + playhead                         │                   │
 ├──────┴──────────────────────────────────────────┴───────────────────┤
-│ 左侧：回合列表（评分筛选 / 排序 / 批量） 或 素材列表                   │
+│ Left: rally list (score filter / sort / bulk) or media list          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 快捷键
+The navigation rail has five pages: **Library**, **Studio**, **Annotate**, **Exports**, **Settings**.
 
-| 按键 | 作用 |
+### Keyboard shortcuts
+
+| Key | Action |
 | --- | --- |
-| `空格` | 播放 / 暂停 |
-| `←` / `→` | 后退 / 前进一帧（按住 `Shift` 为 5 秒） |
-| `Home` | 跳到开头 |
-| `S` | 在播放头处分割选中片段 |
-| `Delete` | 删除选中片段 |
-| `Ctrl+Z` / `Ctrl+Y` | 撤销 / 重做 |
-| `Ctrl+滚轮` | 时间线缩放 |
-| 双击回合标记带 | 把该回合加入时间线 |
-| 右键片段 | 分割 / 慢放 / 快放 / 删除 |
+| `Space` | Play / pause |
+| `←` / `→` | Step back / forward one frame (hold `Shift` for 5 seconds) |
+| `Home` | Jump to the beginning |
+| `S` | Split the selected clip at the playhead |
+| `Delete` | Delete the selected clip |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+wheel` | Zoom the timeline |
+| Double-click a rally band | Add that rally to the timeline |
+| Right-click a clip | Split / slow down / speed up / delete |
+
+Shortcuts only apply on the Studio page, so they never silently edit the timeline while you are annotating.
 
 ---
 
-## AI 分析是怎么做的
+## How the AI analysis works
 
-分析流程在 `backend/bms/analysis/`，四路互补信号各自独立，缺一路会自动降权，不会整体失败。
+The pipeline lives in `backend/bms/analysis/`. Four complementary signals run independently; if one is
+missing it is down-weighted rather than failing the whole run.
 
-### 1. 音频击球检测（`audio_hits.py`）
+### 1. Audio hit detection (`audio_hits.py`)
 
-羽毛球回合的本质是「一串球拍击球声」。球拍触球在中高频段（约 2–8 kHz）表现为
-极短（< 15 ms）的宽带瞬态，用 **高频带谱通量 + 自适应阈值 + 峰值拾取** 检测：
+A badminton rally is essentially "a string of racket impacts". A racket touch shows up as a very short
+(< 15 ms) broadband transient in the mid/high band (about 2–8 kHz), detected with **high-band spectral flux +
+adaptive threshold + peak picking**:
 
-- STFT 后取 1800–7800 Hz 频带的正向谱通量
-- 用「谱平坦度」加权——击球是噪声型瞬态，而音乐/人声是窄带，会被压低
-- 阈值 = 长窗中位数 + k × MAD，鲁棒且自适应
-- 用低频带（80–900 Hz）能量反向惩罚环境噪声、脚步、喊叫
-- 峰值时刻再向原始包络的上升沿做亚帧对齐，保证时刻精确
+- STFT, then positive spectral flux in the 1800–7800 Hz band
+- Weighted by **spectral flatness** — an impact is a noise-like transient, while music/speech is narrowband and gets suppressed
+- Threshold = long-window median + k × MAD, robust and adaptive
+- Low-band energy (80–900 Hz) is used to penalize ambient noise, footsteps and shouting
+- Peaks are then aligned sub-frame to the rising edge of the raw envelope for accuracy
 
-**可信度门控**：多球场球馆 + 相机 AGC 会让「击球声」在整条时间轴上均匀出现，
-这种信号不含回合信息。模块会计算：
+**Reliability gating**: a multi-court venue plus camera AGC makes "hit sounds" appear uniformly across the
+whole timeline, which carries no rally information. The module computes:
 
-- 覆盖率（2 秒格内有击球的比例）——真实比赛通常 0.25–0.55，> 0.86 判为噪声
-- 平均触球率——现实上限约 2.5 次/秒，> 3.2 判为噪声
-- 爆发度（相邻间隔 < 0.35 s 的占比）——真实回合里很高
+- Coverage (fraction of 2-second bins containing a hit) — real matches are usually 0.25–0.55; > 0.86 is treated as noise
+- Average touch rate — the realistic ceiling is about 2.5 hits/s; > 3.2 is treated as noise
+- Burstiness (fraction of adjacent gaps < 0.35 s) — high in real rallies
 
-三者相乘得到 `audio_reliability`，直接乘到音频那一路的融合权重上。
-在实测的嘈杂球馆素材里，这个系数会把它从 0.95 压到 0.03，避免把整段粘成一个回合。
+The product is `audio_reliability`, multiplied directly into the audio fusion weight. On the noisy venue
+footage tested, this coefficient pushed the weight from 0.95 down to 0.03, preventing the whole clip from
+being glued into a single rally.
 
-### 2. 画面运动分析（`motion.py`）
+### 2. Visual motion analysis (`motion.py`)
 
-在低分辨率灰度图上做，速度极快（5 分钟素材约 10 秒）：
+Runs on low-resolution grayscale frames and is very fast (about 10 s for 5 minutes of footage):
 
-- 帧间绝对差 → 运动能量
-- 时间累积的**活动热区图** → 自动估计场地大致范围
-- `phaseCorrelate` 估全局位移 → 手持抖动 / 摇镜
-- Laplacian 方差 → 清晰度（用于画面质量分）
-- 直方图差异 → 场景切换检测
+- Frame-to-frame absolute difference → motion energy
+- Time-accumulated **activity heatmap** → rough automatic court estimate
+- `phaseCorrelate` for global displacement → handheld shake / panning
+- Laplacian variance → sharpness (used for the picture-quality score)
+- Histogram difference → scene-cut detection
 
-### 3. 球员检测与跟踪（`players.py`）
+### 3. Player detection and tracking (`players.py`)
 
-用 **YOLO** 逐帧检测人体，再用自研的多目标跟踪器串成轨迹：
+Uses **YOLO** to detect people on sampled frames in batches, then **ByteTrack** (the implementation built
+into `ultralytics`) to join them into tracks:
 
-- 归一化 IoU + 中心距离构造代价矩阵，`scipy` 匈牙利算法求解
-- 对每个轨迹做**匀速外推**预测后再匹配，快速跑动时不容易断
-- 允许丢失若干帧后重连
+- A Kalman motion model predicts track positions; `lap` solves the association
+- **Two-stage high/low-score association**: when occluded, low-score boxes reconnect the track, reducing
+  one player being split into two tracks
+- An adapter drives the tracker frame-by-frame over sampled frames while keeping the original batched GPU
+  inference (not per-frame `model.track()`)
 
-然后按「框面积大 + 移动快 + 长期在场上」挑出**真正的比赛球员**
-（背景观众和隔壁场地的人框小、基本不动，会被排除）。
+It then selects the **actual match players** by "large box + fast movement + present for a long time"
+(spectators and people on adjacent courts have small boxes and barely move, so they are excluded).
 
-输出逐帧的「场上活跃人数」「平均速度」「最大速度」，这是最可靠的回合信号。
+The output is per-frame "number of active players on court", "average speed" and "maximum speed" — the most
+reliable rally signal.
 
-### 4. 羽毛球轨迹跟踪（`shuttle.py`）—— 默认关闭，按需开启
+### 4. Shuttle tracking (`shuttle.py`) — off by default, enable on demand
 
-相机固定，所以可以放心用**时序中值背景建模**：
+Because the camera is static, **temporal median background modeling** is safe:
 
-- `|帧 − 前后 K 帧中值|` 得到前景，用 `W = min(R,G,B)`（白色度）而不是灰度，
-  在绿场地上找白点的信噪比高得多
-- 面积 + 形态学 + **周围一圈背景必须是绿场地**（这个场地先验必须用在
-  *候选点周围* 而不是候选点自身——球本身是白的，用「自己偏绿」会把真目标先排除掉）
-- 速度门控（羽毛球是全场最快的物体）
-- 帧间关联成轨迹，再用**抛物线拟合**剔除随机噪声；额外要求拟合出的
-  **加速度不低于重力下限**——球受重力必然被「弯」过，而走动的人只会产生匀速直线
+- `|frame − median of K frames before/after|` gives the foreground; use `W = min(R,G,B)` (whiteness) instead
+  of grayscale, which has a much better signal-to-noise ratio for a white dot on a green court
+- Area + morphology + **the surrounding ring must be green court**. This court prior must be applied
+  *around* the candidate, not to the candidate itself — the shuttle is white, so requiring "itself is
+  greenish" would rule out the real target
+- Speed gating (the shuttle is the fastest object on court)
+- Frame-to-frame association into trajectories, then **parabolic fitting** to reject random noise; the fitted
+  **acceleration must not be below a gravity floor** — a shuttle is necessarily "bent" by gravity, while a
+  walking person only produces constant-velocity straight lines
 
-**为什么默认关闭**：计算量与「帧数 × 像素数 × 时间窗」成正比，30 分钟 4K 素材
-需要小时级。打开后可以设一个**时间预算**控制总耗时；如果覆盖不足 60% 的时间轴，
-这一路信号会被自动忽略（只分析一段会把融合权重带偏）。
+**Why it is off by default**: cost grows with "frames × pixels × time window", so a 30-minute 4K clip takes
+hours. When enabled you can set a **time budget** to cap the total cost; if it covers less than 60% of the
+timeline the signal is ignored (analyzing only part of the clip would skew the fusion weights).
 
-实测说明：在 960×540 代理上，羽毛球只有 2～5 像素，与远场白鞋在亮度上不可分，
-所以默认灵敏度下会诚实地返回「0 条轨迹」而不是给噪声。这一路要发挥价值需要
-更高分辨率的素材（球有 8～20 px 时白度能和白鞋重新分开）。
+Measured note: on a 960×540 proxy the shuttle is only 2–5 pixels and is not separable in brightness from
+distant white shoes, so at the default sensitivity it honestly returns "0 trajectories" instead of noise.
+This signal needs higher-resolution footage to be worthwhile (8–20 px, where whiteness separates again).
 
-### 5. 融合与切分（`rally.py` + `rally_vision.py`）
+### 5. Fusion and segmentation (`rally.py` + `rally_vision.py`)
 
-1. 每路信号先做**分位数鲁棒归一化**（5%–95%），避免量纲互相压制
-2. 按「双峰程度」和音频可信度**自适应算权重**
-3. 加权求和并平滑 → 逐帧活跃度曲线
-4. **切分**：优先用球员运动的「静默段」切（见下一节），
-   没有球员信号时才用活跃度曲线的谷值 / 旧的迟滞状态机
-5. **边界锚定**：用音频击球把边界钉死（见下一节）——先在击球序列的大空档处
-   把区间切开，再把终点锚到「最后一拍 + 死球余量」
-6. `thin_shots` 做**物理合理性筛选**：同一方两次击球间隔不可能小于 0.3 秒，
-   按强度贪心挑选保证间隔，剔除「每秒 4 拍」的噪声串
-7. `attribute_sides` 把发球/接发球落到具体球员：**画面里框更大的一定更靠近相机**，
-   据此分成 near / far，再看发球瞬间谁在动——刚挥拍那个就是发球方；
-   两人深度接近时分不出来，会保守地保持 `unknown`
+1. Each signal is first **quantile-robust normalized** (5%–95%) so units cannot dominate each other
+2. **Adaptive weights** are computed from bimodality and audio reliability
+3. Weighted sum + smoothing → a per-frame activity curve
+4. **Segmentation**: prefer cutting at "quiet segments" of player motion (next section); when no player
+   signal exists, fall back to valleys of the activity curve or the older hysteresis state machine
+5. **Boundary anchoring**: pin boundaries with the hit sequence (next section) — split intervals at large
+   gaps in the hit sequence, then anchor the end to "last hit + dead-ball tail"
+6. `thin_shots` applies **physical plausibility filtering**: the same side cannot hit twice less than 0.3 s
+   apart, so it greedily thins by strength and removes "4 shots per second" noise strings
+7. `attribute_sides` assigns serves/receives to specific players: **the larger box is nearer the camera**,
+   giving near/far; then see who is moving at the serve moment — the one who just swung is the server. When
+   the two depths are close it conservatively stays `unknown`
 
-### 回合终点为什么要「锚到最后一拍」
+### Why rally endpoints are "anchored to the last hit"
 
-一分的物理终点是**球落地**。可观测的替代物里最可靠的是**最后一拍**：
-一拍打出去之后球还要飞 0.4~1.2 秒才落地，所以
+The physical end of a point is **the shuttle landing**. The most reliable observable substitute is the
+**last hit**: after a shot the shuttle still flies for 0.4–1.2 s before landing, so
 
 ```
-终点 = 最后一拍 + hit_tail_seconds        （默认 0.9 秒）
-起点 = 第一拍   - pre_roll                 （默认 1.2 秒，发球准备）
+end   = last hit + hit_tail_seconds   (default 0.9 s)
+start = first hit − pre_roll          (default 1.2 s, serve preparation)
 ```
 
-旧代码在 `refine_with_hits` 里写的是 `iv.end = max(iv.end, last + tail)` ——
-**终点只能往后推、永远收不回来**。于是无论切分给出的区间有多长（实测有一个
-69.35 秒、72 拍的「回合」，里面其实有两三个回合），击球信息都无法把球落地
-之后那一段砍掉。这就是「一回合内包含球落地后很长时间」的直接原因。
+The old code in `refine_with_hits` wrote `iv.end = max(iv.end, last + tail)` — **the end could only be
+pushed later, never pulled back**. So no matter how long the interval produced by segmentation was (one
+measured "rally" was 69.35 s / 72 shots, actually containing two or three rallies), the hit information
+could not trim the segment after the shuttle landed. That is the direct cause of "a rally contains a long
+stretch after the shuttle lands".
 
-同样的道理，**「一回合里混进下一个回合」也不能靠「球员停没停下来」判断**：
-球员在捡球、走回接发球位置时一直在动，活跃度根本不塌。但**球有没有在被击打**
-是直接观测：一回合内拍间隔由球的飞行时间决定（实测 p80 = 1.19 秒、p99 = 3.25 秒），
-而两个回合之间隔着捡球 / 换发球，**没有任何人击球**的时间普遍 ≥4 秒。
-所以 `split_by_hit_gaps` 在击球序列的大空档处切开区间，并带两道护栏
-（两侧各至少 2 拍、各自撑得起一个回合），把「漏检了几拍」和「真的是两个回合」
-区分开。
+By the same logic, **"the next rally bleeding into this one" cannot be detected from whether the players
+stopped**: players keep moving while fetching shuttles and walking back to serve, so activity never
+collapses. But **whether the shuttle is being hit** is a direct observation: within a rally, hit spacing is
+determined by shuttle flight time (measured p80 = 1.19 s, p99 = 3.25 s), while between two rallies there is
+shuttle fetching / changing serve and **nobody hits anything** typically for ≥ 4 s. So `split_by_hit_gaps`
+splits intervals at large gaps in the hit sequence with two guardrails (at least 2 hits on each side, each
+side substantial enough to be a rally), separating "a few missed hits" from "genuinely two rallies".
 
-### 姿态辅助：判断每一记击球声是不是我们打的（`analysis/pose.py`）
+### Pose assist: deciding whether each hit sound is ours (`analysis/pose.py`)
 
-上面那套「锚到最后一拍」有一个前提：**击球序列是我们这场比赛的**。多球场球馆里
-这个前提不成立 —— 隔壁场地的击球声会把序列填密，于是既切不开该切的，
-也判不出「最后一拍之后没人打球了」。实测那段素材的 `audio_reliability = 0.04`，
-音频权重被压到 0.023，等于这一路完全不可用。
+The "anchor to the last hit" scheme has one premise: **the hit sequence belongs to our match**. In a
+multi-court venue this does not hold — hits from adjacent courts fill the sequence, so it neither cuts where
+it should nor detects that "nobody is playing after the last hit". The tested footage had
+`audio_reliability = 0.04`, pushing the audio weight to 0.023 — effectively unusable.
 
-姿态解决的正是这件事。它不是「更准的检测器」，而是**归属**的证据：
+Pose solves exactly this. It is not "a more accurate detector" but evidence of **attribution**:
 
-* 我们的球员只在真的击球时会挥拍；隔壁场地的击球声在我们的画面上**没有任何
-  对应的动作**。所以「这一拍是不是我们打的」第一次有了直接观测，而不再需要
-  靠音频的统计量去猜；
-* 一次挥拍只能解释一个击球 —— 这条「一对一」约束是门控有效的主要原因。
-  只取「窗口内的最大手腕速度」是没有区分度的（实测证据分中位数 0.72，
-  等于没筛），因为对拉时 1~1.5 秒就有一拍，±0.35 秒的窗口已经覆盖了半个
-  拍间隔。改成**先找挥拍峰、再让峰与击球一对一匹配**之后，证据分中位数
-  降到 0.00，保留比例落在 40%~45%，和「我们这场大约占所有击球声一半」
-  的直觉吻合。
+* Our players only swing when they actually hit; a hit sound from an adjacent court has **no corresponding
+  motion** in our frame. For the first time, "is this hit ours?" has a direct observation instead of a guess
+  from audio statistics.
+* One swing can only explain one hit — this one-to-one constraint is the main reason the gating works.
+  Taking only "maximum wrist speed within a window" has no discrimination (measured evidence median 0.72,
+  i.e. no filtering at all), because in a rally there is a hit every 1–1.5 s and a ±0.35 s window already
+  covers half a shot interval. After **finding swing peaks first and then matching peaks to hits
+  one-to-one**, the evidence median dropped to 0.00 and the retention ratio landed at 40%–45%, matching the
+  intuition that "our match is roughly half of all hit sounds".
 
-工程上的两个选择：
+Two engineering choices:
 
-* **不重新检测、不重新跟踪**，直接复用 `PlayerSignal.frame_boxes`。省一半算力，
-  更重要的是避免「两套跟踪结果对不上」这类最难查的 bug。
-* **把球员框裁出来放大到 192×192 再送姿态模型**。实测素材里球员只有约 100 像素高，
-  整帧直接跑关键点会飘（腕、肘先丢）；裁窗放大之后关键点稳定，而且顺带把
-  隔壁场地的人挡在窗外。窗口要**往上偏并留余量**，否则头顶击球时手腕跑出框外。
+* **No re-detection and no re-tracking** — reuse `PlayerSignal.frame_boxes`. This halves the compute and,
+  more importantly, avoids the hardest-to-debug class of bug: two tracking results disagreeing.
+* **Crop and upscale the player box to 192×192 before the pose model**. In the tested footage players are
+  only ~100 px tall, and full-frame keypoints drift (wrists and elbows are lost first); after cropping and
+  upscaling the keypoints are stable, and people on adjacent courts are kept out of the crop. The window is
+  shifted **upward with margin**, otherwise the wrist leaves the box on overhead shots.
 
-实测开销：姿态只对每帧的 2~4 个比赛球员跑，3080 上 90 秒素材 5.6 秒，
-**折合 30 分钟素材约 1.9 分钟**（约 +35% 分析时间），结果按「视频 + 球员框指纹」
-缓存，反复调切分参数不会重跑。
+Measured cost: pose runs only on the 2–4 match players per frame, 5.6 s for 90 s of footage on a 3080,
+**about 1.9 minutes for 30 minutes of footage** (~+35% analysis time). Results are cached by "video + player
+box fingerprint", so re-tuning segmentation parameters does not re-run it.
 
-**它一定会降级，而不是变成新的错误来源**：姿态覆盖率低于 35%、或者门控后保留
-比例落在 [12%, 97%] 之外（说明门限完全没起作用、或把大部分击球都判掉了）、
-没有 GPU、权重缺失 —— 任何一条命中就原样放行全部击球，行为与关掉这个开关完全一致。
-在「AI 分析」里可以用「姿态辅助（击球归属）」开关整体关掉。
+**It always degrades rather than becoming a new source of error**: pose coverage below 35%, or a post-gating
+retention ratio outside [12%, 97%] (meaning the threshold did nothing, or rejected most hits), or no GPU, or
+missing weights — any of these passes all hits through unchanged, identical to turning the switch off. The
+"AI analysis" dialog has a **Pose assist (hit attribution)** switch to disable it entirely.
 
-### 为什么原来的回合边界不准，以及现在怎么改的
+### Cross-court suppression is instant (`resegment` re-gates)
 
-旧版本的切分完全建立在**整帧融合活跃度**上。这条路在真实素材上是失效的，
-而且失效方式是原理性的：
+The gate used to be a one-shot decision buried in the full analysis: `hits` was overwritten in place and only
+the post-gate sequence was persisted, so changing the threshold — or even forcing the gate when its safety
+guard skipped it — required re-running the whole AI pipeline.
 
-1. **整帧运动里没有回合信息。** 球馆里同时有观众走动、隔壁场地的球、灯光变化，
-   它们让整帧运动能量在**任何**时刻都不低。于是活跃度曲线在回合之间根本塌不下去，
-   迟滞状态机永远不认为「这一段结束了」。实测 30 分钟素材只切出 8 个区间，
-   其中一个是 236 秒、一个是 138 秒。
-2. **1.2 秒的平滑把「停顿」抹平了。** 回合之间只有几秒静默，被 1.2 秒均值
-   一平滑、再和持续的背景运动相加，谷底就消失了。
-3. **于是「切分」变成了「均分」。** 超长区间落进 `_split_by_valley`，而它只在
-   区间比目标时长长一点点时也会在内部找最低点再切一刀。结果是 32 个回合
-   平均 20.1 秒、中位数 19.8 秒，且大量片段**首尾相接**（前一个的 `end`
-   正好等于后一个的 `start`）。真实比赛里不可能这样：得分之后必然有
-   捡球 / 换发球的停顿，两个回合之间**一定有间隔**。
-4. **球员信号在中段以外整段是空的。** 长视频里球员被遮挡 / 走出画面就会换
-   新 id（实测 30 分钟有 285 条轨迹），而「挑比赛球员」是**按全片统计量排名
-   取前 4 条**的 —— 结果 4 条很可能全部落在视频中段。`frame_boxes` 在其余
-   时段为空，`player_motion` 整段恒为 0（实测前 372 秒全 0），
-   「球员运动切分」这条路直接作废，覆盖率只有 0.48。
+Now the **pre-gate candidates** (`hit_times_raw`) and the **full-rate pose swing curve** (`pose_swing_full`)
+are persisted alongside the gated result. `pipeline.regate_hits(sig, params)` always starts from the raw
+candidates, so
 
-现在的做法（`analysis/rally_vision.py` + `analysis/rally.py`）：**用球员运动找停顿，
-再用击球序列钉死边界。**
+* the rally panel's **Cross-court suppression** slider re-runs the gate in milliseconds through
+  `resegment` (no player / motion / audio re-run), and repeated resegments are idempotent (never
+  double-filtered);
+* `pose_gate_force` overrides the retention-ratio safety band when the user explicitly wants to filter anyway;
+* the **Annotate** page's optimizer can search the gate threshold as a separate stage, scored by **hit-level
+  precision / recall** when hits are labeled "ours / neighbor", instead of only by rally IoU.
 
-回合的语义是「发球 → 对拉 → 死球 → 捡球/准备 → 下一次发球」。球员是唯一贯穿
-全过程的可靠观测对象：对拉时两名比赛球员都在持续快速移动，死球之后他们会停下来
-——**这个停顿是每个回合之间必然出现的**，而且隔壁场地的人不会制造它。
+Projects analyzed before this change have neither field; the **Rebuild hits** action re-runs only the cached
+audio detection (cheap STFT) and recovers the pose signal from `data/cache/pose/*.npz` when possible, so the
+slider becomes usable without a full re-analysis. The calibration can be saved into a **scene preset**
+(which now also carries the gate parameters and a small `fit` record) and reused across projects.
 
-- 从检测框序列算出「每一帧球员移动了多少」（`box_motion`，**按每名球员分别算、
-  再取最活跃的那个**，所以背景人员的走动不会污染信号）；
-- 在局部时间尺度上做**最低点 + 显著度**分析，把曲线切成「活跃段 / 静默段」交替。
-  显著度门限按 `(p95 - p20)` 的比例定，不用手调阈值，安静球馆和嘈杂球馆共用一套参数；
-- **用静默段定义边界**：起点 = 停顿结束后第一次明显移动，终点 = 下一次停顿前的
-  最后一次明显移动。这样得到的区间就是「球在飞」的时间窗，不含捡球的走动；
-- 「挑比赛球员」改成**逐时间窗**判定（`_select_active_players_windowed`），
-  每个窗口只拿与自己有时间重叠的轨迹去排名，再把各窗结果取并集。这样球员
-  在哪一段被重新分配了新 id 都不影响那一段有信号；
-- 再用**击球序列**做终极修正：大空档处切开、终点锚到最后一拍（见上一节）；
-- 羽毛球信号可用时再做一次校验：核心区间里几乎看不到球 → 这段其实是捡球 / 换场。
+### Why the old rally boundaries were wrong, and what changed
 
-**自适应降级**：球员检测失败（球员太小、非比赛素材）时自动退回活跃度谷值切分
-（`segment_activity`）——它同样只承认显著度足够的谷，也不做机械等分；
-两种都拿不出结果时才退回旧的迟滞状态机，行为与旧版完全一致。
-在「AI 分析 → 机位与场地 → 切分依据」里可以固定用某一种，或者设为「两者对比择优」。
-**边界锚定在所有路径上都会执行**（包括快速重切分），因为它是纯逻辑，不需要重跑 AI。
+The old segmentation was built entirely on **full-frame fused activity**. That approach fails on real
+footage, and it fails for a fundamental reason:
 
-「两者对比择优」（`auto`）是**按时间窗**做的（`_merge_by_availability`），每一窗
-只信一边：球员检测有效的窗里球员切分说了算；检测无效的窗里用活跃度。这里有一种
-容易写错、而且错了很难发现的情况 —— **球员检测有效、但球员切分没给候选**：
+1. **Full-frame motion carries no rally information.** Spectators walking, adjacent-court play and lighting
+   changes keep full-frame motion energy high at **all** times. The activity curve therefore never collapses
+   between rallies, and the hysteresis state machine never decides "this segment ended". On 30 minutes of
+   measured footage it produced only 8 intervals, one 236 s and one 138 s long.
+2. **1.2 s of smoothing erases the pauses.** There are only a few seconds of silence between rallies; after
+   a 1.2 s moving average and adding persistent background motion, the valleys disappear.
+3. **So "segmentation" became "even splitting".** Overlong intervals fell into `_split_by_valley`, which
+   cuts at the lowest internal point even when the interval is only slightly longer than the target. The
+   result was 32 rallies averaging 20.1 s (median 19.8 s), with many segments **butting end-to-end** (one
+   `end` exactly equal to the next `start`). This cannot happen in a real match: after a point there is
+   always a pause to fetch the shuttle / change serve, so **there is always a gap** between rallies.
+4. **The player signal was empty outside the middle.** In long videos, players change id whenever they are
+   occluded or leave the frame (285 tracks in a 30-minute clip), while "select match players" ranked **the
+   top 4 tracks by whole-clip statistics** — so all 4 could fall in the middle of the video. `frame_boxes`
+   was empty elsewhere and `player_motion` was a constant 0 (measured: the first 372 s were all 0). The
+   "player-motion segmentation" path was dead, with coverage of only 0.48.
 
-* 如果球员**没动**，那是真正的停顿（两个回合之间捡球 / 换发球），必须留空。
-  旧代码在这种情况下会退回活跃度候选，把停顿填上，球员切分好不容易切开的
-  回合立刻被粘回去（实测最长回合多出 6 秒）；
-* 如果球员**在动**，那是球员切分的漏检（它对「移动占空比 / 核心片段长度」有门限，
-  混合片段容易被整个丢掉），必须用活跃度兜住，否则整段回合消失
-  （实测召回率掉 6 个百分点）。
+The current approach (`analysis/rally_vision.py` + `analysis/rally.py`): **find pauses with player motion,
+then pin the boundaries with the hit sequence.**
 
-判断用的是球员运动曲线本身，门限和 `segment_by_player_motion` 一致
-（静息地板 + 25% 动态范围）。
+A rally means "serve → rally → dead ball → fetch/prepare → next serve". Players are the only reliable
+observation spanning the whole process: during a rally both match players move fast continuously, and after
+the dead ball they stop — **this pause necessarily appears between rallies**, and people on adjacent courts
+do not create it.
 
-### 关于不同素材的适配
+- Compute "how much each player moved this frame" from the detection boxes (`box_motion`, **per player,
+  then take the most active one**, so background movement does not pollute the signal).
+- On a local time scale, run a **minimum + prominence** analysis to split the curve into alternating
+  "active / quiet" segments. The prominence threshold is defined as a ratio of `(p95 − p20)`, so quiet and
+  noisy venues share one parameter set without hand tuning.
+- **Define boundaries with quiet segments**: start = the first clear movement after a pause ends; end = the
+  last clear movement before the next pause. The resulting interval is exactly "the time the shuttle was in
+  play", without fetching-shuttle walking.
+- "Select match players" becomes **per time window** (`_select_active_players_windowed`): each window ranks
+  only the tracks overlapping it, then the per-window results are unioned. Reassigning a player a new id in
+  one stretch no longer removes the signal there.
+- Then the **hit sequence** does the final correction: split at large gaps and anchor the end to the last
+  hit (previous section).
+- When the shuttle signal is available, one more check: if almost no shuttle is seen in the core interval,
+  it was actually fetching/changing ends.
 
-不同录制条件差异很大，所以每一路信号都会自己算可信度，权重是动态的：
+**Adaptive degradation**: when player detection fails (players too small, non-match footage) it falls back
+to activity-valley segmentation (`segment_activity`) — which also only accepts sufficiently prominent
+valleys and never splits mechanically; only if both fail does it fall back to the old hysteresis state
+machine, matching the old behavior exactly. Under "AI analysis → Camera & court → Segmentation basis" you can
+pin one method or choose "compare and pick the best". **Boundary anchoring runs on every path** (including
+fast resegmentation) because it is pure logic and does not need to re-run AI.
 
-- **安静的球馆 + 清楚的击球声** → 音频权重高，切分非常准
-- **嘈杂多球场 + 相机 AGC**（比如实测的那段 GoPro 素材）→ 音频权重被压到接近 0，
-  改由球员运动主导
-- **画面里球员很小 / 检不到** → 自动退回运动 + 音频
+"Compare and pick the best" (`auto`) works **per time window** (`_merge_by_availability`), trusting one side
+per window: windows with valid player detection follow player segmentation; invalid windows use activity.
+There is one easy-to-miswrite and hard-to-notice case — **player detection valid but player segmentation
+yields no candidate**:
 
-### 回合切不干净怎么办：即时重切分
+* If the players **did not move**, it is a genuine pause (shuttle fetching / changing serve between two
+  rallies) and must stay empty. The old code fell back to the activity candidate here, filling the pause and
+  immediately gluing back together the rallies player segmentation had just separated (measured: the longest
+  rally gained 6 extra seconds).
+* If the players **are moving**, it is a miss by player segmentation (it has thresholds on movement duty
+  cycle / core segment length, and mixed segments are easily dropped entirely), and activity must catch it,
+  otherwise the whole rally disappears (measured: recall dropped 6 percentage points).
 
-连续训练、多球练习这类素材里，球员在两个回合之间只停几秒，活跃度曲线**不会塌陷**。
-分析里额外保存了**满帧率的融合活跃度曲线**、**满帧率的球员运动曲线**和**逐帧球员
-检测覆盖率**，于是调「留白 / 最短回合 / 最长回合 / 切分依据 / 死球余量」这类参数
-可以只重跑「切分 + 特征 + 评分」这一步——毫秒级出结果，不用再等几分钟的球员检测、
-姿态分析与运动分析。
+The decision uses the player-motion curve itself, with thresholds identical to
+`segment_by_player_motion` (resting floor + 25% dynamic range).
 
-**重切分走的是和完整分析完全相同的切分逻辑**（`_segment_rallies`），而不是退化成
-「只看活跃度」：球员运动曲线与覆盖率都存了，所以球员切分、按时间段择优、
-击球空档切分、终点锚定全部照常生效。这一点很关键——重切分恰恰是调切分参数时
-最常用的操作，如果它和完整重跑给出不一样的回合数，用户就再也无法判断
-「我这次调参到底改了什么」。
+### Adapting to different footage
 
-左侧「回合 → 回合切分调参」里可以实时调：
+Recording conditions vary a lot, so every signal computes its own reliability and the weights are dynamic:
 
-| 参数 | 作用 |
+- **Quiet venue + clear hit sounds** → high audio weight, very accurate segmentation
+- **Noisy multi-court venue + camera AGC** (such as the GoPro footage tested) → audio weight pushed near 0,
+  player motion takes over
+- **Players too small / not detected** → falls back to motion + audio
+
+### When rallies are not cut cleanly: instant resegmentation
+
+In continuous-training or multi-shuttle practice footage, players only pause for a few seconds between
+rallies and the activity curve **does not collapse**. The analysis also stores the **full-frame-rate fused
+activity curve**, the **full-frame-rate player-motion curve** and the **per-frame player detection
+coverage**, so tuning "padding / shortest rally / longest rally / segmentation basis / dead-ball tail" only
+re-runs "segmentation + features + scoring" — milliseconds, without waiting minutes for player detection,
+pose and motion analysis.
+
+**Resegmentation uses exactly the same segmentation logic as a full analysis** (`_segment_rallies`),
+rather than degrading to "activity only": the player-motion curve and coverage are stored, so player
+segmentation, per-window best-of, hit-gap splitting and endpoint anchoring all still apply. This matters
+because resegmentation is precisely the most common operation when tuning segmentation parameters — if it
+produced a different rally count than a full re-run, the user could never tell what a parameter change did.
+
+Under "Rallies → Rally segmentation tuning" on the left you can adjust in real time:
+
+| Parameter | Effect |
 | --- | --- |
-| 切分粒度 | 越大越倾向在活跃度低谷处切开（只在活跃度切分下生效）|
-| 间隔判定 | 两个候选靠得比这更近就合并 |
-| 最短回合 | 短于此长度的片段丢弃 |
+| Segmentation granularity | Higher prefers cutting at activity valleys (only for activity-based segmentation) |
+| Gap threshold | Two candidates closer than this are merged |
+| Shortest rally | Segments shorter than this are dropped |
 
-切分还会做两件收尾工作：
+Segmentation also does two finishing passes:
 
-- **超长片段按内部最深的停顿切开**，而不是机械等分
-- **消除相邻重叠**：边界回贴时每个回合都会前后留白，挨得近的回合会互相盖住几秒，
-  拿去拼时间线会让同一段画面出现两次。`dedupe_overlaps` 会把重叠区切在两次击球之间
+- **Overlong segments are cut at the deepest internal pause**, not split mechanically
+- **Adjacent overlaps are removed**: when boundaries snap back, each rally keeps padding on both sides, so
+  close rallies cover each other by a few seconds and would show the same footage twice in the timeline.
+  `dedupe_overlaps` cuts the overlap between two hits
 
-如果自动结果不理想，界面上所有关键参数都可以实时调，也可以在回合列表里手动
-保留 / 排除 / 标记，改动会直接反映到时间线。还可以用「最低置信度」把
-「AI 也不太确定」的片段直接滤掉。
+If the automatic result is not good, every key parameter can be tuned live in the UI, and you can manually
+keep / exclude / star rallies in the list; changes reflect directly on the timeline. A "minimum confidence"
+filter additionally drops clips where "the AI is not sure".
 
 ---
 
-## 回合评分规则
+## Rally scoring
 
-评分是**可解释的公式**，不是黑箱（`analysis/scoring.py`）。
+Scoring is a **explainable formula**, not a black box (`analysis/scoring.py`).
 
-| 分项 | 依据 |
+| Component | Basis |
 | --- | --- |
-| **长度** | 拍数与时长，用饱和曲线（避免超长回合独占榜首） |
-| **强度** | 球员移动速度、画面运动峰值、整体节奏、**末段节奏**（末段提速加分） |
-| **技术** | 球速、击球力度、羽毛球在画面中的持续性 |
-| **精彩** | 长度 + 强度 + 末段提速 + 多拍加权 |
-| **画面** | 清晰度、抖动、主体是否够大（够清楚才值得用） |
+| **Length** | Shot count and duration, with a saturation curve (so an overlong rally does not dominate) |
+| **Intensity** | Player speed, peak frame motion, overall tempo, **late-rally tempo** (a late acceleration adds points) |
+| **Technique** | Shuttle speed, hit power, shuttle persistence in frame |
+| **Excitement** | Length + intensity + late acceleration + long-rally weighting |
+| **Picture** | Sharpness, shake, subject large enough (only clear enough to be worth using) |
 
-总分 = 加权和 × 分析置信度折扣。
+Total = weighted sum × analysis-confidence discount.
 
-### 评分口径预设
+### Scoring profile presets
 
-| 预设 | 偏向 | 适用 |
+| Preset | Emphasis | Use |
 | --- | --- | --- |
-| 均衡 | 全维度 | 默认 |
-| 精彩集锦 | 强度 + 技术 | 做高光混剪 |
-| 多拍回合 | 拍数 + 时长 | 找拉锯战 |
-| 技术动作 | 球速 + 力度 | 复盘技术细节 |
-| 训练复盘 | 画面完整度 | 教学材料 |
+| Balanced | All dimensions | Default |
+| Highlight reel | Intensity + technique | High-light edits |
+| Long rallies | Shot count + duration | Finding grind-it-out points |
+| Technique | Shuttle speed + power | Reviewing technique |
+| Training review | Picture completeness | Teaching material |
 
-切换预设会**只重新打分，不重跑 AI 分析**，秒出结果。
+Switching a preset **only re-scores, it never re-runs the AI analysis**, so it is instant.
 
-### 自动标签
+### Automatic tags
 
-分析完会打上 `超长多拍 / 多拍 / 快节奏 / 末段提速 / 高强度跑动 / 高速球 / 长回合 /
-短回合 / 高分 / 低置信` 等标签，可以直接当作筛选条件。
+After analysis, tags such as `super-long-rally / long-rally / fast-tempo / late-acceleration /
+high-intensity-running / fast-shuttle / long-rally / short-rally / high-score / low-confidence` are applied
+and can be used directly as filter criteria.
 
 ---
 
-## 剪辑与导出
+## Annotation and annotation-driven tuning
 
-### 时间线
+The **Annotate** page lets you mark rallies by hand and then use those marks to **automatically tune the
+segmentation parameters**. This closes the loop that previously had no ground truth: before this, the
+quiet-segment scales and minimum rally length could only be tuned by eye.
 
-- 顶部是**源片回合标记带**：所有识别出的回合按评分着色，一眼看出哪段值得留
-- 单击定位、双击加入时间线、右键批量操作
-- 视频轨上的片段支持拖拽移动、两端拖拽裁剪、分割、变速、音量
-- 吸附点包含播放头、相邻片段边界、回合起止
-- 完整的撤销 / 重做
+Workflow:
 
-### 导出
+1. **Draft from the current analysis.** One click turns the AI's rallies into a draft annotation (semi-
+   automatic), so you mostly adjust rather than start from scratch.
+2. **Mark rallies.** Play the proxy, mark the start/end of each real rally, add notes. Annotations are saved
+   per media clip as `data/annotations/<proxy-name>.anno.json` and exported to CSV on demand.
+3. **Evaluate.** The current parameters are scored against your annotation with IoU-based matching,
+   producing Precision / Recall / F1 (`analysis/annotation.py`).
+4. **Optimize.** A grid search over the segmentation parameters (four quiet-segment scales + minimum rally
+   length) re-runs only "segmentation + finishing" on the stored signals — no AI is re-run — and returns the
+   best-F1 combination plus the top results. When F1 ties, recall and precision break the tie, so it does not
+   simply pick "the parameters that cut less".
+5. **Apply.** Write the chosen parameters back to the project and resegment (a single fast pass).
 
-| 预设 | 规格 |
+The page also shows objective suggestions computed straight from the annotation (rally count, min / median /
+max duration, median / min gap) to explain why a parameter set fits better. This is the same machinery as
+`scripts/eval_segmentation.py`, but inside the app.
+
+## Scene presets
+
+A **scene preset** packages "segmentation params + court calibration + a preview frame" so it can be reused
+across projects (`core/presets.py`, `api/presets.py`). It is saved from the Annotate page and applied from
+the "Scene presets" strip in the AI analysis dialog.
+
+Design choices:
+
+- **Manual selection, not automatic matching.** There is no reliable measure of scene similarity, and a
+  forced match silently applies unsuitable parameters to new footage. The preset is shown together with the
+  frame captured at save time, and you judge from the screenshot whether it looks similar.
+- **Storage is project-independent**: `data/presets/<id>.json` + `<id>.jpg`, visible to every project.
+- Applying a preset **writes the segmentation parameters and court polygon into the current media only**; it
+  does not automatically re-run anything. You can then start an analysis or resegment from the Annotate page.
+
+The parameter whitelist covers only quantities that actually affect segmentation/boundaries
+(`seg_prominence`, `seg_min_core`, `seg_min_rest`, `seg_min_quiet`, `min_rally_seconds`, `max_rally_seconds`,
+`pre_roll`, `post_roll`, `hit_tail_seconds`), not the whole `AnalysisParams` — `use_*` switches describe "how
+to run this time", not "what this scene should use".
+
+---
+
+## Editing and exporting
+
+### Timeline
+
+- The top strip is the **source rally band**: every detected rally colored by score, so you can see at a
+  glance which parts are worth keeping
+- Single click to seek, double click to add to the timeline, right click for bulk actions
+- Clips on the video track support drag to move, drag ends to trim, split, speed change and volume
+- Snapping points include the playhead, adjacent clip boundaries and rally start/end
+- Full undo / redo
+
+### Export
+
+| Preset | Spec |
 | --- | --- |
-| 横屏 1080p / 4K / 720p | H.264 |
-| 竖屏 1080×1920 | 抖音 / 小红书，**自动跟随球员裁切** |
-| 方形 1080×1080 | 朋友圈 |
-| 4K HEVC | 省空间 |
+| Landscape 1080p / 4K / 720p | H.264 |
+| Portrait 1080×1920 | TikTok / Xiaohongshu, **auto-follow court cropping** |
+| Square 1080×1080 | Moments/feed |
+| 4K HEVC | Space saving |
 
-编码器自动选择：有 NVENC 就用 `h264_nvenc`/`hevc_nvenc`，否则用 `libx264`。
+The encoder is chosen automatically: `h264_nvenc`/`hevc_nvenc` when NVENC is available, otherwise `libx264`.
 
-导出实现有两条路（`render/exporter.py`）：
+The export implementation has two paths (`render/exporter.py`):
 
-- **单趟滤镜图**：同一素材、片段数 ≤ 80 时，用一条 `trim` + `concat` 的
-  `filter_complex` 一次编码完成，最快、画质最好
-- **分段回退**：跨素材或片段过多时，先渲染统一参数的中间片段再 concat
+- **Single-pass filter graph**: for the same media and ≤ 80 clips, one `trim` + `concat` `filter_complex`
+  encodes in a single pass — fastest and best quality
+- **Segmented fallback**: across media or with many clips, render uniform intermediate segments first and
+  concat them
 
-竖屏裁切会读取分析阶段得到的**逐帧主体横向中心**，让镜头跟着球员走，
-而不是死板地居中裁剪。
+Portrait cropping reads the **per-frame subject horizontal center** from the analysis phase, so the camera
+follows the players instead of a rigid center crop.
+
+Finished files can be written to **any directory** (no longer fixed to `data/exports`). A registry
+(`core/exports.py`, `data/exports/index.json`) tracks each output so the Exports page can list, replay and
+download them by id. Re-exporting to the same path overwrites the old entry; missing files disappear from
+the list.
 
 ---
 
-## 命令行工具
+## Command-line tools
 
-不开界面也能跑全流程，方便调参和批处理：
+The whole pipeline runs without the UI, which is convenient for tuning and batch work:
 
 ```powershell
 $py = ".\.venv\Scripts\python.exe"
 
-# 侦察视频（抽帧、看机位、拿到时长/分辨率）
+# Probe a video (sample frames, inspect camera angle, get duration/resolution)
 & $py scripts\probe_video.py "D:\Videos\match.mp4" --from 0 --span 120 --n 8
 
-# 音频击球检测诊断（打印检测到的回合 + 存信号）
+# Audio hit-detection diagnostics (print detected hits + save signals)
 & $py scripts\test_audio.py "D:\Videos\match.mp4" --from 0 --to 300
 
-# 画音频诊断图（波形 / 谱通量 / 阈值 / 检出 / 频谱图）
+# Plot audio diagnostics (waveform / spectral flux / threshold / detections / spectrogram)
 & $py scripts\plot_audio.py data\cache\audio\xxx.wav --from 0 --to 40
 
-# 只需要运动信号
+# Motion signal only
 & $py scripts\test_motion.py data\cache\proxies\xxx.mp4
 
-# 跑完整分析流水线并打印回合表
+# Run the full analysis pipeline and print the rally table
 & $py scripts\run_analysis.py "D:\Videos\match.mp4" --weights highlight
 
-# 把分析结果画成诊断图
+# Turn the analysis result into diagnostic plots
 & $py scripts\plot_analysis.py
 
-# 启动服务并做端到端冒烟测试（建工程→导入→分析→自动剪辑→导出）
+# Start the service and run an end-to-end smoke test (create project → import → analyze → auto-cut → export)
 & $py scripts\e2e_test.py "D:\Videos\match.mp4"
 
-# 长视频预热：只生成代理/音轨/封面，之后反复分析就能复用缓存
+# Warm up a long video: only generate proxy/audio/cover so later analyses reuse the cache
 & $py scripts\warmup.py "D:\Videos\match.mp4"
+
+# Offline evaluation of segmentation against a manual annotation (no AI re-run)
+& $py scripts\eval_segmentation.py
+
+# Pre-fetch the faster-whisper model used by voice-command scoring (optional; auto-downloads otherwise)
+& $py scripts\fetch_speech_model.py
 ```
 
-后端还带一套 OpenAPI 文档：服务跑起来后访问 <http://127.0.0.1:8000/api/docs>。
+The backend also ships OpenAPI docs: once the service is running, visit
+<http://127.0.0.1:8000/api/docs>.
 
 ---
 
-## 工程结构
+## Project layout
 
 ```
 BadmintonStudio/
 ├─ backend/bms/
-│  ├─ config.py            路径与全局配置（可用 BMS_* 环境变量覆盖）
-│  ├─ main.py              FastAPI：工程/素材/分析/回合/时间线/导出/任务 + WebSocket
+│  ├─ config.py            Paths and global config (overridable via BMS_* env vars)
+│  ├─ main.py              FastAPI: projects/media/analysis/rallies/timeline/export/jobs + WebSocket
 │  ├─ core/
-│  │  ├─ ffmpeg.py         ffmpeg/ffprobe 定位、能力探测、带进度的命令执行
-│  │  ├─ media.py          探测、代理视频、音轨、封面、雪碧图、抽帧
-│  │  ├─ models.py         Pydantic 领域模型
-│  │  ├─ jobs.py           后台任务（进度 / 取消 / 广播）
-│  │  ├─ store.py          工程 JSON 持久化
-│  │  └─ streaming.py      HTTP Range 视频流（浏览器拖进度条用）
+│  │  ├─ ffmpeg.py         ffmpeg/ffprobe discovery, capability probing, progress-aware command execution
+│  │  ├─ media.py          Probe, proxy video, audio track, poster, sprite sheet, frame extraction
+│  │  ├─ models.py         Pydantic domain models
+│  │  ├─ jobs.py           Background jobs (progress / cancel / broadcast)
+│  │  ├─ store.py          Project JSON persistence
+│  │  ├─ streaming.py      HTTP Range video streaming (browser seek bar)
+│  │  ├─ presets.py        Scene presets (params + court calibration + preview frame)
+│  │  └─ exports.py        Export registry (data/exports/index.json)
+│  ├─ api/
+│  │  ├─ annotations.py    Rally annotation + annotation-driven tuning routes
+│  │  └─ presets.py        Scene preset routes
 │  ├─ analysis/
-│  │  ├─ audio_hits.py     击球声检测 + 可信度评估
-│  │  ├─ motion.py         运动能量 / 抖动 / 清晰度 / 活动热区
-│  │  ├─ court_calib.py    场地标定（地面颜色 → 多边形 → 单应）+ 机位识别
-│  │  ├─ players.py        YOLO 检测 + 多目标跟踪 + 比赛球员识别（机位自适应 + 框尺寸筛选）
-│  │  ├─ shuttle.py        羽毛球候选检测 + 抛物线轨迹关联
-│  │  ├─ rally.py          多模态融合 + 迟滞状态机 + 边界回贴
-│  │  ├─ rally_vision.py   球员运动静默段切分（主用）+ 活跃度谷值切分（降级）
-│  │  ├─ scoring.py        五维评分 + 标签 + 统计
-│  │  └─ pipeline.py       编排全流程，产出 AnalysisResult
-│  └─ render/exporter.py   时间线导出（单趟滤镜图 / 分段回退 / 竖屏跟随）
-├─ frontend/               React 19 + TS + Vite + Tailwind v4 + Framer Motion
+│  │  ├─ audio_hits.py     Hit-sound detection + reliability estimation
+│  │  ├─ motion.py         Motion energy / shake / sharpness / activity heatmap
+│  │  ├─ court_calib.py    Court calibration (floor color → polygon → homography) + camera-angle detection
+│  │  ├─ players.py        YOLO detection + ByteTrack tracking + match-player selection (camera-adaptive + box size filtering)
+│  │  ├─ shuttle.py        Shuttle candidate detection + parabolic trajectory association
+│  │  ├─ rally.py          Multimodal fusion + hysteresis state machine + boundary snapping
+│  │  ├─ rally_vision.py   Player-motion quiet-segment segmentation (primary) + activity-valley segmentation (fallback)
+│  │  ├─ pose.py           Pose-assist hit attribution (deciding whether a hit sound is ours)
+│  │  ├─ scoring.py        Five-dimension scoring + tags + statistics
+│  │  ├─ speech.py         Optional voice-command scoring (faster-whisper + near-homophone match)
+│  │  ├─ annotation.py     Manual annotation I/O + annotation-driven parameter search
+│  │  └─ pipeline.py       Orchestrates the whole flow, produces AnalysisResult
+│  └─ render/exporter.py   Timeline export (single-pass filter graph / segmented fallback / portrait follow)
+├─ frontend/               React 19 + TS + Vite + Tailwind v4 + Motion
 │  └─ src/
-│     ├─ components/       壳层、素材库、播放器、时间线、回合面板、检查器、弹窗
-│     ├─ store/useStore.ts 全局状态（含撤销重做、播放、筛选）
-│     └─ lib/              API 客户端、WebSocket、类型、格式化
-├─ desktop/app.py          pywebview 桌面外壳
-├─ scripts/                命令行工具与诊断脚本
-├─ data/                   运行时数据（工程、缓存、导出）
-└─ models/                 模型权重
+│     ├─ components/       Shell, library, player, timeline, rally panel, inspector, dialogs, annotate page
+│     ├─ store/useStore.ts Global state (undo/redo, playback, filtering, presets)
+│     └─ lib/              API client, WebSocket, types, formatting
+├─ desktop/app.py          pywebview desktop shell
+├─ scripts/                Command-line tools and diagnostics
+├─ data/                   Runtime data (projects, cache, exports, annotations, presets)
+└─ models/                 Model weights (not committed)
 ```
 
-数据目录：
+Data directory:
 
 ```
 data/
-├─ projects/*.json         工程文件（可读、可手工编辑、可备份）
-├─ cache/proxies/          分析用低分辨率代理视频
-├─ cache/audio/            提取出的 16k 单声道音轨
-├─ cache/thumbs/           封面与时间线雪碧图
-├─ cache/frames/           诊断图 + 尺寸筛选的试测帧图（probe/）
-├─ exports/                导出成片
-└─ uploads/                拖拽导入的文件
+├─ projects/*.json         Project files (human-readable, editable, backup-able)
+├─ cache/proxies/          Low-resolution proxy videos for analysis
+├─ cache/audio/            Extracted 16 kHz mono audio tracks
+├─ cache/thumbs/           Posters and timeline sprite sheets
+├─ cache/frames/           Diagnostic frames + size-filter probe frames (probe/)
+├─ annotations/            Manual rally annotations (<proxy-name>.anno.json)
+├─ presets/                Scene presets (<id>.json + <id>.jpg)
+├─ exports/                Exported videos + index.json registry
+├─ logs/                   Runtime logs
+└─ uploads/                Files copied in by browser drag-and-drop (the native window references by path)
 ```
 
 ---
 
-## 常见问题
+## FAQ
 
-**Q：分析很慢怎么办？**
+**Q: Analysis is slow. What can I do?**
 
-4K 长视频第一次分析会先生成低分辨率代理。这一步走的是
-**CUDA 解码 → `scale_cuda` → NVENC** 全 GPU 链路，实测 30 分钟 4K 素材
-**177 秒**就能生成完（约 10 倍实时）；如果显卡不支持这条链路会自动退回
-CPU 软件编码，会慢一个数量级，但仍可用。
+The first analysis of a long 4K clip generates a low-resolution proxy. This uses the **CUDA decode →
+`scale_cuda` → NVENC** GPU chain and measured **177 s** for 30 minutes of 4K (about 10× real time); if the
+GPU does not support the chain it falls back to CPU software encoding, about an order of magnitude slower
+but still usable.
 
-之后反复调参做分析都会复用缓存（代理文件名带素材 ID 哈希，所以是幂等的）。
-也可以用 `scripts/warmup.py` 提前把它跑好。
+Repeated parameter-tuning analyses reuse the cache (proxy filenames include a hash of the media id, so it is
+idempotent). You can also pre-run it with `scripts/warmup.py`.
 
-分析本身在代理上做：30 分钟素材大约 6～10 分钟，其中**球员检测与跟踪占大头**。
+The analysis itself runs on the proxy: about 6–10 minutes for 30 minutes of footage, with **player detection
+and tracking dominating**.
 
-**Q：为什么「羽毛球轨迹跟踪」默认是关的？**
+**Q: Why is "shuttle tracking" off by default?**
 
-它的计算量随「时长 × 分辨率」增长，30 分钟素材能跑到小时级。回合分割主要靠
-球员运动和画面运动，不开它也能正常工作。需要球速数据时可以在「AI 分析」里打开，
-并设一个时间预算。
+Its cost grows with "duration × resolution" and can reach hours for 30 minutes of footage. Rally
+segmentation mainly relies on player motion and frame motion, so it works fine without it. Enable it in "AI
+analysis" when you need shuttle-speed data, and set a time budget.
 
-**Q：没有 NVIDIA 显卡能用吗？**
+**Q: Can I use it without an NVIDIA GPU?**
 
-能。会自动退回 CPU，球员检测会慢一些，代理生成和导出用 `libx264`。功能完全一样。
+Yes. It falls back to CPU automatically: player detection is slower, and proxy generation and export use
+`libx264`. Functionality is identical.
 
-**Q：回合切得太碎 / 粘在一起？**
+**Q: Rallies are cut too finely / glued together.**
 
-到「AI 分析」里调这三个：「回合间隔判定」（粘在一起就调小，切太碎就调大）、
-「最短回合时长」、「击球检测灵敏度」。也可以在回合列表里手动保留 / 排除。
-如果你固定用同一套机位，调好一次即可。
+Go to "AI analysis" and tune three things: "Rally gap threshold" (lower if glued, higher if too fragmented),
+"Minimum rally duration", and "Hit detection sensitivity". You can also keep / exclude rallies manually in
+the list. If you always use the same camera setup, tune once.
 
-**Q：音频是场边杂音很多，会不会影响结果？**
+**Q: The audio is mostly courtside noise — will it hurt the result?**
 
-不会。音频那一路会自己算可信度（覆盖率 / 触球率 / 爆发度），噪声大时权重自动降到
-接近 0，改由球员运动和画面运动主导。
+No. The audio path computes its own reliability (coverage / touch rate / burstiness); when noise is high its
+weight drops near 0 and player motion plus frame motion take over.
 
-**Q：支持哪些格式？**
+**Q: Which formats are supported?**
 
-FFmpeg 能解的都支持：MP4 / MOV / MKV / AVI / MTS 等，H.264 / H.265 / ProRes 均可。
+Anything FFmpeg can decode: MP4 / MOV / MKV / AVI / MTS, H.264 / H.265 / ProRes, etc.
 
-**Q：会占很多硬盘吗？**
+**Q: Why can't I drag a large file in?**
 
-代理视频大约占原片的 1/50～1/100（30 分钟 4K 素材的 960p 代理约 260 MB）。
-「设置」页可以随时清理缓存，清理后不影响原始素材，只是下次分析要重新生成。
+For security, the browser only gets the dropped file's contents, not its local path, so a drop effectively
+copies the whole file; files over 2 GB are skipped automatically — use "Choose video". The **native desktop
+window** (with pywebview installed) is the exception: it gets the full path, references the file without
+copying, and accepts drops of any size, just like "Choose video".
+
+**Q: Will it use a lot of disk space?**
+
+Proxy videos are about 1/50–1/100 of the source (a 960p proxy of 30 minutes of 4K is about 260 MB). The
+Settings page can clear the cache at any time; clearing does not affect the original media, only requiring
+regeneration on the next analysis.
+
+**Q: Voice-command scoring — what is it?**
+
+An optional mode that uses a local faster-whisper model to recognize 1–2 short phrases you configure
+(for example "好球" / nice shot) and adds bonus points to rallies where they are heard. A near-homophone
+pass (via pypinyin) also counts mis-heard variants such as "到球" / "倒球" as "好球". It is off by
+default, needs the `faster-whisper` dependency (and downloads a model on first use), and degrades
+silently if either is missing. It **does not affect segmentation**, only scoring. See the model section
+above for how to pre-fetch the model.
 
 ---
 
-## 性能实测（RTX 3080，30 分钟 3840×2160 HEVC 素材）
+## Measured performance (RTX 3080, 30 minutes of 3840×2160 HEVC)
 
-| 环节 | 耗时 | 说明 |
+| Stage | Time | Notes |
 | --- | --- | --- |
-| 生成代理（960×540 / 30fps） | **177 s** | 全 GPU 链路，约 10× 实时 |
-| 提取音轨 | 15 s | |
-| 球员检测与跟踪 | 约 3.5 min | YOLO11n + 自研跟踪器 |
-| 画面运动分析 | 约 45 s | 5 分钟素材约 10 s |
-| 融合 + 切分 + 评分 | 数秒 | |
-| **整条分析流水线** | **237 s** | 30 分钟素材 → 13 个回合 |
-| 导出 1080p（NVENC，13 片段 / 698 s） | **343 s** | 片段稀疏时自动走分段导出，避免从 0 顺序解码 |
-| 导出竖屏 1080×1920（自动跟随裁切） | 691 s | 竖屏裁切 + 逐片段主体定位 |
+| Proxy generation (960×540 / 30 fps) | **177 s** | Full GPU chain, about 10× real time |
+| Audio track extraction | 15 s | |
+| Player detection and tracking | ~3.5 min | YOLO11n + custom tracker |
+| Frame motion analysis | ~45 s | about 10 s per 5 minutes |
+| Fusion + segmentation + scoring | seconds | |
+| **Whole analysis pipeline** | **237 s** | 30 minutes → 13 rallies |
+| Export 1080p (NVENC, 13 clips / 698 s) | **343 s** | Sparse clips use segmented export to avoid decoding from 0 |
+| Export portrait 1080×1920 (auto-follow crop) | 691 s | Portrait crop + per-clip subject positioning |
 
-> 导出性能的关键点：单趟 `trim`+`concat` 滤镜图**不能跳读**，必须从一个输入顺序
-> 解码到最后一个片段。所以当「解码跨度 / 实际输出」超过 1.5 倍时，导出器会自动
-> 改走分段路径（每段各自 `-ss` 快速定位），实测快约一倍。
+> The key to export performance: a single-pass `trim`+`concat` filter graph **cannot seek**, so it must
+> decode from one input sequentially to the last clip. When "decode span / actual output" exceeds 1.5×, the
+> exporter switches to the segmented path (each segment seeks quickly with `-ss`), which measured about
+> twice as fast.
 
 ---
 
-## 支持哪些拍法（机位）
+## Supported camera setups
 
-这是这一版新加的能力。在这之前，整条分析链里**写死了一种拍法**：
-摄像机静止、超广角、架在某块场地的底线后方、场地是绿色的。这些先验散落在
-「球员是画面里最大的两个人框」「框越大越靠近相机」「球员框底边落在画面高度
-0.40~0.65 的横带里」等判断上，换一个角度不会报错，只会**静默地给出错的结果**。
+This is the capability added in the current version. Before this, the whole analysis chain **hard-coded one
+setup**: a static ultra-wide camera behind a baseline of a court, with a green floor. These priors were
+scattered across judgments like "the players are the two largest boxes", "a larger box is nearer the
+camera", and "the bottom edge of a player box lies in the horizontal band 0.40–0.65 of the frame height".
+Another angle would not raise an error — it would **silently produce wrong results**.
 
-现在分析开始前会先做一次**场地标定**（`analysis/court_calib.py`，约 1~2 秒）：
+The analysis now starts with a **court calibration** (`analysis/court_calib.py`, about 1–2 s):
 
-1. **找地面颜色。** 在每帧下方 45%、水平中间 60% 的区域统计色相直方图
-   （那里必定是场地），再在色相/饱和度/亮度上做小范围搜索，目标是
-   「画面最底部中央一定被覆盖、覆盖面积又不过大」。这套搜索是必要的：
-   实测素材里地胶的色相是 82（青绿），而**墙面木饰面和顶棚是 92~98**，
-   只差十几个 bin；同时地胶远端的饱和度会从 215 掉到 81。任何一个写死的
-   阈值都会要么漏掉半个场地、要么把整面墙算进去。
-2. **拟合场地边界并算单应变换。** 取多帧 mask 的交叠（真正的地面每帧都在，
-   球员/观众/隔壁场地只偶尔命中，取交叠能自动滤掉它们），拟合出边界多边形，
-   再从多边形里挑出**面积最大的内接四边形**算单应矩阵（把画面映射成单位方框）。
-   坐标用**单位方框**而不是真实米制：画面里常常只看得到半个场地，硬映射到
-   13.40 m 会把纵向距离放大两倍以上，比不标定更糟。
-3. **判定机位。** 用三个与画面朝向无关的量：场地远端/近端的宽度比
-   （近大远小的程度）、球员在画面里横向/纵向的铺开程度、同屏两名球员的
-   框高比。输出 `rear`（底线后）/ `side`（边线侧方）/ `elevated`（高机位斜俯）/
-   `overhead`（正俯拍）/ `unknown`。
+1. **Find the floor color.** Count a hue histogram in the bottom 45% / horizontal middle 60% of each frame
+   (where the court must be), then do a small search over hue/saturation/value with the goal "the bottom
+   center of the frame is definitely covered, but the covered area is not too large". This search is
+   necessary: in the tested footage the mat hue is 82 (teal), while **wall wood paneling and ceiling are
+   92–98** — only a dozen bins apart — and at the far end the mat saturation drops from 215 to 81. Any
+   hard-coded threshold would either miss half the court or include an entire wall.
+2. **Fit the court boundary and compute the homography.** Take the intersection of masks across several
+   frames (the real floor is present every frame; players/spectators/adjacent courts only occasionally
+   match, so the intersection filters them out), fit a boundary polygon, then pick the **largest inscribed
+   quadrilateral** to compute the homography (mapping the frame to a unit square). Coordinates use a **unit
+   square** rather than real meters: usually only half the court is visible, and forcing a mapping to
+   13.40 m would stretch the longitudinal distances by more than 2×, worse than no calibration.
+3. **Determine the camera angle.** Use three frame-orientation-independent quantities: the far/near width
+   ratio of the court (perspective), how spread out the players are horizontally/vertically, and the box
+   height ratio of two players on screen. Output `rear` (behind baseline) / `side` (side line) /
+   `elevated` (high oblique) / `overhead` (top-down) / `unknown`.
 
-### 场地边界是**多边形**，不只是四个角
+### The court boundary is a **polygon**, not just four corners
 
-全景相机 / 鱼眼镜头拍出来的场地边界是**弯的**（桶形畸变，越靠画面边缘弯得越厉害）。
-以前标定只有「四个角」这一种表示，等于假设边界在画面里是直线，于是：
+A panoramic or fisheye lens makes the court boundary **curved** (barrel distortion, worse toward the frame
+edges). Calibration used to represent the court as only "four corners", assuming the boundary is straight in
+the frame, so:
 
-- 用四个角框一块弯边的场地，要么把边角切掉一块，要么把场地外的看台一起圈进来；
-- 而「球员在不在场地里」原来是按**外接矩形**判的，弯边造成的误差在画面边角
-  会被放大到整块看台 —— 那恰恰是背景人员最密集的地方。
+- framing a curved court with four corners either clips the corners or includes the stands outside the court;
+- and "is the player on court" was judged by the **bounding rectangle**, so the curved-edge error at the
+  frame corners could balloon to include an entire stand — exactly where background people are densest.
 
-所以现在标定的核心表示是 **N 点多边形（4~24 点）**：
+Calibration therefore represents the court as an **N-point polygon (4–24 points)**:
 
-| 用途 | 用什么 |
+| Use | Representation |
 | --- | --- |
-| 判定「球员在不在场地里」 | **多边形**（逐点射线法，边界外扩 4%，见下） |
-| 分析 ROI（粗筛范围） | 多边形的外接矩形 |
-| 单应变换（谁离相机更近、距离比较） | 多边形里**面积最大的内接四边形** |
-| 机位判定 | 单应 + 球员分布（口径不变） |
+| Decide "is the player on court" | **Polygon** (ray casting, boundary expanded 4%, see below) |
+| Analysis ROI (coarse range) | Bounding rectangle of the polygon |
+| Homography (who is nearer the camera, distance comparison) | **Largest inscribed quadrilateral** of the polygon |
+| Camera-angle decision | Homography + player distribution (unchanged) |
 
-- **点数由数据决定**：自动标定时从 4 个点开始往上加，取第一个能
-  「与原地面区域交并比 ≥ 98.5%」的点数。边界笔直就仍然是 4 点（普通机位
-  行为完全不变），弯边就自动变成 8~14 点。判据用交并比而不是面积差：
-  面积差看不出「形状对了但整体偏了」。
-- **「弯了多少」会写进结果**：`calibration.distortion`
-  ＝多边形比拟合四边形多出来的面积比例。超过 6% 时 `calibration.notes` 会
-  提示「超广角/鱼眼畸变的典型特征」。
-- **多边形之外会让出 4%**（每条边向外平移 0.04 个画面单位）再判「场内」。
-  判错方向的代价不对称：多留一个人只是噪声（后面还有尺寸筛选与活跃度评分），
-  漏掉真球员会让下游的活跃度曲线和裁切跟随直接断档。
+- **The point count follows the data**: automatic calibration starts at 4 points and adds more, taking the
+  first count that reaches "IoU ≥ 98.5% with the original floor region". A straight boundary stays at 4
+  points (ordinary setups behave exactly as before); a curved boundary becomes 8–14 points. The criterion is
+  IoU rather than area difference, because area difference cannot detect "the shape is right but shifted".
+- **"How much it curved" is written into the result**: `calibration.distortion` is the extra area of the
+  polygon over the fitted quadrilateral. Above 6%, `calibration.notes` warns of "a typical sign of
+  ultra-wide/fisheye distortion".
+- **The polygon is expanded by 4%** (each edge moved outward by 0.04 frame units) before the on-court test.
+  The cost of judging the wrong way is asymmetric: keeping one extra person is only noise (size filtering
+  and activity scoring follow), while missing a real player breaks the downstream activity curve and crop
+  following.
 
-标定结果会**反过来影响分析**：
+Calibration then **feeds back into the analysis**:
 
-- **场地 ROI 成为球员检测的硬过滤**：只有框底边中心落在场地**多边形**里的才作为候选，
-  于是「框最大的两个人就是球员」这条跟机位强耦合的猜测不再是唯一的防线，
-  隔壁场地的人和看台上的观众直接被排掉。分析结果里
-  `stats.effective_roi`（外接矩形）与 `stats.effective_poly`（多边形）可以看到实际用的范围。
-- **机位决定先验参数**。高机位 / 俯拍下所有人在画面里一样大，这时
-  「框大 = 离相机近」完全不成立：判比赛球员的权重会切成「运动为主、
-  面积只作微调」，取消「贴画面边缘扣分」（俯拍时球场本来就可能偏在一侧），
-  并且**不再输出** `near` / `far`（过去它会在这两种机位下写死一个 `near`，
-  把猜的结果当成测的结果；现在拿不准就是 `unknown`）。
-- **几何门限跟着放宽**。俯拍时人在画面上是「矮而宽」的，宽高比会超过 1.8，
-  旧的硬性裁剪会把真实球员直接丢掉。
-- **画面上可以核对**：预览左上角出现「场地标定」按钮，点开会在画面上
-  画出 AI 识别到的球场范围和机位判断，一眼就能看出它到底在看哪块场地。
+- **The court ROI becomes a hard filter for player detection**: only boxes whose bottom-edge center falls
+  inside the court **polygon** are candidates, so "the two largest boxes are the players" is no longer the
+  only defense; people on adjacent courts and spectators in the stands are dropped directly. The actual
+  range used is visible as `stats.effective_roi` (bounding rectangle) and `stats.effective_poly` (polygon).
+- **The camera angle selects the prior parameters.** Under a high/overhead angle everyone is the same size
+  in frame, so "large box = near the camera" is simply false: match-player selection switches to
+  "motion-dominant, area only a minor adjustment", the "penalty for touching the frame edge" is removed (an
+  overhead shot may legitimately sit to one side), and `near` / `far` are **no longer emitted** (previously
+  it hard-coded a `near` under these angles, presenting a guess as a measurement; now uncertain means
+  `unknown`).
+- **Geometric thresholds are relaxed accordingly.** In an overhead view people are "short and wide" with an
+  aspect ratio above 1.8, and the old hard crop would discard real players.
+- **You can verify it on screen**: a "Court calibration" button appears at the top-left of the preview;
+  opening it draws the detected court range and the camera-angle decision over the frame, so you can see at
+  a glance which court it is looking at.
 
-「AI 分析 → 机位与场地」里可以选择：
+Under "AI analysis → Camera & court" you can choose:
 
-| 选项 | 说明 |
+| Option | Description |
 | --- | --- |
-| 自动识别 | 默认。按上面的方法判断，适合大多数情况 |
-| 场地后方 / 边线侧方 / 高机位斜俯 / 正俯拍 | 固定用同一套机位时直接指定，省掉猜测（仍会算并记录实测指标供核对）|
-| 自动标定场地 | 关掉则退回全画幅 + 通用参数（多球场、地胶颜色异常时可用）|
-| 切分依据 | 球员运动（推荐）/ 画面活跃度 / 两者对比择优 |
+| Auto-detect | Default. Uses the method above; works for most cases |
+| Behind baseline / Side line / High oblique / Top-down | Pin the setup when you always use it, skipping the guess (measured metrics are still computed and recorded for verification) |
+| Auto-calibrate court | Turn off to fall back to full frame + generic parameters (useful for multi-court venues or unusual mat colors) |
+| Segmentation basis | Player motion (recommended) / frame activity / compare and pick the best |
 
-### 自动标定不准？手动标一次
+### Auto-calibration inaccurate? Calibrate manually once
 
-自动标定靠「地面颜色 + 逐行分析」找场地，在实测素材上能把**近半场**圈得很准，
-但有两种情况会偏：
+Auto-calibration finds the court from "floor color + per-row analysis" and can frame the **near half-court**
+accurately on the tested footage, but it drifts in two cases:
 
-- 场地远端被顶灯洗淡，饱和度掉到近端的三分之一，会被判成「墙」而排除在外；
-- 多球场、地胶颜色异常（纯灰 / 木地板 / 反光严重）时颜色先验本身不成立。
+- the far end of the court is washed out by ceiling lights and its saturation falls to a third of the near
+  end, so it is classified as "wall" and excluded;
+- multi-court venues and unusual mat colors (plain gray / wooden floor / strong reflections) break the color
+  prior itself.
 
-这两种情况下继续调算法是低效的，**直接手动画一次更省事**。入口有三处：
+In these cases continuing to tune the algorithm is inefficient; **drawing it once by hand is easier**. There
+are three entry points:
 
-- 剪辑台动作条上的 **「标定场地」** 按钮；
-- 预览画面左上角的机位角标（点它就能改）；
-- 「AI 分析 → 机位与场地」里的 **「手动标定场地」** 按钮。
+- the **"Calibrate court"** button in the Studio action bar;
+- the camera-angle badge at the top-left of the preview (click it to edit);
+- the **"Calibrate court manually"** button under "AI analysis → Camera & court".
 
-打开后会显示当前画面（封面帧），**沿着球场边界点一圈**即可：
+It opens the current frame (the poster) and you **click around the court boundary**:
 
-| 操作 | 说明 |
+| Action | Description |
 | --- | --- |
-| 拖动顶点 | 微调位置（直接按住点拖） |
-| 边的中点「+」 | 在**这条边上插入一个顶点** —— 边界弯的地方就这么加点 |
-| 「每条边加中点」 | 一次给每条边都插一个中点：弯边（鱼眼 / 全景）最省事的一步到位 |
-| 选中顶点 → 「−」 | 删掉这个顶点（最少留 4 个） |
-| 双击画面 | 在离得最近的那条边的中点插点（不用去够那个小「+」） |
+| Drag a vertex | Fine-tune its position |
+| "+" on an edge midpoint | **Insert a vertex on that edge** — add points where the boundary curves |
+| "Add midpoint to every edge" | Insert one midpoint per edge at once: the easiest one-step fix for curved (fisheye/panoramic) edges |
+| Select a vertex → "−" | Delete the vertex (minimum 4 remain) |
+| Double-click the frame | Insert a point at the nearest edge midpoint (no need to hit the small "+") |
 
-点数 4~24 个：**4 个点就是传统四边形**，第一个点是靠近镜头那一侧的最左角
-（前两个近、后两个远），顺序不用管，系统会按画面上下自动整理成环序。
-多点（6~14 个）用来描述全景 / 鱼眼弯掉的边界 —— 一圈点下来，
-`parameters.court_poly` 会带上全部点，界面上也会显示「弯边约 X%」。
+The point count is 4–24: **4 points is the traditional quadrilateral**, with the first point at the
+left-most corner of the side nearer the camera (the first two near, the last two far); order does not matter
+because the system sorts them into a ring by their vertical position. Multi-point (6–14) is used to describe
+a panoramic/fisheye curved boundary — after clicking a ring of points, `parameters.court_poly` carries all of
+them and the UI shows "curved edge about X%".
 
-初始位置优先用「你上次标的结果」，其次用「AI 识别的结果」，都没有才给一个
-默认梯形——所以大多数时候只需要微调一两个点。
+Initial positions prefer "your last calibration", then "the AI result", and only fall back to a default
+trapezoid — so most of the time you only need to nudge one or two points.
 
-保存后会**写进工程文件**（按素材分开存，键名 `ui.court_polys`，旧工程的
-`court_quads` 继续兼容），下次打开工程还在，重新分析时直接生效
-（对应 `params.court_poly`；旧的 `params.court_quad` 仍然接受）。
-窗口里也可以「清除」，回到自动识别。
+Saving writes into the **project file** (stored per media under the key `ui.court_polys`; the old
+`court_quads` remains compatible), so it survives reopening the project and applies directly on the next
+analysis (corresponding to `params.court_poly`; the old `params.court_quad` is still accepted). The dialog
+also offers "Clear" to return to auto-detection.
 
-标定结果只影响「在哪里找比赛球员、谁离相机更近、竖屏往哪边裁」，不会改动原始
-视频。预览左上角的「显示范围」可以把识别到的球场范围叠在画面上核对 ——
-叠加时会**把场地之外压暗**，所以「它到底在看哪一块」一眼就能看出来
-（标定最常犯的错就是把看台也圈进去了）。
+Calibration only affects "where to look for match players, who is nearer the camera, and which way to crop
+for portrait"; it never modifies the original video. "Show range" at the top-left of the preview overlays
+the detected court range for verification — it **dims everything outside the court**, so "which area is it
+looking at" is obvious at a glance (the most common calibration mistake is including the stands).
 
-### 球员框尺寸：两道门限，第二道可以自己定
+### Player box size: two thresholds, the second one is yours
 
-「框大 = 离相机近」这条先验只用来**加分**是不够的：一条「框很小但一直在动」的
-轨迹（观众走动、隔壁场地热身）有机会靠速度分挤进候选。所以尺寸是一道
-**硬门限**，而且有两道：
+"Large box = near the camera" is not enough as a **bonus** alone: a track that is "small but always moving"
+(walking spectators, warming up on an adjacent court) can squeeze into the candidates via its speed score.
+So size is a **hard threshold**, and there are two:
 
-1. **自动门限（默认）**：球员检测跑完后先算一次「这场比赛里球员大概多大」——
-   取每帧最大框的 90 分位当参考尺度（比赛球员就是画面里最大的人，这个量在
-   任何机位下都指向真实球员），然后把**明显偏小**的轨迹直接排除，并在事后按
-   尺寸再砍一刀（比赛球员之间尺寸不会差 2 倍以上）。参考尺度不足画面高度
-   6% 时会整个跳过这一步，避免在「谁都检不到」的素材上把人全筛掉。
-   检测框的尺寸上限也会随参考尺度放宽到 4 倍（特写镜头里球员会占很大一块，
-   这里只想挡掉「整个人贴到镜头前」的误检）。
-2. **手动门限（「AI 分析 → 找谁：人物框尺寸」）**：自动门限在两种素材上会失灵，
-   只能由用户指认：
+1. **Automatic threshold (default)**: after player detection, first estimate "how big a player is in this
+   match" — take the 90th percentile of the largest box per frame as the reference scale (match players are
+   the largest people in frame, and this points at real players under any camera angle), then exclude tracks
+   that are **clearly too small**, with a second size cut afterwards (match players never differ in size by
+   more than 2×). If the reference scale is below 6% of the frame height, this step is skipped entirely, to
+   avoid filtering everyone out on footage where "nobody is detected". The upper size limit of detection
+   boxes is relaxed to 4× the reference scale as well (in close-ups a player occupies a large area; this
+   only wants to block "a whole person pressed against the lens").
+2. **Manual threshold ("AI analysis → Find who: person-box size")**: the automatic threshold fails on two
+   kinds of footage and can only be set by the user:
 
-   - **看台 / 观众离相机比球员更近**（边线侧方机位、看台就在镜头后面）：
-     参考尺度会被最大的观众框劫持，真球员反而成了「偏小」的那一批；
-   - **全景 / 鱼眼畸变严重**：同一个球员在画面中心和边角的框高能差一倍以上，
-     「多大才算球员」在画面不同位置本来就不是同一个数。
+   - **The stands/spectators are nearer the camera than the players** (side-line setups with stands right
+     behind the camera): the reference scale is hijacked by the largest spectator box, and the real players
+     become the "too small" batch;
+   - **Severe panoramic/fisheye distortion**: the same player's box height can differ by more than 2×
+     between the frame center and corners, so "how big counts as a player" is not one number across the
+     frame.
 
-   面板给出两种口径：
+   The panel offers two measures:
 
-   | 口径 | 判据 | 适合 |
+   | Measure | Criterion | Best for |
    | --- | --- | --- |
-   | **绝对比例** | 框高 ÷ 画面高度 | 机位固定、人框大小稳定 |
-   | **同帧相对** | 框高 ÷ **同帧最大框高** | 畸变严重 / 观众更近：每帧重新归一，免疫「位置不同框大小不同」 |
+   | **Absolute ratio** | box height ÷ frame height | Fixed setup with stable box sizes |
+   | **Same-frame relative** | box height ÷ **largest box height in the same frame** | Severe distortion / nearer spectators: renormalized per frame, immune to "different position, different size" |
 
-   另外还能卡**面积**上下限（畸变会把框拉得更宽而不是更高，这时面积比框高灵）。
+   You can also clamp **area** (distortion widens boxes rather than heightening them, where area is more
+   sensitive).
 
-   调参不用等，而且**看得见**：
+   Tuning is immediate and **visible**:
 
-   1. **画面核对（手动选帧）**：「帧核对」里拖滑杆选一个时刻（打开面板时默认
-      就是对到预览播放头的位置）→ 点「抓这一帧」，那一帧的**画面本身**会被抓出来，
-      检测到的每个框直接画在上面：<span>绿实线＝会保留、红虚线＝会筛掉</span>，
-      框上标着它的框高（如 `#3 12.4% 低于下限`），鼠标悬停能看到框高/面积和判定结果。
-      **拖阈值滑杆时画面上立刻变色** —— 判定在本地做，不用重跑检测，所以
-      「被筛掉的到底是看台上的观众，还是把真球员筛掉了」一眼就能看出来，
-      这是纯数字（框高 12%）永远说不了的事。
-      抓过的帧会排成一条缩略图条，可以来回对比不同时刻（换场、暂停、工作人员走过）。
-      「均匀试测 10 帧」则是在整条视频上均匀抽 10 帧，一次看清各类人框的大小分布。
-   2. **分布**：**框高分布直方图**（统计的是**筛选前**的框，柱子按「保留 / 丢掉」
-      两段着色），拖滑杆时实时重算保留比例。
-   3. **实测数据**：抓帧/试测都是**只做检测不跟踪**，第一次约 4 秒（含加载模型），
-      之后同一段视频再抓是**零点几秒**（模型复用 + 只解码那一帧）。分析结果里也会
-      带上同一份分布（`stats.player_trace.size_filter`，含每帧参考尺度、被筛掉的
-      框数与 `sample` 样本），所以拖阈值是在**实测数据**上试，而不是靠猜。
+   1. **Frame check (manual frame pick)**: drag a slider in "Frame check" (opening the panel defaults to the
+      preview playhead) → click "Grab this frame"; the **frame itself** is extracted and every detected box
+      is drawn on it: <span>solid green = kept, dashed red = filtered</span>, each box labeled with its
+      height (e.g. `#3 12.4% below lower bound`), and hovering shows height/area and the verdict.
+      **Dragging the threshold slider recolors the frame instantly** — the decision is made locally without
+      re-running detection, so "is what got filtered a spectator in the stands, or a real player?" is
+      obvious, which pure numbers (box height 12%) can never show. Grabbed frames line up as a thumbnail
+      strip for comparison across moments (side change, timeout, staff walking past). "Evenly probe 10
+      frames" samples 10 frames across the whole video, showing the size distribution of all kinds of
+      people at once.
+   2. **Distribution**: a **box-height histogram** (counting boxes **before** filtering, bars colored by
+      keep/drop), recomputing the retention ratio live as the slider moves.
+   3. **Measured data**: frame grab and probe do **detection only, no tracking**; the first call is about
+      4 s (including loading the model), and later grabs on the same video are **a fraction of a second**
+      (model reuse + decoding only that frame). The analysis result carries the same distribution
+      (`stats.player_trace.size_filter`, with per-frame reference scale, dropped box count and `sample`),
+      so the threshold is tried on **measured data**, not guessed.
 
-   > 抓到的帧图落在 `data/cache/frames/probe/` 下（约 30 KB 一张，同名覆盖），
-   > 「设置 → 清理缓存」会一起清掉。
+   > Grabbed frames land under `data/cache/frames/probe/` (about 30 KB each, overwritten by name) and are
+   > cleared together by "Settings → Clear cache".
 
-   > 「全被筛掉时保留原样」是有意的：宁可多给跟踪器一点噪声，也不要出现
-   > 「整段时间一个框都没有」——那会让下游的活跃度曲线和裁切跟随直接断档。
+   > "Keep as-is when everything is filtered" is intentional: better to give the tracker a little noise than
+   > to have "no box at all for a whole stretch", which would break the downstream activity curve and crop
+   > following.
 
-其他与机位相关的修正：
+Other camera-related corrections:
 
-- **竖屏自动跟随改用「左右包络」**。旧实现取的是所有球员框中心的**均值**，
-  侧方机位下两名球员在画面两端，均值正好落在他们中间，裁出来谁都没对准；
-  现在按「把两名球员的最左到最右都装进去」来定裁切框，双打也适用。
-- **修掉了竖屏导出可能出现的横向拉伸**：旧实现在「双打放不下」时会把裁切框
-  横向加宽到超过目标比例、再由缩放直接拉伸成 9:16，人会被拉胖。现在裁切框
-  始终严格等于目标宽高比，视野不够时**等比放大**而不是改变形状。
-- **修掉了竖屏素材下「两个不同的人被判成同一个人」**：判定重复框时的画面
-  宽高比原来写死 1.78，9:16 素材下横向距离被放大 3 倍以上，会把两个站得
-  不远的球员合并掉。
+- **Portrait auto-follow now uses a "left-right envelope".** The old implementation took the **mean** of all
+  player box centers; under a side-line setup the two players are at opposite ends of the frame and the mean
+  lands exactly between them, so the crop aimed at neither. It now sizes the crop to "fit both players from
+  their left-most to right-most extent", which also works for doubles.
+- **Fixed horizontal stretching that could appear in portrait exports**: the old implementation widened the
+  crop beyond the target aspect when "doubles do not fit", then the scaler stretched it directly to 9:16,
+  making people look fat. The crop box is now always exactly the target aspect; when the field of view is
+  insufficient it **upscales proportionally** instead of changing the shape.
+- **Fixed "two different people judged as one" on portrait footage**: the frame aspect ratio used when
+  detecting duplicate boxes was hard-coded to 1.78; on 9:16 footage the horizontal distance was magnified
+  more than 3×, merging two players standing not far apart.
 
 ---
 
-## 测试
+## Tests
 
 ```powershell
 .\.venv\Scripts\python.exe tests\test_core.py
 ```
 
-覆盖的是**静默失败最容易发生**的几处，不是算法准确度：
+The suite covers the places where **silent failures are most likely**, not algorithm accuracy:
 
-- 流水线调用 `analyze_players` / `analyze_shuttle` / `_select_active_players` /
-  `probe_boxes` 时用到的每个关键字参数都必须在签名里存在。球员模块的异常会被
-  pipeline 的 try/except 吞掉、只写进 `player_trace`，界面上看起来「分析成功」
-  但结果全乱，所以这类接口错配必须用测试挡住；
-- 球员框尺寸门限：过小的轨迹要被排除、真实球员要被选中；**两种框表示
-  （带轨迹号的五元组 / 检测阶段的四元组）都必须能算出参考尺度** ——
-  只认五元组时 `ref` 恒为 0、自适应门限会静默失效，而单元测试如果只喂五元组
-  就永远发现不了；
-- 人物框尺寸筛选：两种口径（绝对 / 同帧相对）+ 面积上下限逐条判对，
-  非法模式要退化成「不筛」，统计直方图必须覆盖**筛选前**的框；
-  试测取帧的路径要稳定且唯一，而且**要跳过 seek 之后返回的黑帧**
-  （拿黑帧给用户核对等于白抓）；
-- 场地多边形：环序整理、最大内接四边形拟合、场内判定（弯边以外要判成场外）、
-  外扩后边线上的点要算场内、退化的多边形（点数不足 / 面积过小）要被拒；
-- 自动标定的点数要跟着数据走：**弯边 mask 拟合成多于 4 点、直边 mask 仍然是 4 点**；
-- 手动标定的解析：点数不对 / 像素坐标 / 面积为零 / 空值都要被拒（4~24 点都接受）；
-- 切分：合成的「对拉 → 停顿 → 对拉」必须切出两段、位置正确、中间留间隔；
-- 静默段检测、球员检测覆盖率、消除首尾相接、活跃度谷值切分不产出相接区间。
+- Every keyword argument the pipeline passes to `analyze_players` / `analyze_shuttle` /
+  `_select_active_players` / `probe_boxes` must exist in the signature. Player-module exceptions are
+  swallowed by the pipeline's try/except and only written to `player_trace`, so the UI looks like "analysis
+  succeeded" while the results are garbage; such interface mismatches must be caught by tests.
+- Player box size thresholds: too-small tracks must be excluded and real players selected; **both box
+  representations (5-tuples with track ids / 4-tuples from the detection stage) must yield a reference
+  scale** — when only 5-tuples are recognized, `ref` is always 0 and the adaptive threshold silently fails,
+  which a unit test feeding only 5-tuples would never catch.
+- Person-box size filtering: both measures (absolute / same-frame relative) plus area bounds judged
+  correctly line by line; an invalid mode degrades to "no filtering"; the histogram must count boxes
+  **before** filtering; the probe frame path must be stable and unique, and must **skip black frames
+  returned after a seek** (grabbing a black frame for the user is useless).
+- Court polygon: ring ordering, largest inscribed quadrilateral fitting, on-court tests (beyond a curved
+  edge must be off-court), points on an edge after expansion must be on-court, and degenerate polygons (too
+  few points / too small area) must be rejected.
+- The auto-calibration point count follows the data: **a curved mask fits more than 4 points, a straight
+  mask stays at 4**.
+- Manual calibration parsing: wrong point count / pixel coordinates / zero area / empty values must be
+  rejected (4–24 points are accepted).
+- Segmentation: a synthetic "rally → pause → rally" must produce two segments at the right positions with a
+  gap between them.
+- Quiet-segment detection, player detection coverage, removal of end-to-end segments, and activity-valley
+  segmentation not producing abutting intervals.
+- Annotation evaluation: the pure functions (IoU matching, metrics) and the hit-density evidence.
+- Annotation parameter search must run and return usable optimal parameters (offline, no AI re-run).
+- Scene presets: parameter whitelist / polygon validation / id path safety.
+- Voice commands: phrase sanitization (at most 2, each ≤ 3 characters, whitespace stripped and deduplicated;
+  the same rules are enforced at the params layer), interface contract, silent degradation when the
+  dependency is missing, per-interval bonus application, and scoring/tagging.
 
 ---
 
-## 已知限制
+## Known limitations
 
-- 自动场地标定依赖「地面颜色在画面里足够大且与其他区域可分」。**实测素材上
-  能稳定圈出近半场，但远端场地因为被顶灯洗淡，饱和度掉到近端的三分之一，
-  会被判成墙而排除**。纯灰/木地板、反光严重、或者球场只占画面很小一角时
-  也会失败。这些情况下请用「标定场地」手动画一次（见上文），
-  **全景 / 鱼眼素材一定要多加几个点**。
-  自动标定失败时 `calibration.notes` 里会写明原因。
-- 自动标定的多边形最多 16 个点（手动最多 24 个）。边界弯得极端时
-  （交并比一直做不到 98.5%）会退回点数最接近的那个结果，并在
-  `calibration.distortion` 里体现「它有多不准」——超过 6% 建议手动标一次。
-- 单应变换永远只用**四个角**（多边形里面积最大的内接四边形）。弯边素材上
-  这是近似：靠近画面边角的距离（「谁离相机更近」「两人相距多远」）会偏。
-  受影响的是机位判定与距离比较；**球员筛选用的是多边形**，不受影响。
-- 球员跟踪在超广角鱼眼、多球场素材上仍然会难：实测 30 分钟素材里
-  比赛球员只在约 30%~55% 的时间上被稳定跟到（其余时间是捡球/休息，或者球员
-  在 960×540 代理上太小）。因此切分设计了「球员运动 → 活跃度谷值 → 迟滞状态机」
-  三级降级，并且会**按时间段**在「球员运动」和「活跃度谷值」之间择优；
-  实际用了哪条路径写在 `stats.segmentation.method` 里。
-- 羽毛球轨迹跟踪需要较高分辨率的素材才有意义，且**白色球场线是原理性盲区**
-  （球飞到白线上方时背景本身就是亮的），模块选择「宁漏不误」。
-- 记分牌识别（判断谁得分、是否关键分）留有接口但尚未启用。
-- 竖屏跟随仍是**逐片段取一次裁切框**，还没有做到逐帧平滑跟随。
-- 发球方识别依赖两名球员「离相机远近明显不同」；两人深度接近、或者是
-  高机位/俯拍时一律保持 `unknown`，不写错。
+- Automatic court calibration depends on "the floor color is large enough in frame and separable from other
+  regions". **On the tested footage it reliably frames the near half-court, but the far end is washed out by
+  ceiling lights and its saturation falls to a third of the near end, so it is classified as wall and
+  excluded.** It also fails on plain gray/wooden floors, strong reflections, or when the court occupies only
+  a small corner of the frame. In these cases calibrate once by hand (see above); **panoramic/fisheye
+  footage definitely needs several extra points**. When auto-calibration fails, `calibration.notes` states
+  the reason.
+- The auto-calibrated polygon has at most 16 points (manual up to 24). When the boundary is extremely curved
+  (IoU never reaches 98.5%) it falls back to the closest point count and reflects "how inaccurate it is" in
+  `calibration.distortion` — above 6%, calibrate manually.
+- The homography always uses only **four corners** (the largest inscribed quadrilateral of the polygon). On
+  curved-boundary footage this is an approximation: distances near the frame corners ("who is nearer the
+  camera", "how far apart are the two players") will drift. This affects the camera-angle decision and
+  distance comparisons; **player filtering uses the polygon and is unaffected**.
+- Player tracking is still hard on ultra-wide fisheye, multi-court footage: on the tested 30-minute clip the
+  match players were stably tracked for only about 30%–55% of the time (the rest is shuttle fetching/rest,
+  or players too small on the 960×540 proxy). Segmentation therefore has a three-level fallback
+  "player motion → activity valley → hysteresis state machine" and picks per time window between "player
+  motion" and "activity valley"; the path actually used is written to `stats.segmentation.method`.
+- Shuttle tracking only makes sense at higher resolution, and **the white court lines are a fundamental
+  blind spot** (when the shuttle flies over a line the background is itself bright); the module prefers
+  missing over false positives.
+- Scoreboard recognition (who scored, whether it is a key point) has an interface but is not enabled.
+- Portrait following still takes **one crop box per clip**; per-frame smooth following is not implemented.
+- Server-side attribution of the serving side depends on the two players being at **clearly different
+  depths**. When they are close in depth, or under a high/overhead angle, it always stays `unknown` rather
+  than guessing.

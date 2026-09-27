@@ -1,15 +1,22 @@
-"""媒体探测与派生资源生成（代理视频 / 音频 / 缩略图 / 雪碧图）。"""
+"""Media probing and derived asset generation (proxy video / audio / thumbnails / sprite sheet)."""
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import shutil
+import threading
+import uuid
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
+from loguru import logger
+
 from ..config import AUDIO_DIR, PROXIES_DIR, THUMBS_DIR, PROXY_FPS, PROXY_MAX_EDGE, AUDIO_SR
+from ..i18n import tr
 from . import ffmpeg as ff
 from .models import MediaInfo
 
@@ -20,7 +27,52 @@ def _noop(_p: float, _m: str = "") -> None:
     pass
 
 
-# ------------------------------------------------------------------ 探测
+def _part_path(out: Path) -> Path:
+    """Unique ``.part`` sibling of ``out`` (same directory, same final extension).
+
+    A fixed ``.part`` name lets two concurrent callers (e.g. a prepare job and the analysis
+    pipeline) feed their ffmpeg processes into the same file and corrupt each other's output.
+    """
+    return out.with_name(
+        f"{out.stem}.{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}.part{out.suffix}"
+    )
+
+
+# ------------------------------------------------------------------ Probing
+
+
+_pyav_error: str | None = None
+_pyav_checked = False
+
+
+def _pyav_ok() -> bool:
+    """Whether PyAV is available.
+
+    Windows with "Smart App Control / AppLocker" enabled blocks PyAV's unsigned native
+    extension (DLL load failed); probe only once and remember the failure so it is not
+    triggered repeatedly for every file.
+    """
+    global _pyav_error, _pyav_checked
+    if not _pyav_checked:
+        _pyav_checked = True
+        try:
+            import av  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            _pyav_error = f"{type(e).__name__}: {e}"
+    return _pyav_error is None
+
+
+def probe_backend_status() -> dict:
+    """For the "Settings / Environment" page: explains which chain is actually used to probe media."""
+    pyav = _pyav_ok()
+    ffprobe = ff.find_ffprobe()
+    return {
+        "active": "pyav" if pyav else ("ffprobe" if ffprobe else "ffmpeg"),
+        "pyav": pyav,
+        "pyav_error": _pyav_error,
+        "ffprobe": ffprobe,
+        "ffmpeg": ff.find_ffmpeg(),
+    }
 
 
 def _probe_pyav(path: Path) -> dict:
@@ -40,7 +92,7 @@ def _probe_pyav(path: Path) -> dict:
             "has_audio": a is not None,
             "nb_frames": int(v.frames) if v and v.frames else 0,
         }
-        # 旋转元数据
+        # Rotation metadata
         rot = 0
         if v is not None:
             for k in ("rotate", "rotation"):
@@ -104,11 +156,66 @@ def _probe_ffprobe(path: Path) -> dict:
     }
 
 
-def stable_media_id(path: str | Path) -> str:
-    """用文件路径（含大小）算一个稳定 id。
+_FFMPEG_DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+# Of the form `Stream #0:0[0x1](und): Video: hevc ...`; the order of the bracket/paren groups is not fixed.
+_FFMPEG_VIDEO_RE = re.compile(r"Stream #\d+:\d+[^:]*:\s*Video:\s*([A-Za-z0-9_]+)")
+_FFMPEG_AUDIO_RE = re.compile(r"Stream #\d+:\d+[^:]*:\s*Audio:\s*([A-Za-z0-9_]+)")
+_FFMPEG_SIZE_RE = re.compile(r"(\d{2,5})x(\d{2,5})")
+_FFMPEG_FPS_RE = re.compile(r"([\d.]+)\s*fps\b")
+# Handles both `displaymatrix: rotation of -90.00 degrees` and `rotation : -90` outputs
+_FFMPEG_ROT_RE = re.compile(r"(?:rotation of\s*|rotation\s*:\s*)(-?[\d.]+)")
 
-    随机的 UUID 会让「同一个文件重新探测」变成一个新素材，进而重复生成
-    代理视频、让已有分析结果失效。用路径哈希可以保证幂等。
+
+def _probe_ffmpeg(path: Path) -> dict:
+    """Fallback when ffprobe is unavailable: parse ``ffmpeg -i`` stderr metadata.
+
+    On Windows ``imageio-ffmpeg`` ships only ffmpeg, not ffprobe; PyAV may in turn be
+    blocked by app-control policy, so a probe path that depends only on ffmpeg must be kept.
+    """
+    res = ff.run([ff.find_ffmpeg(), "-hide_banner", "-i", str(path)])
+    text = res.stderr or ""
+    duration = 0.0
+    m = _FFMPEG_DUR_RE.search(text)
+    if m:
+        duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    vid = _FFMPEG_VIDEO_RE.search(text)
+    aud = _FFMPEG_AUDIO_RE.search(text)
+    width = height = 0
+    fps = 0.0
+    if vid:
+        # Parse only the video line, to avoid mistaking the audio sample rate/bitrate for the resolution.
+        line = text[vid.start():].splitlines()[0]
+        size = _FFMPEG_SIZE_RE.search(line)
+        if size:
+            width, height = int(size.group(1)), int(size.group(2))
+        fr = _FFMPEG_FPS_RE.search(line)
+        if fr:
+            fps = float(fr.group(1))
+    rot = 0
+    rm = _FFMPEG_ROT_RE.search(text)
+    if rm:
+        rot = int(float(rm.group(1))) % 360
+    if rot % 180 == 90:
+        width, height = height, width
+    return {
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "fps": fps or 30.0,
+        "vcodec": vid.group(1) if vid else "",
+        "acodec": aud.group(1) if aud else None,
+        "has_audio": aud is not None,
+        "nb_frames": 0,
+        "rotation": rot,
+    }
+
+
+def stable_media_id(path: str | Path) -> str:
+    """Compute a stable id from the file path (including size).
+
+    A random UUID makes "probing the same file again" become a new media item, which then
+    regenerates the proxy video and invalidates existing analysis results. Hashing the path
+    guarantees idempotence.
     """
     import hashlib
 
@@ -121,22 +228,34 @@ def stable_media_id(path: str | Path) -> str:
     return "m_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
+def _probe_media_raw(p: Path) -> dict:
+    """Try PyAV / ffprobe / ffmpeg in order; use whichever first returns a complete duration + resolution."""
+    info: dict = {}
+    errors: list[str] = []
+    probes = [_probe_ffprobe, _probe_ffmpeg]
+    if _pyav_ok():
+        probes.insert(0, _probe_pyav)
+    for probe in probes:
+        try:
+            got = probe(p)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{probe.__name__}: {type(e).__name__}: {e}")
+            continue
+        for k, v in got.items():
+            if not info.get(k):
+                info[k] = v
+        if info.get("duration", 0) > 0 and info.get("width", 0) > 0:
+            return info
+    if not info:
+        raise RuntimeError(tr("media.probe_failed", detail="；".join(errors)))
+    return info
+
+
 def probe_media(path: str | Path) -> MediaInfo:
     p = Path(path)
     if not p.is_file():
-        raise FileNotFoundError(f"媒体文件不存在: {p}")
-    try:
-        info = _probe_pyav(p)
-    except Exception:
-        info = _probe_ffprobe(p)
-    if info.get("duration", 0) <= 0 or info.get("width", 0) <= 0:
-        try:
-            fb = _probe_ffprobe(p)
-            for k, v in fb.items():
-                if not info.get(k):
-                    info[k] = v
-        except Exception:
-            pass
+        raise FileNotFoundError(tr("media.file_not_found", path=p))
+    info = _probe_media_raw(p)
     return MediaInfo(
         id=stable_media_id(p),
         path=str(p),
@@ -153,7 +272,7 @@ def probe_media(path: str | Path) -> MediaInfo:
     )
 
 
-# ------------------------------------------------------------------ 派生资源
+# ------------------------------------------------------------------ Derived assets
 
 
 def proxy_target(media: MediaInfo) -> tuple[int, int]:
@@ -168,21 +287,47 @@ def proxy_target(media: MediaInfo) -> tuple[int, int]:
     return max(2, tw), max(2, th)
 
 
+def proxy_source(media: MediaInfo) -> Path:
+    """Resolve "prefer the proxy but fall back to the source" for every read path.
+
+    ``media.proxy_path`` may point at a file that no longer exists (it was removed by the cache
+    cleanup). The old ``media.proxy_path or media.path`` only fell back when the field was *empty*,
+    so a stale non-empty path was handed to cv2/ffmpeg and failed. Fall back whenever the file is
+    gone, not only when the field is unset.
+    """
+    if media.proxy_path:
+        p = Path(media.proxy_path)
+        if p.is_file():
+            return p
+    return Path(media.path)
+
+
+def proxy_stem(media: MediaInfo) -> str:
+    """Deterministic name of the proxy file (the same formula :func:`ensure_proxy` writes).
+
+    Callers that key artifacts on the proxy name (rally annotations) need it even when
+    ``proxy_path`` has been cleared from the project, so it must not depend on the file existing.
+    """
+    tw, th = proxy_target(media)
+    return f"{Path(media.path).stem}_{media.id}_{tw}x{th}"
+
+
 def _scale_filter(w: int, h: int, fps: float) -> str:
     return f"scale={w}:{h}:flags=bilinear,fps={fps:g},setsar=1"
 
 
-# ------------------------------------------------------------------ 硬件加速
+# ------------------------------------------------------------------ Hardware acceleration
 
 
 _HW_PROBE: dict[str, bool] = {}
 
 
 def hardware_available() -> bool:
-    """检测「CUDA 解码 + scale_cuda + NVENC」这条链路是否真的能用。
+    """Check whether the "CUDA decode + scale_cuda + NVENC" chain really works.
 
-    只信 ffmpeg 的 `-hwaccels` 声明不够——很多构建声明了 cuda 却没有可用的
-    CUDA 设备，所以这里真跑一次 2 帧的短转码来判定，结果缓存起来。
+    Trusting ffmpeg's `-hwaccels` declaration alone is not enough -- many builds declare cuda
+    but have no usable CUDA device, so this actually runs a 2-frame transcode to decide and
+    caches the result.
     """
     import os
 
@@ -211,7 +356,7 @@ def hardware_available() -> bool:
 
 
 def hwaccel_input_args(media: MediaInfo) -> list[str]:
-    """高分辨率素材才值得开硬件解码；小素材走软件路径反而更省事。"""
+    """Only high-resolution media is worth hardware decoding; small media is actually easier through the software path."""
     if not hardware_available():
         return []
     if max(media.width or 0, media.height or 0) < 1440:
@@ -224,11 +369,12 @@ def hw_scale_filter(w: int, h: int, fps: float) -> str:
 
 
 def nvenc_args(quality: int = 26, bitrate: str = "4M") -> list[str]:
-    """NVENC 参数。
+    """NVENC parameters.
 
-    注意：实测这个 ffmpeg 构建的 ``h264_nvenc`` **只在帧来自 CUDA 显存时可用**
-    （输入走 ``-hwaccel_output_format cuda`` 或滤镜链末尾有 ``hwupload_cuda``），
-    否则会报 "No capable devices found"。所以这里始终配合 GPU 滤镜链使用。
+    Note: in this ffmpeg build ``h264_nvenc`` **only works when frames come from CUDA
+    memory** (input uses ``-hwaccel_output_format cuda`` or the filter chain ends with
+    ``hwupload_cuda``), otherwise it reports "No capable devices found". So it is always
+    used together with a GPU filter chain here.
     """
     return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr",
             "-cq", str(quality), "-b:v", bitrate, "-maxrate", _mul(bitrate, 2),
@@ -245,7 +391,7 @@ def _mul(br: str, k: float) -> str:
 
 
 def _probe_duration(path: Path) -> float:
-    """快速读取文件时长，用来校验派生资源是否完整。"""
+    """Quickly read the file duration, used to verify that a derived asset is complete."""
     try:
         import av
 
@@ -257,15 +403,19 @@ def _probe_duration(path: Path) -> float:
                 return float(v.duration * v.time_base)
     except Exception:
         pass
-    return 0.0
+    try:  # fall back to ffmpeg when PyAV is blocked / ffprobe is unavailable
+        return float(_probe_ffmpeg(path).get("duration", 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _is_valid(path: Path, expected: float, tol: float = 0.06, min_bytes: int = 4096) -> bool:
-    """判断已有派生文件能否直接复用。
+    """Decide whether an existing derived file can be reused directly.
 
-    必须同时满足：文件够大、能被解出、时长和源差不多。
-    任务被取消时 ffmpeg 会留下一个没有 moov 的残file，只判断「文件存在」
-    会导致后续全部复用这个坏文件。
+    Must satisfy all of: the file is large enough, it can be decoded, and its duration is
+    close to the source. When a job is cancelled ffmpeg leaves behind a broken file without
+    a moov atom; checking only "the file exists" would cause that bad file to be reused
+    everywhere afterwards.
     """
     if not path.is_file() or path.stat().st_size < min_bytes:
         return False
@@ -278,31 +428,35 @@ def _is_valid(path: Path, expected: float, tol: float = 0.06, min_bytes: int = 4
 
 
 def ensure_proxy(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaInfo:
-    """生成低分辨率代理视频（AI 分析与网页预览都用它）。
+    """Generate a low-resolution proxy video (used by both AI analysis and web preview).
 
-    优先走「CUDA 解码 → scale_cuda → NVENC」这条全 GPU 链路：实测 4K HEVC
-    能跑到 8 倍实时以上，比纯 CPU 快一个数量级。失败自动退回软件编码。
+    Prefer the fully GPU path "CUDA decode -> scale_cuda -> NVENC": measured 4K HEVC can run
+    at over 8x real time, an order of magnitude faster than pure CPU. Fall back to software
+    encoding automatically on failure.
 
-    写入始终走 ``.part`` 临时文件，成功校验后才改名，避免中断留下坏文件。
+    Writes always go through a ``.part`` temporary file and are renamed only after
+    verification, to avoid leaving a broken file on interruption.
     """
     src = Path(media.path)
     tw, th = proxy_target(media)
-    out = PROXIES_DIR / f"{src.stem}_{media.id}_{tw}x{th}.mp4"
+    out = PROXIES_DIR / f"{proxy_stem(media)}.mp4"
     media.proxy_width, media.proxy_height = tw, th
     media.proxy_fps = min(PROXY_FPS, media.fps or PROXY_FPS)
 
     if _is_valid(out, media.duration, min_bytes=65536):
-        on(0.6, "复用已有代理视频")
+        on(0.6, tr("media.reuse_proxy"))
         media.proxy_path = str(out)
         return media
     out.unlink(missing_ok=True)
+    logger.info("proxy generate: {!r} -> {} ({}x{} @ {:.2f}fps)",
+                src.name, out.name, tw, th, media.proxy_fps)
 
-    part = out.with_suffix(".part.mp4")
+    part = _part_path(out)
     hw_in = hwaccel_input_args(media)
     attempts: list[tuple[str, list[str]]] = []
 
     if hw_in:
-        attempts.append(("硬件加速", [
+        attempts.append((tr("media.hw_accel"), [
             ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin", *hw_in, "-i", str(src),
             "-vf", hw_scale_filter(tw, th, media.proxy_fps),
             *nvenc_args(26),
@@ -310,7 +464,7 @@ def ensure_proxy(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaIn
             "-movflags", "+faststart", "-progress", "pipe:1", "-loglevel", "error", str(part),
         ]))
 
-    attempts.append(("软件编码", [
+    attempts.append((tr("media.sw_encode"), [
         ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin", "-i", str(src),
         "-vf", _scale_filter(tw, th, media.proxy_fps),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -322,7 +476,7 @@ def ensure_proxy(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaIn
     last_err = ""
     for label, cmd in attempts:
         variants = [cmd]
-        # 无声源回退：把音频参数换掉
+        # Silent-source fallback: swap out the audio arguments
         if "-c:a" in cmd:
             v2 = [c for c in cmd if c not in ("-c:a", "aac", "-b:a", "128k", "-ac", "2")]
             v2.insert(v2.index("-c:v"), "-an")
@@ -330,19 +484,21 @@ def ensure_proxy(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaIn
         for cmd_v in variants:
             part.unlink(missing_ok=True)
             res = ff.run_with_progress(
-                cmd_v, media.duration, lambda p, m=label: on(0.6 * p, f"生成代理视频（{m}）"), cancel
+                cmd_v, media.duration, lambda p, m=label: on(0.6 * p, tr("media.proxy_generating", mode=m)), cancel
             )
             if res.ok and _is_valid(part, media.duration, min_bytes=65536):
                 part.replace(out)
                 media.proxy_path = str(out)
+                logger.info("proxy ready: {} ({})", out.name, label)
                 return media
             last_err = (res.stdout or "")[-2000:]
     part.unlink(missing_ok=True)
-    raise RuntimeError(f"代理视频生成失败:\n{last_err}")
+    logger.error("proxy failed for {!r}: {}", src.name, last_err[-500:])
+    raise RuntimeError(tr("media.proxy_failed", err=last_err))
 
 
 def ensure_audio(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaInfo:
-    """提取单声道 16k PCM，用于击球/回合音频分析（同样原子写入 + 校验）。"""
+    """Extract mono 16k PCM for hit/rally audio analysis (same atomic write + verification)."""
     if not media.has_audio:
         media.audio_path = None
         return media
@@ -352,31 +508,34 @@ def ensure_audio(media: MediaInfo, on: Progress = _noop, cancel=None) -> MediaIn
         media.audio_path = str(out)
         return media
     out.unlink(missing_ok=True)
-    part = out.with_suffix(".part.wav")
+    part = _part_path(out)
     cmd = [
         ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin",
         "-i", str(src), "-vn", "-ac", "1", "-ar", str(AUDIO_SR),
         "-c:a", "pcm_s16le", "-progress", "pipe:1", "-loglevel", "error", str(part),
     ]
-    res = ff.run_with_progress(cmd, media.duration, lambda p: on(0.15 + 0.15 * p, "提取音轨"), cancel)
+    res = ff.run_with_progress(cmd, media.duration, lambda p: on(0.15 + 0.15 * p, tr("media.extract_audio")), cancel)
     if not res.ok or not _is_valid(part, media.duration, min_bytes=8192):
         part.unlink(missing_ok=True)
         media.audio_path = None
+        logger.warning("audio extraction failed for {!r} (continuing without audio)", src.name)
         return media
     part.replace(out)
     media.audio_path = str(out)
+    logger.info("audio ready: {}", out.name)
     return media
 
 
 def ensure_poster(media: MediaInfo, at: float | None = None, on: Progress = _noop,
                   force: bool = False) -> MediaInfo:
-    """生成封面。
+    """Generate a poster.
 
-    默认取片长 25% 处；但如果分析已经知道哪些时间点有内容，调用方应该传入
-    ``at``（例如最高分回合的中间时刻），否则很容易抓到「有人正走过镜头」的黑历史。
-    ``at`` 会参与文件名，所以换了更好的一帧会直接覆盖旧封面。
+    Defaults to 25% of the clip length; but if the analysis already knows which time points
+    have content, the caller should pass ``at`` (for example the midpoint of the highest-scoring
+    rally), otherwise it easily captures an embarrassing "someone walking past the lens" frame.
+    ``at`` is part of the filename, so switching to a better frame directly overwrites the old poster.
     """
-    src = Path(media.proxy_path or media.path)
+    src = proxy_source(media)
     t = at if at is not None else min(max(media.duration * 0.25, 1.0), 600.0)
     tag = f"{int(t)}" if at is not None else "default"
     out = THUMBS_DIR / f"{media.id}_poster_{tag}.jpg"
@@ -406,8 +565,8 @@ def make_sprite(
     tile_w: int = 160,
     on: Progress = _noop,
 ) -> dict | None:
-    """生成时间线用的缩略图雪碧图。"""
-    src = Path(media.proxy_path or media.path)
+    """Generate the thumbnail sprite sheet used by the timeline."""
+    src = proxy_source(media)
     if media.duration <= 0:
         return None
     count = max(10, min(count, 400))
@@ -436,11 +595,11 @@ def make_sprite(
     }
 
 
-# ------------------------------------------------------------------ 抽帧
+# ------------------------------------------------------------------ Frame extraction
 
 
 def extract_frame(media: MediaInfo, t: float, out_png: Path, max_edge: int = 0) -> Path | None:
-    src = Path(media.proxy_path or media.path)
+    src = proxy_source(media)
     vf = f"scale={max_edge}:-2" if max_edge else None
     cmd = [ff.find_ffmpeg(), "-hide_banner", "-y", "-nostdin", "-ss", f"{max(0.0, t):.3f}", "-i", str(src)]
     if vf:
@@ -457,15 +616,16 @@ def extract_thumb_grid(
     thumb_h: int = 108,
     gap: int = 4,
 ) -> Path | None:
-    """把若干时刻的帧纵向拼成一张联络图。
+    """Vertically stitch frames from several time points into a contact sheet.
 
-    用 ffmpeg 逐帧取样而非 OpenCV：在超长 HEVC（4K/20GB 级）上
-    ``cv2.VideoCapture.set(POS_MSEC)`` 会 seek 到关键帧后返回黑帧。
+    Use ffmpeg to sample frame by frame rather than OpenCV: on very long HEVC files
+    (4K/20GB class) ``cv2.VideoCapture.set(POS_MSEC)`` seeks to a keyframe and returns a
+    black frame.
     """
     import cv2
     import numpy as np
 
-    src = Path(media.proxy_path or media.path)
+    src = proxy_source(media)
     frames: list[np.ndarray] = []
     tmp = out_path.parent / f".thumb_{out_path.stem}"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -520,6 +680,8 @@ def cleanup_cache(keep_ids: set[str]) -> None:
 __all__ = [
     "probe_media",
     "ensure_proxy",
+    "proxy_source",
+    "proxy_stem",
     "ensure_audio",
     "ensure_poster",
     "make_sprite",

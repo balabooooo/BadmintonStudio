@@ -14,6 +14,8 @@ import type { AnalysisParams, PlayerProbeFrame, PlayerSizeStats } from '../lib/t
 import { cn } from '../lib/format'
 import { Button, Segmented, Slider } from './ui'
 import { useStore } from '../store/useStore'
+import { useT } from '../i18n/useT'
+import { t as translate } from '../i18n'
 
 /** 直方图分箱与横轴上限：与后端 `players.SIZE_HIST_BINS / SIZE_HIST_MAX` 对齐。 */
 const BINS = 24
@@ -49,10 +51,10 @@ function dropReason(s: number[], p: AnalysisParams): string | null {
     lo = p.player_min_height * ref
     hi = p.player_max_height > 0 ? p.player_max_height * ref : 0
   }
-  if (lo > 0 && h < lo) return '低于下限'
-  if (hi > 0 && h > hi) return '超过上限'
-  if (p.player_min_area > 0 && area < p.player_min_area) return '面积过小'
-  if (p.player_max_area > 0 && area > p.player_max_area) return '面积过大'
+  if (lo > 0 && h < lo) return translate('sizefilter.reason.belowMin')
+  if (hi > 0 && h > hi) return translate('sizefilter.reason.aboveMax')
+  if (p.player_min_area > 0 && area < p.player_min_area) return translate('sizefilter.reason.areaTooSmall')
+  if (p.player_max_area > 0 && area > p.player_max_area) return translate('sizefilter.reason.areaTooLarge')
   return null
 }
 
@@ -86,6 +88,7 @@ function FrameView({
   aspect: number
   params: AnalysisParams
 }) {
+  const tr = useT()
   const wrapRef = useRef<HTMLDivElement>(null)
   const [box, setBox] = useState({ w: 0, h: 0 })
 
@@ -156,6 +159,7 @@ function FrameView({
                 const y2 = oy + b[3] * vh
                 const color = reason ? DROP_COLOR : KEEP_COLOR
                 const label = `#${i + 1} ${(h * 100).toFixed(1)}%${reason ? ` ${reason}` : ''}`
+                const areaPct = (100 * (b[2] - b[0]) * (b[3] - b[1])).toFixed(2)
                 return (
                   <g key={i}>
                     <rect
@@ -169,7 +173,9 @@ function FrameView({
                       strokeWidth={2}
                       strokeDasharray={reason ? '5 3' : undefined}
                     >
-                      <title>{`框 ${i + 1}：高 ${(h * 100).toFixed(1)}% · 面积 ${(100 * (b[2] - b[0]) * (b[3] - b[1])).toFixed(2)}%${reason ? ` · 会被筛掉（${reason}）` : ' · 会被保留'}`}</title>
+                      <title>{reason
+                        ? tr('sizefilter.frame.boxTitleDropped', { n: i + 1, h: (h * 100).toFixed(1), area: areaPct, reason })
+                        : tr('sizefilter.frame.boxTitleKept', { n: i + 1, h: (h * 100).toFixed(1), area: areaPct })}</title>
                     </rect>
                     <text
                       x={x1 + 2}
@@ -192,8 +198,8 @@ function FrameView({
         ) : (
           <div className="grid h-full w-full place-items-center px-6 text-center text-[11.5px] leading-relaxed text-ink-500">
             {frame
-              ? '这一帧没有存到画面（只拿到了框）'
-              : '点「抓这一帧」把当前时间的画面抓出来，框会直接画在画面上'}
+              ? tr('sizefilter.frame.noImage')
+              : tr('sizefilter.frame.prompt')}
           </div>
         )}
       </div>
@@ -202,20 +208,24 @@ function FrameView({
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px]">
           <span className="mono text-ink-300">t = {frame.t.toFixed(2)}s</span>
           <span className="text-ink-400">
-            这一帧 <span className="mono text-ink-200">{items.length}</span> 个框 ·
-            保留 <span className="mono" style={{ color: KEEP_COLOR }}>{keptN}</span> ·
-            筛掉 <span className="mono" style={{ color: DROP_COLOR }}>{items.length - keptN}</span>
+            {tr('sizefilter.frame.statsThisFrame')}{' '}
+            <span className="mono text-ink-200">{items.length}</span>{' '}
+            {tr('sizefilter.frame.statsBoxes')} ·{' '}
+            {tr('sizefilter.frame.statsKept')}{' '}
+            <span className="mono" style={{ color: KEEP_COLOR }}>{keptN}</span> ·{' '}
+            {tr('sizefilter.frame.statsDropped')}{' '}
+            <span className="mono" style={{ color: DROP_COLOR }}>{items.length - keptN}</span>
           </span>
           {frame.ref > 0 && (
-            <span className="text-ink-500">参考框高（同帧最大）{(frame.ref * 100).toFixed(1)}%</span>
+            <span className="text-ink-500">{tr('sizefilter.frame.refHeight', { pct: (frame.ref * 100).toFixed(1) })}</span>
           )}
           <span className="inline-flex items-center gap-1 text-ink-500">
-            <span className="inline-block h-[3px] w-4 rounded-full" style={{ background: KEEP_COLOR }} />保留
+            <span className="inline-block h-[3px] w-4 rounded-full" style={{ background: KEEP_COLOR }} />{tr('sizefilter.legend.keep')}
             <span
               className="ml-1 inline-block h-[3px] w-4 rounded-full"
               style={{ background: `repeating-linear-gradient(90deg, ${DROP_COLOR} 0 4px, transparent 4px 7px)` }}
             />
-            筛掉
+            {tr('sizefilter.legend.drop')}
           </span>
         </div>
       )}
@@ -235,6 +245,7 @@ function SizeHistogram({
   params: AnalysisParams
   relative: boolean
 }) {
+  const tr = useT()
   const { counts, kcounts, kept, total, maxCount, xMax } = useMemo(() => {
     const xMax = relative ? 1.0 : H_MAX
     const counts = new Array<number>(BINS).fill(0)
@@ -268,7 +279,7 @@ function SizeHistogram({
                 key={i}
                 className="flex-1 overflow-hidden rounded-t-[2px] bg-ink-600/50"
                 style={{ height: `${(c / maxCount) * 100}%` }}
-                title={`${c} 个框，保留 ${kcounts[i]}`}
+                title={tr('sizefilter.hist.barTitle', { n: c, kept: kcounts[i] })}
               >
                 <div
                   className="w-full bg-court-400/80"
@@ -280,35 +291,37 @@ function SizeHistogram({
         </div>
         {total === 0 && (
           <div className="absolute inset-0 grid place-items-center text-[11px] text-ink-500">
-            还没有数据：先跑一次分析，或抓一帧看看
+            {tr('sizefilter.hist.empty')}
           </div>
         )}
         {active && params.player_min_height > 0 && (
           <div
             className="absolute top-0 bottom-0 w-[2px] bg-court-300"
             style={{ left: `${pct(params.player_min_height)}%` }}
-            title={`下限 ${params.player_min_height}`}
+            title={tr('sizefilter.hist.lowerBound', { v: params.player_min_height })}
           />
         )}
         {active && params.player_max_height > 0 && (
           <div
             className="absolute top-0 bottom-0 w-[2px] bg-amber-glow"
             style={{ left: `${pct(params.player_max_height)}%` }}
-            title={`上限 ${params.player_max_height}`}
+            title={tr('sizefilter.hist.upperBound', { v: params.player_max_height })}
           />
         )}
       </div>
       <div className="mt-1 flex items-center justify-between text-[10.5px] text-ink-500">
         <span>0</span>
-        <span>{relative ? '横轴：框高 ÷ 同帧最大框高' : '横轴：框高（占画面高度，比例）'}</span>
+        <span>{relative ? tr('sizefilter.hist.axisRelative') : tr('sizefilter.hist.axisAbsolute')}</span>
         <span>{relative ? '1.0' : H_MAX.toFixed(1)}</span>
       </div>
       {total > 0 && (
         <div className="mt-1 text-[11px] text-ink-400">
-          按当前条件保留 <span className="mono text-court-300">{kept}</span> / {total} 个框
-          <span className="text-ink-500">（{((kept / Math.max(1, total)) * 100).toFixed(0)}%）</span>
+          {tr('sizefilter.hist.keptPre')}{' '}
+          <span className="mono text-court-300">{kept}</span>
+          {' / '}{total} {tr('sizefilter.hist.keptPost')}
+          <span className="text-ink-500">{tr('sizefilter.hist.percent', { pct: ((kept / Math.max(1, total)) * 100).toFixed(0) })}</span>
           {active && kept === total && (
-            <span className="text-amber-glow"> · 目前一个都没筛掉，可以把下限调高一点</span>
+            <span className="text-amber-glow"> · {tr('sizefilter.hist.noneDropped')}</span>
           )}
         </div>
       )}
@@ -346,6 +359,7 @@ function mergeFrames(prev: PlayerProbeFrame[], add: PlayerProbeFrame[]): PlayerP
  * 3. **两种口径**：绝对比例 / 同帧相对（后者对畸变更稳），外加面积上下限。
  */
 export default function SizeFilterPanel() {
+  const tr = useT()
   const params = useStore((s) => s.params)
   const setParams = useStore((s) => s.setParams)
   const project = useStore((s) => s.project)
@@ -402,8 +416,8 @@ export default function SizeFilterPanel() {
         if (res.error || !res.frames.length) {
           toast({
             kind: 'warn',
-            title: '没抓到画面',
-            detail: res.error || '这一帧没读出画面，换个时间再试',
+            title: tr('sizefilter.toast.noFrame.title'),
+            detail: res.error || tr('sizefilter.toast.noFrame.detail'),
           })
           return
         }
@@ -419,17 +433,21 @@ export default function SizeFilterPanel() {
         if (body.at_time === undefined) {
           toast({
             kind: 'success',
-            title: `抓到 ${res.frames.length} 帧`,
-            detail: `共 ${res.frames.reduce((a, f) => a + f.boxes.length, 0)} 个框 · 用了 ${res.elapsed.toFixed(1)}s · ${res.device}`,
+            title: tr('sizefilter.toast.caught.title', { n: res.frames.length }),
+            detail: tr('sizefilter.toast.caught.detail', {
+              boxes: res.frames.reduce((a, f) => a + f.boxes.length, 0),
+              elapsed: res.elapsed.toFixed(1),
+              device: res.device,
+            }),
           })
         }
       } catch (e) {
-        toast({ kind: 'error', title: '试测失败', detail: String(e) })
+        toast({ kind: 'error', title: tr('sizefilter.toast.failed.title'), detail: String(e) })
       } finally {
         setBusy(false)
       }
     },
-    [project, media, params, manualPoly, frames, toast],
+    [project, media, params, manualPoly, frames, toast, tr],
   )
 
   /** 用实测分布给一个推荐下限：多少比例的人框能被留下。 */
@@ -443,10 +461,10 @@ export default function SizeFilterPanel() {
     }
     toast({
       kind: 'info',
-      title: '已填入推荐阈值',
+      title: tr('sizefilter.toast.recommend.title'),
       detail: params.player_size_mode === 'relative'
-        ? '同帧最大框的 42%：比它更小的人框基本不是比赛球员'
-        : '按实测参考尺度（每帧最大框的 90 分位）折算，与自动门限同源',
+        ? tr('sizefilter.toast.recommend.relative')
+        : tr('sizefilter.toast.recommend.absolute'),
     })
   }
 
@@ -454,7 +472,7 @@ export default function SizeFilterPanel() {
     <div className="mb-4 rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-[12.5px] font-medium text-ink-100">
-          <Ruler size={13} className="text-court-300" /> 人物框尺寸筛选
+          <Ruler size={13} className="text-court-300" /> {tr('sizefilter.title')}
         </div>
         <Segmented
           size="sm"
@@ -472,18 +490,17 @@ export default function SizeFilterPanel() {
             })
           }}
           options={[
-            { value: 'off', label: '不筛', hint: '只保留原有的自适应尺寸门限' },
-            { value: 'absolute', label: '绝对比例', hint: '按框高占画面高度的比例筛' },
-            { value: 'relative', label: '同帧相对', hint: '按框高 ÷ 同帧最大框高筛，畸变素材更稳' },
+            { value: 'off', label: tr('sizefilter.mode.off.label'), hint: tr('sizefilter.mode.off.hint') },
+            { value: 'absolute', label: tr('sizefilter.mode.absolute.label'), hint: tr('sizefilter.mode.absolute.hint') },
+            { value: 'relative', label: tr('sizefilter.mode.relative.label'), hint: tr('sizefilter.mode.relative.hint') },
           ]}
         />
       </div>
 
       <div className="mt-2 text-[11px] leading-relaxed text-ink-400">
-        只在检测阶段丢掉「明显不是这场比赛球员」的人框。看台比球员更靠前、
-        或者全景镜头把画面边角的人拉大/缩小的时候，自动门限会被带偏，这时用手动阈值最有效。
+        {tr('sizefilter.desc')}
         {params.player_size_mode === 'relative' && (
-          <span className="text-court-300"> 当前口径在每一帧里重新归一，免疫「位置不同框大小不同」。</span>
+          <span className="text-court-300"> {tr('sizefilter.descRelative')}</span>
         )}
       </div>
 
@@ -491,7 +508,7 @@ export default function SizeFilterPanel() {
       <div className="mt-2.5 rounded-xl border border-white/8 bg-black/25 px-3 py-2.5">
         <div className="flex flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1.5 text-[11.5px] text-ink-200">
-            <ImageIcon size={12} className="text-court-300" /> 帧核对
+            <ImageIcon size={12} className="text-court-300" /> {tr('sizefilter.frameCheck.title')}
           </span>
           <Button
             variant="primary"
@@ -500,25 +517,25 @@ export default function SizeFilterPanel() {
             onClick={() => runProbe({ at_time: time }, time)}
           >
             {busy ? <Loader2 size={12} className="spin" /> : <Camera size={12} />}
-            {busy ? '检测中…' : '抓这一帧'}
+            {busy ? tr('sizefilter.frameCheck.detecting') : tr('sizefilter.frameCheck.grab')}
           </Button>
           <Button
             variant="ghost"
             size="sm"
             disabled={!media || currentTime <= 0}
             onClick={() => setTime(currentTime)}
-            title="把滑杆对到预览播放头的位置"
+            title={tr('sizefilter.frameCheck.usePlayheadHint')}
           >
-            用播放头 {currentTime > 0 ? `${currentTime.toFixed(1)}s` : ''}
+            {tr('sizefilter.frameCheck.usePlayhead', { time: currentTime > 0 ? `${currentTime.toFixed(1)}s` : '' })}
           </Button>
           <Button
             variant="ghost"
             size="sm"
             disabled={busy || !media}
             onClick={() => runProbe({ count: 10 })}
-            title="在整条视频上均匀抽 10 帧，一次看清各类人框的大小分布"
+            title={tr('sizefilter.frameCheck.sampleHint')}
           >
-            <ScanSearch size={12} /> 均匀试测 10 帧
+            <ScanSearch size={12} /> {tr('sizefilter.frameCheck.sample')}
           </Button>
           {frames.length > 0 && (
             <Button
@@ -528,21 +545,21 @@ export default function SizeFilterPanel() {
                 setFrames([])
                 setSel(0)
               }}
-              title="清掉抓到的帧"
+              title={tr('sizefilter.frameCheck.clearHint')}
             >
-              <Trash2 size={12} /> 清空 {frames.length} 帧
+              <Trash2 size={12} /> {tr('sizefilter.frameCheck.clear', { n: frames.length })}
             </Button>
           )}
           {meta && (
             <span className="text-[10.5px] text-ink-500">
-              最近一次 {meta.elapsed.toFixed(1)}s · {meta.device}
+              {tr('sizefilter.frameCheck.lastRun', { elapsed: meta.elapsed.toFixed(1), device: meta.device })}
             </span>
           )}
         </div>
 
         <div className="mt-2 max-w-[520px]">
           <Slider
-            label="手动选帧"
+            label={tr('sizefilter.frameCheck.sliderLabel')}
             value={time}
             min={0}
             max={Math.max(1, Math.round(duration))}
@@ -550,7 +567,7 @@ export default function SizeFilterPanel() {
             onChange={setTime}
             disabled={!media || duration <= 0}
             format={(v) => `${v.toFixed(1)}s`}
-            hint="拖到想看的位置，再点「抓这一帧」；缩略图条里也可以直接点"
+            hint={tr('sizefilter.frameCheck.sliderHint')}
           />
         </div>
 
@@ -560,7 +577,7 @@ export default function SizeFilterPanel() {
               <button
                 key={f.t.toFixed(1)}
                 onClick={() => setSel(i)}
-                title={`${f.t.toFixed(2)}s · ${f.boxes.length} 个框（点击查看）`}
+                title={tr('sizefilter.frameCheck.thumbTitle', { t: f.t.toFixed(2), n: f.boxes.length })}
                 className={cn(
                   'relative h-[46px] w-[82px] shrink-0 overflow-hidden rounded-md border transition-all',
                   i === sel ? 'border-court-400 ring-1 ring-court-400/40' : 'border-white/10 hover:border-white/30',
@@ -570,7 +587,7 @@ export default function SizeFilterPanel() {
                   <img src={api.assetUrl(f.image, 86400)} alt="" className="h-full w-full object-cover" />
                 ) : (
                   <span className="grid h-full w-full place-items-center bg-ink-900 text-[10px] text-ink-500">
-                    无图
+                    {tr('sizefilter.frameCheck.noImage')}
                   </span>
                 )}
                 <span className="mono absolute right-0 bottom-0 rounded-tl bg-black/70 px-1 text-[9px] text-ink-200">
@@ -585,35 +602,35 @@ export default function SizeFilterPanel() {
           <FrameView frame={cur} aspect={aspect} params={params} />
         </div>
         <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
-          拖下面的阈值滑杆，画面里的框会**立刻**变色（判定在本地做，不用重跑检测）：
-          <span style={{ color: KEEP_COLOR }}> 绿实线＝会保留</span>、
-          <span style={{ color: DROP_COLOR }}> 红虚线＝会筛掉</span>，
-          鼠标停在框上能看到它的框高与面积。
+          {tr('sizefilter.frameCheck.explain')}
+          <span style={{ color: KEEP_COLOR }}> {tr('sizefilter.frameCheck.keepLegend')}</span>、
+          <span style={{ color: DROP_COLOR }}> {tr('sizefilter.frameCheck.dropLegend')}</span>，
+          {tr('sizefilter.frameCheck.hoverHint')}
         </div>
       </div>
 
       {/* ---- 阈值 ---- */}
       <div className="mt-2.5 grid gap-x-5 gap-y-1 md:grid-cols-2">
         <Slider
-          label="框高下限"
+          label={tr('sizefilter.slider.minHeight.label')}
           value={params.player_min_height}
           min={0}
           max={relative ? 1 : 0.4}
           step={relative ? 0.01 : 0.005}
           onChange={(v) => setParams({ player_min_height: v })}
-          format={(v) => (relative ? `最大框的 ${(v * 100).toFixed(0)}%` : `画面高的 ${(v * 100).toFixed(1)}%`)}
-          hint="比它更小的框在检测阶段就被丢掉（观众、隔壁场地、远处的人）"
+          format={(v) => (relative ? tr('sizefilter.slider.ofMaxBox', { pct: (v * 100).toFixed(0) }) : tr('sizefilter.slider.ofFrame', { pct: (v * 100).toFixed(1) }))}
+          hint={tr('sizefilter.slider.minHeight.hint')}
           disabled={params.player_size_mode === 'off'}
         />
         <Slider
-          label="框高上限"
+          label={tr('sizefilter.slider.maxHeight.label')}
           value={params.player_max_height}
           min={0}
           max={relative ? 2 : 1}
           step={relative ? 0.01 : 0.01}
           onChange={(v) => setParams({ player_max_height: v })}
-          format={(v) => (v <= 0 ? '不限' : relative ? `最大框的 ${(v * 100).toFixed(0)}%` : `画面高的 ${(v * 100).toFixed(0)}%`)}
-          hint="0 = 不限；用来挡掉「整个人贴到镜头前」的误检"
+          format={(v) => (v <= 0 ? tr('sizefilter.slider.noLimit') : relative ? tr('sizefilter.slider.ofMaxBox', { pct: (v * 100).toFixed(0) }) : tr('sizefilter.slider.ofFrame', { pct: (v * 100).toFixed(0) }))}
+          hint={tr('sizefilter.slider.maxHeight.hint')}
           disabled={params.player_size_mode === 'off'}
         />
       </div>
@@ -624,19 +641,21 @@ export default function SizeFilterPanel() {
           size="sm"
           disabled={params.player_size_mode === 'off'}
           onClick={applyRecommend}
-          title="按实测分布填一个保守的下限"
+          title={tr('sizefilter.applyRecommendHint')}
         >
-          <Lightbulb size={12} /> 用推荐值
+          <Lightbulb size={12} /> {tr('sizefilter.applyRecommend')}
         </Button>
         <span className="inline-flex items-center gap-1.5 text-[10.5px] text-ink-500">
           <BarChart3 size={11} />
           {frames.length
-            ? `分布来自自己抓的 ${frames.length} 帧`
+            ? tr('sizefilter.dist.fromFrames', { n: frames.length })
             : stats && stats.total > 0
-              ? `上次分析的分布（${stats.frames} 帧 · ${stats.total} 个框${
-                  stats.dropped ? ` · 已筛掉 ${stats.dropped}` : ''
-                }）`
-              : '暂无实测分布'}
+              ? tr('sizefilter.dist.lastAnalysis', {
+                  frames: stats.frames,
+                  total: stats.total,
+                  extra: stats.dropped ? tr('sizefilter.dist.droppedSuffix', { n: stats.dropped }) : '',
+                })
+              : tr('sizefilter.dist.none')}
         </span>
       </div>
 
@@ -646,37 +665,37 @@ export default function SizeFilterPanel() {
 
       {!frames.length && stats && stats.total > 0 && stats.active && (
         <div className="mt-1.5 text-[10.5px] text-ink-500">
-          上次分析实际保留了 {stats.kept} / {stats.total} 个框
-          {stats.dropped > 0 && `（筛掉 ${((stats.dropped / stats.total) * 100).toFixed(0)}%）`}
-          {stats.ref > 0 && ` · 参考尺度 ${stats.ref.toFixed(3)}`}
+          {tr('sizefilter.dist.retained', { kept: stats.kept, total: stats.total })}
+          {stats.dropped > 0 && tr('sizefilter.dist.droppedPercent', { pct: ((stats.dropped / stats.total) * 100).toFixed(0) })}
+          {stats.ref > 0 && ` · ${tr('sizefilter.dist.refScale', { v: stats.ref.toFixed(3) })}`}
         </div>
       )}
 
       <details className="mt-2">
         <summary className="cursor-pointer text-[11px] text-ink-500 hover:text-ink-300">
-          面积上下限（畸变把框拉宽时更准）
+          {tr('sizefilter.area.summary')}
         </summary>
         <div className="mt-2 grid gap-x-5 gap-y-1 md:grid-cols-2">
           <Slider
-            label="框面积下限"
+            label={tr('sizefilter.area.min.label')}
             value={params.player_min_area}
             min={0}
             max={0.08}
             step={0.001}
             onChange={(v) => setParams({ player_min_area: v })}
-            format={(v) => (v <= 0 ? '不限' : v.toFixed(3))}
-            hint="归一化框面积（占画面面积的比例），0 = 不限"
+            format={(v) => (v <= 0 ? tr('sizefilter.slider.noLimit') : v.toFixed(3))}
+            hint={tr('sizefilter.area.min.hint')}
             disabled={params.player_size_mode === 'off'}
           />
           <Slider
-            label="框面积上限"
+            label={tr('sizefilter.area.max.label')}
             value={params.player_max_area}
             min={0}
             max={0.3}
             step={0.005}
             onChange={(v) => setParams({ player_max_area: v })}
-            format={(v) => (v <= 0 ? '不限' : v.toFixed(3))}
-            hint="用来挡掉贴到镜头前的人；畸变会把框拉宽，这时比框高更灵"
+            format={(v) => (v <= 0 ? tr('sizefilter.slider.noLimit') : v.toFixed(3))}
+            hint={tr('sizefilter.area.max.hint')}
             disabled={params.player_size_mode === 'off'}
           />
         </div>
