@@ -2,11 +2,14 @@ __pycache__/
 *.py[cod]
 .venv/
 .npmcache/
+.trae/
 node_modules/
 frontend/dist/
 data/
 models/*.pt
 models/*.onnx
+models/faster-whisper-*/
+models/vosk-model-*/
 tools/
 .pytest_cache/
 *.log
