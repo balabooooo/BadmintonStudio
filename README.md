@@ -8,6 +8,8 @@ you selected.
 The UI is a local web app (dark glassmorphism with animations). All AI runs on your own machine; videos are
 never uploaded.
 
+![Badminton Studio interface](docs/images/app-ui.png)
+
 ---
 
 ## Table of contents
