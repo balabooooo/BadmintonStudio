@@ -2,8 +2,8 @@
 
 Windows desktop AI video editor for badminton: FastAPI backend + React/Vite frontend + pywebview shell.
 Language: **the UI is bilingual (Chinese default + English mode)**; **CLI output, log/error messages, code
-comments, docstrings and commit messages keep their existing convention** — commit subjects are Chinese,
-comments/docstrings are English (same for `README.md`). Preserve these conventions.
+comments and docstrings are English** — and **all git commit messages (subject and body) are written in
+English** with a Conventional Commits prefix (same for `README.md`). Preserve these conventions.
 
 `README.md` is the authoritative deep doc (~1000 lines) explaining the design rationale of every analysis
 signal and most gotchas; read the relevant section before changing `analysis/`.
@@ -36,7 +36,7 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - AI modules **degrade silently**: `pipeline.py` wraps player/shuttle/audio work in `try/except` and records failures in `stats.*_trace`, so a broken call looks like a successful analysis with bad output. When changing a public analysis signature (`analyze_players`, `_select_active_players`, `probe_boxes`, `run_analysis`), update every call site and `tests/test_core.py`.
 - Re-segmentation (`_segment_rallies`) must reuse cached full-frame signals and match a full run's output; do not add AI reruns there. Several params only apply to specific segment modes.
 - Analysis is GPU-heavy (CUDA/NVENC when available, CPU fallback); long videos generate a proxy under `data/cache/` first.
-- Commit messages use a conventional prefix + Chinese subject (`fix: 修复…`, `feat: …`, `chore: …`, `docs: …`).
+- Commit messages use Conventional Commits with an **English** subject and body (`fix: …`, `feat: …`, `chore: …`, `docs: …`); never write Chinese in commit messages.
 
 ## Bilingual UI (i18n)
 - **Frontend** (`frontend/src/i18n/`): `useT()` returns `tr(key, params?)` for components; `t()` from `i18n/index.ts` is the non-reactive global (store actions, non-React helpers). Language is a Zustand `lang` field persisted to `localStorage['bms.lang']`, toggled in `SettingsPage`; default `zh`.
