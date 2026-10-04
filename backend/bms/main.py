@@ -1373,6 +1373,10 @@ def _rescore_features(r: Rally) -> dict:
         "player_speed_mean": r.features.player_speed_mean,
         "player_speed_max": r.features.player_speed_max,
         "shuttle_presence": r.features.shuttle_presence,
+        # The voice-command bonus is part of the total, so a rescore must carry it over (otherwise
+        # switching the weighting silently drops the bonus) and its phrases must survive for tags.
+        "speech_bonus": r.features.speech_bonus,
+        "speech_phrases": list(r.features.speech_phrases),
     }
 
 
@@ -1406,12 +1410,26 @@ def _rescore_cache_entry(r: Rally) -> dict:
     }
 
 
-def _rescore_cross_media(proj: Project, key: str, weights) -> int:
+def _apply_bonus_points(rallies: list[Rally], points: float) -> None:
+    """Rewrite the absolute speech bonus from a new per-hit point value.
+
+    The bonus is ``points × number of distinct phrases`` (see ``pipeline._apply_speech_bonus``), and
+    the phrases are already stored per rally, so changing the points only needs this rewrite plus a
+    rescore — no re-recognition or re-segmentation.
+    """
+    for r in rallies:
+        r.features.speech_bonus = points * len(r.features.speech_phrases)
+
+
+def _rescore_cross_media(proj: Project, key: str, weights, bonus_points: float | None = None) -> int:
     """Recompute all media's rallies as one batch and write back, returning the number of rallies recomputed.
 
     Scoring uses within-batch percentiles, so scores computed per media are not comparable across media;
     this puts them into the same distribution. The cache is keyed on each media's ``cross:<weighting>``
     key and does not overwrite the per-media cache.
+
+    ``bonus_points`` is an optional override for the absolute voice-command bonus; when set, the bonus
+    is rewritten for every rally and every cached score (which embeds the old bonus) is discarded.
     """
     from .analysis import scoring as SC
 
@@ -1420,6 +1438,11 @@ def _rescore_cross_media(proj: Project, key: str, weights) -> int:
     if not flat:
         return 0
     cache_key = f"cross:{key}"
+
+    if bonus_points is not None:
+        _apply_bonus_points(flat, bonus_points)
+        for _, res in ordered:
+            res.stats["score_cache"] = {}
 
     # A complete cache means this weighting has already been batch-computed: refill directly, no recompute when toggling back and forth.
     cached_all = all(
@@ -1436,12 +1459,14 @@ def _rescore_cross_media(proj: Project, key: str, weights) -> int:
 
     # Before overwriting, store the current per-media scores into each cache so they can be restored
     # unchanged when switching back to "current media". If the current weighting is already cross it
-    # cannot serve as a per-media baseline, so skip it.
-    for _, res in ordered:
-        cache = res.stats.setdefault("score_cache", {})
-        cur = str(res.stats.get("weights") or "")
-        if cur and not cur.startswith("cross:") and cur not in cache and res.rallies:
-            cache[cur] = [_rescore_cache_entry(r) for r in res.rallies]
+    # cannot serve as a per-media baseline, so skip it. When a bonus override is applied the current
+    # scores still reflect the old bonus, so this baseline snapshot must be skipped too.
+    if bonus_points is None:
+        for _, res in ordered:
+            cache = res.stats.setdefault("score_cache", {})
+            cur = str(res.stats.get("weights") or "")
+            if cur and not cur.startswith("cross:") and cur not in cache and res.rallies:
+                cache[cur] = [_rescore_cache_entry(r) for r in res.rallies]
 
     scores = SC.score_rallies(
         [_rescore_features(r) for r in flat],
@@ -1460,8 +1485,12 @@ def _rescore_cross_media(proj: Project, key: str, weights) -> int:
     return len(flat)
 
 
-def _rescore_per_media(proj: Project, key: str, weights, mid: str | None) -> int:
-    """Per-media weighting recompute (only touches the given media_id; all if not passed), returning the number of rallies recomputed."""
+def _rescore_per_media(proj: Project, key: str, weights, mid: str | None, bonus_points: float | None = None) -> int:
+    """Per-media weighting recompute (only touches the given media_id; all if not passed), returning the number of rallies recomputed.
+
+    ``bonus_points`` is an optional override for the absolute voice-command bonus; when set, the bonus
+    is rewritten for every rally and every cached score (which embeds the old bonus) is discarded.
+    """
     from .analysis import scoring as SC
 
     n = 0
@@ -1469,15 +1498,22 @@ def _rescore_per_media(proj: Project, key: str, weights, mid: str | None) -> int
         if mid and k != mid:
             continue
 
+        if bonus_points is not None:
+            _apply_bonus_points(res.rallies, bonus_points)
+            res.stats["score_cache"] = {}
+
         # Cache one copy of the scores computed under each weighting: switching away and back must return
         # to the original scores. The objective features stored in the analysis result are truncated, so
         # recomputed scores are not completely identical to those at analysis time; without caching,
         # "switch back and forth once and the original ranking is lost forever".
         cache = res.stats.setdefault("score_cache", {})
-        cur = str(res.stats.get("weights") or "")
-        # cross weighting scores cannot serve as a per-media baseline; only the current non-cross score is worth caching.
-        if cur and not cur.startswith("cross:") and cur not in cache and res.rallies:
-            cache[cur] = [_rescore_cache_entry(r) for r in res.rallies]
+        # When a bonus override is applied the current scores still reflect the old bonus, so skip the
+        # baseline snapshot (it would otherwise cache the stale score under the current weighting).
+        if bonus_points is None:
+            cur = str(res.stats.get("weights") or "")
+            # cross weighting scores cannot serve as a per-media baseline; only the current non-cross score is worth caching.
+            if cur and not cur.startswith("cross:") and cur not in cache and res.rallies:
+                cache[cur] = [_rescore_cache_entry(r) for r in res.rallies]
 
         cached = cache.get(key)
         if isinstance(cached, list) and len(cached) == len(res.rallies):
@@ -1507,6 +1543,10 @@ def rescore(pid: str, payload: dict = Body(default={})) -> dict:
     With ``cross_media=true``, rallies from all media are pooled and recomputed together so scores
     are comparable across media (scoring uses within-batch percentiles, and scores computed
     separately are not comparable).
+
+    ``speech_bonus_points`` optionally overrides the absolute voice-command bonus (clamped to 0~30);
+    the per-rally bonus is rewritten from the stored phrase hits and the scores are recomputed, again
+    without re-running the AI or re-segmenting.
     """
     from .analysis import scoring as SC
 
@@ -1518,13 +1558,21 @@ def rescore(pid: str, payload: dict = Body(default={})) -> dict:
     mid = payload.get("media_id")
     cross = bool(payload.get("cross_media"))
 
+    bonus_points: float | None = None
+    if payload.get("speech_bonus_points") is not None:
+        try:
+            bonus_points = float(payload.get("speech_bonus_points"))
+        except (TypeError, ValueError):
+            raise _bad_request(ValueError("speech_bonus_points")) from None
+        bonus_points = min(30.0, max(0.0, bonus_points))
+
     result: dict[str, int] = {}
 
     def apply(proj: Project) -> None:
         if cross:
-            result["n"] = _rescore_cross_media(proj, key, w)
+            result["n"] = _rescore_cross_media(proj, key, w, bonus_points)
         else:
-            result["n"] = _rescore_per_media(proj, key, w, mid)
+            result["n"] = _rescore_per_media(proj, key, w, mid, bonus_points)
 
     if ST.update_project(pid, apply, write_analyses=True) is None:
         raise HTTPException(404, tr("api.project_not_found"))

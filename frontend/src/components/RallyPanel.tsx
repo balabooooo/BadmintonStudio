@@ -326,6 +326,20 @@ export default function RallyPanel() {
     },
     [resegment, setParams],
   )
+  // 口令加分滑杆：拖动过程中防抖触发重算分（毫秒级）。复用 rescore 而不是 resegment，
+  // 避免重建回合边界、清掉用户手调的入点/出点。
+  const bonusTimer = useRef<number | null>(null)
+  const applyBonus = useCallback(
+    (points: number) => {
+      setParams({ speech_bonus_points: points })
+      if (bonusTimer.current) window.clearTimeout(bonusTimer.current)
+      bonusTimer.current = window.setTimeout(() => {
+        if (scope === 'all') void rescoreAll(weights, { bonus: points })
+        else void rescore(weights, { bonus: points })
+      }, 220)
+    },
+    [scope, weights, rescore, rescoreAll, setParams],
+  )
   const rawCount = analysis?.signals?.hit_times_raw?.length ?? 0
   const keptCount = analysis?.signals?.hit_times?.length ?? 0
   const preGateCount = rawCount || (analysis?.stats?.hit_trace?.count as number | undefined) || 0
@@ -336,6 +350,11 @@ export default function RallyPanel() {
 
   // 范围内全部回合（未过筛选）：scope 感知，供统计、标签、保留前 40% 用
   const all = useMemo(() => collectRallies(project, scope, mediaId), [project, scope, mediaId])
+  // 范围内是否有回合命中过口令：没有的话加分滑杆无效果，禁用并提示。
+  const hasSpeechHits = useMemo(
+    () => all.some((r) => (r.features.speech_phrases ?? []).length > 0),
+    [all],
+  )
   // 当前范围内出现的标签全集（不受展示条数限制），用于判断已选标签是否仍然适用。
   const tagCounts = useMemo(() => {
     const s = new Map<string, number>()
@@ -529,7 +548,12 @@ export default function RallyPanel() {
             transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
             className="shrink-0 overflow-hidden border-b border-white/7"
           >
-            <div className="max-h-[42vh] overflow-y-auto px-3 py-2.5">
+            <div
+              className={cn(
+                'overflow-y-auto px-3 py-2.5',
+                showSettings ? 'max-h-[24vh]' : 'max-h-[42vh]',
+              )}
+            >
               <div className="space-y-2.5 rounded-xl border border-white/7 bg-white/[0.025] px-3 py-2.5">
                 <Slider
                   label={tr('rally.minScore')}
@@ -793,7 +817,12 @@ export default function RallyPanel() {
               transition={{ duration: 0.2 }}
               className="overflow-hidden"
             >
-              <div className="max-h-[46vh] space-y-3 overflow-y-auto pt-3">
+              <div
+                className={cn(
+                  'space-y-3 overflow-y-auto pt-3',
+                  showFilter ? 'max-h-[34vh]' : 'max-h-[46vh]',
+                )}
+              >
                 {scope === 'all' && (
                   <div
                     className={cn(
@@ -882,6 +911,31 @@ export default function RallyPanel() {
                   <div className="mt-1.5 text-[10px] leading-relaxed text-ink-500">
                     {tr('rally.weightFooter')}
                   </div>
+                </div>
+
+                {/* 口令命中加分：只重算加分，不重切分 */}
+                <div className="border-t border-white/7 pt-2.5">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-ink-200">
+                    <Mic size={11} className="text-court-300" />
+                    {tr('rally.speechBonusTitle')}
+                    <span className="text-ink-500">{tr('rally.splitInstant')}</span>
+                  </div>
+                  <Slider
+                    label={tr('analysis.speech.bonusLabel')}
+                    value={params.speech_bonus_points}
+                    min={0}
+                    max={30}
+                    step={1}
+                    disabled={busy.rescore || !hasSpeechHits}
+                    onChange={(v) => applyBonus(v)}
+                    format={(v) => tr('analysis.speech.bonusFormat', { n: v })}
+                    hint={tr('analysis.speech.bonusHint')}
+                  />
+                  {!hasSpeechHits ? (
+                    <div className="mt-1.5 text-[10px] leading-relaxed text-ink-500">
+                      {tr('rally.speechBonusNone')}
+                    </div>
+                  ) : null}
                 </div>
 
                 {/* 切分调参：只重跑切分，毫秒级 */}

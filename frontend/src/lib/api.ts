@@ -216,10 +216,16 @@ export const api = {
     pid: string,
     body: { media_id?: string; ids?: string[]; filter?: Record<string, unknown>; patch: Record<string, unknown> },
   ) => req<{ updated: number }>(`/api/projects/${pid}/rallies/bulk`, { method: 'POST', body: JSON.stringify(body) }),
-  rescore: (pid: string, weights: string, media_id?: string, cross_media?: boolean) =>
+  rescore: (
+    pid: string,
+    weights: string,
+    media_id?: string,
+    cross_media?: boolean,
+    speech_bonus_points?: number,
+  ) =>
     req<{ rescored: number; weights: string; cross_media?: boolean }>(`/api/projects/${pid}/rallies/rescore`, {
       method: 'POST',
-      body: JSON.stringify({ weights, media_id, cross_media }),
+      body: JSON.stringify({ weights, media_id, cross_media, speech_bonus_points }),
     }),
 
   // ---------------------------------------------------------------- 时间线

@@ -223,6 +223,7 @@ const baseZh = {
   'toast.rescoreAllDone': '已按全部素材统一重算评分',
   'toast.rescoreAllDetail': '共 {n} 个回合进入同一评分分布，跨素材分数现在可比',
   'toast.rescoreAllFailed': '统一重算评分失败',
+  'toast.rescorePerMedia': '已恢复当前素材的逐素材评分',
   'toast.resegmentFailed': '重新切分失败',
   'toast.analysisRunningBlocked': '该素材正在分析中，等分析结束再重切分',
   'toast.rebuildHitsOk': '已重建击球序列，可调整邻场抑制',
@@ -436,6 +437,8 @@ const baseZh = {
   'rally.weightFormula':
     '总分 = 上面五项加权求和，再乘一个「分析置信度」折扣（球员跟踪稳、运动曲线清晰就接近满分，来回都检不到人就打折）。',
   'rally.weightFooter': '鼠标移到选项上看它的计分配方。切换只重新算分，不会动切分和你的手工调整。',
+  'rally.speechBonusTitle': '口令命中加分',
+  'rally.speechBonusNone': '当前范围没有回合命中口令，调整无效果。',
   'rally.noMatches': '没有符合筛选条件的回合',
   'rally.bulkKeepTooltip': '把筛选出的回合全部标记为保留',
   'rally.bulkKeep': '全部保留',

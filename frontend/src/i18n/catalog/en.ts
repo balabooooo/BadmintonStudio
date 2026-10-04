@@ -226,6 +226,7 @@ const baseEn: Record<string, string> = {
   'toast.rescoreAllDone': 'Rescored across all media',
   'toast.rescoreAllDetail': '{n} rallies now share one score distribution, so scores are comparable across media',
   'toast.rescoreAllFailed': 'Unified rescoring failed',
+  'toast.rescorePerMedia': 'Restored per-media scoring',
   'toast.resegmentFailed': 'Resegmentation failed',
   'toast.analysisRunningBlocked': 'Analysis is running for this media; resegment after it finishes',
   'toast.rebuildHitsOk': 'Hit sequence rebuilt; cross-court suppression is now adjustable',
@@ -453,6 +454,8 @@ const baseEn: Record<string, string> = {
   'rally.weightFormula':
     'Total = the weighted sum above, multiplied by an analysis-confidence discount (stable tracking and a clean motion curve score near full; clips where no player is detected get discounted).',
   'rally.weightFooter': 'Hover an option to see its scoring recipe. Switching only rescores; it does not touch segmentation or your manual edits.',
+  'rally.speechBonusTitle': 'Voice-command bonus',
+  'rally.speechBonusNone': 'No rally in scope matched a phrase; adjusting has no effect.',
   'rally.noMatches': 'No rallies match the current filters',
   'rally.bulkKeepTooltip': 'Mark all filtered rallies as kept',
   'rally.bulkKeep': 'Keep all',

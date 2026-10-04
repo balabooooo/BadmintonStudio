@@ -438,9 +438,9 @@ interface State {
   resegment: (patch?: Partial<AnalysisParams>, weights?: string) => Promise<void>
   /** 旧分析缺「门控前击球」时，用缓存音频重建击球序列（仅音频检测，不重跑视频 AI） */
   rebuildHits: (patch?: Partial<AnalysisParams>) => Promise<void>
-  rescore: (w: string, opts?: { silent?: boolean }) => Promise<void>
+  rescore: (w: string, opts?: { silent?: boolean; bonus?: number }) => Promise<void>
   /** 全部素材合成一批重算，让分数跨素材可比 */
-  rescoreAll: (w: string, opts?: { silent?: boolean }) => Promise<void>
+  rescoreAll: (w: string, opts?: { silent?: boolean; bonus?: number }) => Promise<void>
   patchRally: (rid: string, patch: Partial<Rally>) => Promise<void>
   bulkRallies: (patch: Partial<Rally>, opts?: { ids?: string[]; useFilter?: boolean }) => Promise<void>
   selectRally: (rid: string | null) => void
@@ -1072,13 +1072,17 @@ export const useStore = create<State>((set, get) => ({
     const s = get()
     if (!s.project || s.busy.rescore) return
     if (v === 'all') {
-      // 进入「全部素材」默认统一重算：已算过时后端命中缓存、前端也会直接复用，
-      // 来回切换不会重复计算。
-      if (!s.isUnifiedRescore()) void s.rescoreAll(s.weights, { silent: true })
+      // Entering "all media" auto-rescores into one shared distribution (the rescore
+      // success toast explains the score change); scores become comparable across media.
+      if (!s.isUnifiedRescore()) void s.rescoreAll(s.weights)
     } else {
-      // 回到「当前素材」：把当前素材恢复成逐素材评分标准（从缓存还原，不重算）
+      // Back to "current media": restore per-media scoring and notify, so the score
+      // change on scope switch is never silent.
       const a = s.currentAnalysis()
-      if (a && a.stats?.weights !== s.weights) void s.rescore(s.weights)
+      if (a && a.stats?.weights !== s.weights) {
+        void s.rescore(s.weights)
+        get().toast({ kind: 'info', title: tr('toast.rescorePerMedia') })
+      }
     }
   },
   setRoi: (roi) => set({ roi }),
@@ -1133,7 +1137,7 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  async rescore(w, _opts) {
+  async rescore(w, opts) {
     // 换评分口径只应该重新算分，绝不能重建回合：
     // 重建会让 TimeLine 上所有片段的 rally_id 悬空（颜色丢、标签对不上），
     // 还会清掉用户手调的入点/出点。所以走 /rallies/rescore 而不是 /resegment。
@@ -1143,7 +1147,7 @@ export const useStore = create<State>((set, get) => ({
     set({ weights: w })
     set((s) => ({ busy: { ...s.busy, rescore: true } }))
     try {
-      await api.rescore(p.id, w, mid)
+      await api.rescore(p.id, w, mid, undefined, opts?.bonus)
       const res = await api.getAnalysis(p.id, mid)
       // 结果回来时用户可能已经切到别的工程，别把旧工程的结果写进新工程
       if (get().project?.id !== p.id) return
@@ -1193,7 +1197,7 @@ export const useStore = create<State>((set, get) => ({
     set({ weights: w })
     set((s) => ({ busy: { ...s.busy, rescore: true } }))
     try {
-      await api.rescore(p.id, w, undefined, true)
+      await api.rescore(p.id, w, undefined, true, opts?.bonus)
       // 合批重算动了所有素材，逐个拉回最新分析结果
       const results = await Promise.all(
         mids.map((mid) => api.getAnalysis(p.id, mid).catch(() => null)),
