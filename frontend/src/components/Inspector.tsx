@@ -6,6 +6,20 @@ import { useStore, WEIGHT_PRESETS_MAP, FILM_COVERED_RATIO, rallyFilmCoverage } f
 import { useT } from '../i18n/useT'
 import { tagLabel } from '../i18n/domain'
 
+/** 解析用户输入的切分时间点：支持「12.5」「1:23」「1:23.4」等，返回秒数；非法返回 null。 */
+function parseSplitTime(input: string): number | null {
+  const s = input.trim()
+  if (!s || !/^\d+(\.\d+)?(:\d+(\.\d+)?)*$/.test(s)) return null
+  const parts = s.split(':')
+  let total = 0
+  for (const p of parts) {
+    const v = parseFloat(p)
+    if (!Number.isFinite(v) || v < 0) return null
+    total = total * 60 + v
+  }
+  return total
+}
+
 /* ------------------------------------------------------------------ 信号图 */
 
 function SignalChart({ height = 92 }: { height?: number }) {
@@ -170,7 +184,9 @@ export default function Inspector() {
   const splitClipAtSourceTime = useStore((s) => s.splitClipAtSourceTime)
   const previewMode = useStore((s) => s.previewMode)
   const currentTime = useStore((s) => s.currentTime)
+  const toast = useStore((s) => s.toast)
   const [tab, setTab] = useState<'rally' | 'clip' | 'info'>('rally')
+  const [splitTime, setSplitTime] = useState('')
   // 一旦用户自己点过页签，就不再自动切页签。
   // 切回合常常只是想顺手看看别的回合，右侧停在「信号」上比被拽回「回合」有用得多。
   const pinnedTab = useRef(false)
@@ -198,6 +214,19 @@ export default function Inspector() {
   const weightPreset = WEIGHT_PRESETS_MAP.find((w) => w.value === weightValue)
   const weightLabel = weightPreset ? tr(weightPreset.labelKey) : weightValue || tr('weight.balanced.label')
   const traceOffLabels = [tr('inspector.trace.off'), tr('inspector.trace.disabled')]
+
+  // 按用户输入的时间点精确分割当前片段（单位跟随当前预览模式：源片/成片时间）
+  const splitAtInputTime = () => {
+    if (!clip) return
+    const t = parseSplitTime(splitTime)
+    if (t == null) {
+      toast({ kind: 'warn', title: tr('inspector.splitAtTimeInvalid') })
+      return
+    }
+    if (previewMode === 'source') splitClipAtSourceTime(clip.id, t)
+    else splitClipAt(clip.id, t)
+    setSplitTime('')
+  }
 
   // 切换工程时解除页签锁定，让页签重新跟随选择走。
   useEffect(() => {
@@ -517,6 +546,37 @@ export default function Inspector() {
                   <Trash2 size={12} className="text-rose-hot/80" />
                   {tr('common.delete')}
                 </Button>
+              </div>
+
+              <div className="rounded-xl border border-white/7 bg-white/[0.025] px-3 py-2.5">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-ink-300">{tr('inspector.splitAtTime')}</span>
+                  <span className="mono text-[10px] text-ink-500">
+                    {previewMode === 'source'
+                      ? tr('inspector.splitAtTimeUnitSource')
+                      : tr('inspector.splitAtTimeUnitTimeline')}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={splitTime}
+                    onChange={(e) => setSplitTime(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') splitAtInputTime()
+                    }}
+                    placeholder={currentTime.toFixed(2)}
+                    className="field mono min-w-0 flex-1 text-[12px]"
+                  />
+                  <Button variant="outline" size="sm" onClick={splitAtInputTime}>
+                    <Scissors size={12} />
+                    {tr('inspector.split')}
+                  </Button>
+                </div>
+                <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
+                  {tr('inspector.splitAtTimeHint')}
+                </div>
               </div>
 
               <div className="space-y-2.5">
