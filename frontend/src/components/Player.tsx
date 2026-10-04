@@ -14,10 +14,13 @@ import {
   Maximize2,
   ListFilter,
   Crosshair,
+  Film,
+  Clapperboard,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn, scoreColor, timecode } from '../lib/format'
-import type { Rally } from '../lib/types'
+import { clipDur, filmClipAt, filmTimeOfSource, filmTimeToSrc, orderedClips } from '../lib/timeline'
+import type { Clip, Rally } from '../lib/types'
 import { Badge, Button, Progress, SpeedMenu, Tooltip } from './ui'
 import { DEFAULT_FILTER, orderedInScope, useStore } from '../store/useStore'
 import { useT } from '../i18n/useT'
@@ -132,6 +135,9 @@ function CourtOverlay({
  *
  * 值就是当前预览模式的时间轴时间（源片模式=原片时间、成片模式=成片时间），
  * 与 Player 下面算出的 duration 同一套单位，所以这里不需要再做模式换算。
+ *
+ * 视觉上用颜色区分播放内容：成片预览是蓝色（并画出片段覆盖块，空隙留黑），
+ * 源片预览是绿色，和画面左上角的模式徽标、进度条旁的模式标签一致。
  */
 function SeekBar({
   value,
@@ -140,6 +146,8 @@ function SeekBar({
   onSeekingChange,
   disabled,
   className,
+  mode = 'source',
+  segments,
 }: {
   value: number
   max: number
@@ -147,6 +155,9 @@ function SeekBar({
   onSeekingChange: (v: boolean) => void
   disabled?: boolean
   className?: string
+  mode?: 'source' | 'timeline'
+  /** 成片模式下每个片段在进度条上的位置（百分比），用来可视化片段覆盖与空隙 */
+  segments?: { left: number; width: number }[]
 }) {
   const tr = useT()
   const ref = useRef<HTMLDivElement>(null)
@@ -196,7 +207,9 @@ function SeekBar({
       aria-valuemax={Math.round(max) || 0}
       aria-valuenow={Math.round(value) || 0}
       aria-disabled={disabled}
-      title={tr('player.seekHint')}
+      title={
+        mode === 'timeline' ? tr('player.seekFilmHint') : tr('player.seekSourceHint')
+      }
       onPointerDown={(e) => {
         if (disabled || e.button !== 0) return
         e.preventDefault()
@@ -241,8 +254,18 @@ function SeekBar({
       )}
     >
       <div className="relative h-[5px] w-full overflow-hidden rounded-full bg-white/12">
+        {segments?.map((s, i) => (
+          <div
+            key={i}
+            className="absolute inset-y-0 bg-white/10"
+            style={{ left: `${s.left}%`, width: `${s.width}%` }}
+          />
+        ))}
         <div
-          className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-court-500 to-court-300"
+          className={cn(
+            'absolute inset-y-0 left-0 rounded-full bg-gradient-to-r',
+            mode === 'timeline' ? 'from-flux-500 to-flux-400' : 'from-court-500 to-court-300',
+          )}
           style={{ width: `${pct}%` }}
         />
       </div>
@@ -252,7 +275,10 @@ function SeekBar({
       >
         <div
           className={cn(
-            'h-3.5 w-3.5 rounded-full border-2 border-ink-950 bg-court-300 shadow-[0_0_0_1px_rgb(56_224_162/0.6)] transition-transform',
+            'h-3.5 w-3.5 rounded-full border-2 border-ink-950 transition-transform',
+            mode === 'timeline'
+              ? 'bg-flux-400 shadow-[0_0_0_1px_rgb(92_157_255/0.6)]'
+              : 'bg-court-300 shadow-[0_0_0_1px_rgb(56_224_162/0.6)]',
             dragging ? 'scale-110' : 'group-hover/seek:scale-110',
           )}
         />
@@ -282,6 +308,7 @@ export default function Player() {
   const seek = useStore((s) => s.seek)
   const syncTime = useStore((s) => s.syncTime)
   const setUserSeeking = useStore((s) => s.setUserSeeking)
+  const userSeeking = useStore((s) => s.userSeeking)
   const previewMode = useStore((s) => s.previewMode)
   const setPreviewMode = useStore((s) => s.setPreviewMode)
   const selectedRallyId = useStore((s) => s.selectedRallyId)
@@ -328,57 +355,29 @@ export default function Player() {
   const [ready, setReady] = useState(false)
 
   const timeline = project?.timeline
-  const clips = useMemo(
-    () => (timeline?.tracks?.[0]?.clips ?? []).slice().sort((a, b) => a.tl_start - b.tl_start),
-    [timeline],
-  )
+  const clips = useMemo(() => orderedClips(timeline), [timeline])
   // 帧率来源：成片模式用成片帧率，源片模式用代理帧率（代理最高 30fps）。
   // 之前逐帧按钮直接读源片 fps，成片模式下读数是成片时间，帧号就对不上了。
   const displayFps = previewMode === 'timeline' ? timeline?.fps || 30 : media?.proxy_fps || media?.fps || 30
   const frameStep = 1 / displayFps
 
-  /** 成片模式：把时间线时间映射回素材内时间。 */
-  const mapTimeline = useCallback(
-    (t: number): { src: number; clipIndex: number } | null => {
-      if (!clips.length) return null
-      for (let i = 0; i < clips.length; i++) {
-        const c = clips[i]
-        const dur = (c.src_out - c.src_in) / c.speed
-        if (t >= c.tl_start && t < c.tl_start + dur) {
-          return { src: c.src_in + (t - c.tl_start) * c.speed, clipIndex: i }
-        }
-      }
-      // 落点不在任何片段里（成片首段之前 / 片段之间的空隙）：返回 null，
-      // 调用方据此「什么都不做」，而不是拿最后一段的出点当结果把画面跳到片尾。
-      return null
-    },
-    [clips],
-  )
+  /** 成片模式：播放头落点对应的片段（片段之间的空隙 / 首尾之外返回 null）。 */
+  const clipAtPlayhead = useCallback((t: number) => filmClipAt(clips, t), [clips])
 
-  /** 成片模式下播放头走的是成片时间，这里换算回它对应的原片时间 */
+  /** 成片模式下播放头走的是成片时间，这里换算回它对应的当前素材内时间；
+   *  落点在别的素材的片段上时对当前素材没有意义，返回 -1（匹配不到任何回合）。 */
   const srcTime = useMemo(() => {
     if (previewMode !== 'timeline') return currentTime
-    return mapTimeline(currentTime)?.src ?? 0
-  }, [previewMode, currentTime, mapTimeline])
-
-  /** 原片时间 -> 成片时间；该时刻不在成片里则返回 null */
-  const filmTimeOfSource = useCallback(
-    (src: number): number | null => {
-      for (const c of clips) {
-        if (src >= c.src_in && src <= c.src_out) {
-          return c.tl_start + (src - c.src_in) / c.speed
-        }
-      }
-      return null
-    },
-    [clips],
-  )
+    const c = clipAtPlayhead(currentTime)
+    if (!c || c.media_id !== mediaId) return -1
+    return filmTimeToSrc(c, currentTime)
+  }, [previewMode, currentTime, mediaId, clipAtPlayhead])
 
   /** 跳到某个原片时刻：成片模式下换算成成片时间，不在成片里就切回源片 */
   const goToSource = useCallback(
     (src: number) => {
       if (previewMode === 'timeline') {
-        const ft = filmTimeOfSource(src)
+        const ft = filmTimeOfSource(clips, mediaId, src)
         if (ft !== null) {
           seek(ft)
           return
@@ -387,7 +386,7 @@ export default function Player() {
       }
       seek(src)
     },
-    [previewMode, filmTimeOfSource, seek, setPreviewMode],
+    [previewMode, clips, mediaId, seek, setPreviewMode],
   )
 
   const rallyAtTime = useMemo(() => {
@@ -450,9 +449,14 @@ export default function Player() {
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
-    v.playbackRate = speed
-    // 重挂载后新元素会丢掉这些属性，所以 proxyReady/mediaId 变化也要重设
-  }, [speed, proxyReady, mediaId])
+    // 成片预览下叠加片段变速：播放头所在片段 speed=2 时画面也要 2× 快放，
+    // 否则画面 1× 而播放头按 2× 映射前进，只能靠校正 effect 每 0.3 秒左右
+    // 跳跃追赶（变速片段预览卡顿、声画不同步）。空隙 / 源片模式按 1×。
+    const clipSpeed =
+      previewMode === 'timeline' ? clipAtPlayhead(currentTime)?.speed ?? 1 : 1
+    v.playbackRate = speed * clipSpeed
+    // 重挂载后新元素会丢掉这些属性；播放头跨片段时变速比也要跟着换
+  }, [speed, proxyReady, mediaId, previewMode, clipAtPlayhead, currentTime])
 
   useEffect(() => {
     const v = videoRef.current
@@ -461,61 +465,158 @@ export default function Player() {
     v.volume = volume
   }, [muted, volume, proxyReady, mediaId])
 
-  // 播放头由 store 驱动 -> 若与 video 差异较大则校正
+  // 播放头由 store 驱动 -> 校正 video。这里同时兜住两类「时间线与画面不同步」：
+  // 1) 播放头落在片段之间的空隙（编辑/撤销后播放头可能被留在已删除的区域）：
+  //    吸附回最近的片段范围，播放头指的永远是成片里真实存在的内容；
+  // 2) 播放头指向的片段属于别的素材（跨素材成片）：成片预览必须切换视频源，
+  //    否则 video 会拿别的素材的原片时间解当前素材，播出一堆不相干的画面。
   useEffect(() => {
     const v = videoRef.current
     if (!v || !ready) return
-    let target = currentTime
+    let target: number | null = null
     if (previewMode === 'timeline') {
-      const m = mapTimeline(currentTime)
-      // 播放头落在片段之外时没有对应的原片时间，直接别动 video
-      if (!m) return
-      target = m.src
+      const c = clipAtPlayhead(currentTime)
+      if (!c) {
+        // 拖动播放头期间不抢鼠标（松手时 setUserSeeking(false) 会统一吸附）
+        const st = useStore.getState()
+        if (!st.userSeeking && Date.now() >= st.seekingUntil) {
+          st.snapPlayheadToContent()
+        }
+        return
+      }
+      if (c.media_id !== mediaId) {
+        // 拖动中先不切源；松手后 userSeeking 变化会让本 effect 重新执行
+        const st = useStore.getState()
+        if (!st.userSeeking) st.switchMediaInFilm(c.media_id, currentTime)
+        return
+      }
+      target = filmTimeToSrc(c, currentTime)
+    } else {
+      target = currentTime
     }
     // 暂停时的容差要小得多：逐帧按钮一次只走 1/30 秒，
     // 阈值给 0.34 的话点十几下画面都不动（只有播放头在走）。
     const tol = playing ? 0.34 : 0.012
-    if (Math.abs(v.currentTime - target) > tol) {
+    if (target !== null && Math.abs(v.currentTime - target) > tol) {
       try {
         v.currentTime = target
       } catch {
         /* ignore */
       }
     }
-  }, [currentTime, ready, previewMode, mapTimeline, playing])
+  }, [currentTime, ready, previewMode, clipAtPlayhead, playing, mediaId, userSeeking])
 
   const onTimeUpdate = () => {
     const v = videoRef.current
     if (!v || !ready) return
+    const st = useStore.getState()
     let t = v.currentTime
     if (previewMode === 'timeline') {
-      // 素材时间 -> 时间线时间
+      // 只在「当前素材」的片段里找映射：成片里别的素材的片段可能覆盖同一个
+      // 原片时间，但画面不是它，不能拿来推播放头位置。
       let mapped: number | null = null
+      let hit: Clip | null = null
       for (const c of clips) {
-        const dur = (c.src_out - c.src_in) / c.speed
+        if (c.media_id !== mediaId) continue
         if (t >= c.src_in && t < c.src_out) {
+          hit = c
           mapped = c.tl_start + (t - c.src_in) / c.speed
-          // 快进到片段末尾时跳到下一段
-          if (mapped >= c.tl_start + dur - 0.06 && playing) {
-            const idx = clips.indexOf(c)
-            const next = clips[idx + 1]
-            if (next) {
-              v.currentTime = next.src_in
-              seek(next.tl_start)
-              return
-            }
-            // 最后一段：到头就停，别让原片时间继续往前跑进没剪进成片的素材
-            v.pause()
-            setPlaying(false)
-            seek(c.tl_start + dur)
-            return
-          }
           break
         }
       }
-      // 落在片段之间的空隙 / 首段之前：不写回，免得把成片播放头换成原片时间
-      if (mapped === null) return
-      syncTime(mapped)
+      if (hit && mapped !== null) {
+        const dur = clipDur(hit)
+        // 快进到片段末尾时跳到下一段；下一段在别的素材上就换源续播
+        if (mapped >= hit.tl_start + dur - 0.06 && playing && !st.userSeeking) {
+          const next = clips[clips.indexOf(hit) + 1]
+          if (next) {
+            if (next.media_id !== mediaId) {
+              st.switchMediaInFilm(next.media_id, next.tl_start)
+            } else {
+              try {
+                v.currentTime = next.src_in
+              } catch {
+                /* ignore */
+              }
+              seek(next.tl_start)
+            }
+            return
+          }
+          // 最后一段：到头就停，别让原片时间继续往前跑进没剪进成片的素材
+          v.pause()
+          setPlaying(false)
+          seek(hit.tl_start + dur)
+          return
+        }
+        syncTime(mapped)
+        return
+      }
+      // 画面落点没有对应的成片位置（编辑 / 换源后的残留位置）。播放中就地把
+      // 画面拉回播放头所指的内容（或续播到下一段），绝不裸放没剪进成片的素材；
+      // 暂停中不动画面，播放头的吸附由校正 effect 负责。
+      // 注意 timeupdate 采样可能直接落过片段末端（采样间隔 ~250ms），此时上面的
+      // 「片段内临近末端」分支永远不会命中；必须在这里按「视频已越过某段末端」
+      // 确定性判定播完并续播下一段，否则画面会被拉回上一段结尾无限回跳，
+      // 播放头就冻结在片段边界（跨片段播放卡死、时间线与画面失同步的根源）。
+      if (playing && !st.userSeeking && Date.now() >= st.seekingUntil) {
+        let ended: Clip | null = null
+        for (const c of clips) {
+          if (c.media_id !== mediaId) continue
+          // 窗口放宽到数倍片段时长：换源屏蔽窗口 / 采样间隔内视频可能已多跑一段
+          if (t >= c.src_out && t < c.src_out + 3 * (c.speed || 1) && (ended === null || c.src_out > ended.src_out)) {
+            ended = c
+          }
+        }
+        if (ended) {
+          const next = clips[clips.indexOf(ended) + 1] ?? null
+          if (next) {
+            if (next.media_id !== mediaId) {
+              st.switchMediaInFilm(next.media_id, next.tl_start)
+            } else {
+              try {
+                v.currentTime = next.src_in
+              } catch {
+                /* ignore */
+              }
+              seek(next.tl_start)
+            }
+          } else {
+            // 最后一段：到头就停，别让原片时间继续往前跑进没剪进成片的素材
+            v.pause()
+            setPlaying(false)
+            seek(timeline?.duration ?? 0)
+          }
+          return
+        }
+        const c = filmClipAt(clips, st.currentTime)
+        if (c && c.media_id === mediaId) {
+          try {
+            v.currentTime = filmTimeToSrc(c, st.currentTime)
+          } catch {
+            /* ignore */
+          }
+        } else if (c) {
+          st.switchMediaInFilm(c.media_id, st.currentTime)
+        } else {
+          const next = clips.find((x) => x.tl_start >= st.currentTime - 1e-6) ?? null
+          if (next) {
+            if (next.media_id !== mediaId) {
+              st.switchMediaInFilm(next.media_id, next.tl_start)
+            } else {
+              try {
+                v.currentTime = next.src_in
+              } catch {
+                /* ignore */
+              }
+              seek(next.tl_start)
+            }
+          } else {
+            v.pause()
+            setPlaying(false)
+            seek(timeline?.duration ?? 0)
+          }
+        }
+      }
       return
     } else if (previewFiltered && playing && mediaId) {
       // 只看筛选片段：跳过空档。timeupdate 大约 4 次/秒，
@@ -619,6 +720,15 @@ export default function Player() {
   // 代理就绪后加一个参数当缓存戳，避免浏览器继续拿代理生成前那次响应
   const src = mediaId && project ? `${api.proxyUrl(project.id, mediaId)}${proxyReady ? '?ready=1' : ''}` : undefined
   const duration = previewMode === 'timeline' ? timeline?.duration ?? 0 : media?.duration ?? 0
+
+  /** 成片模式下把每个片段画到进度条上：浅色块 = 有内容，留黑 = 空隙 */
+  const filmSegments = useMemo(() => {
+    if (previewMode !== 'timeline' || duration <= 0) return undefined
+    return clips.map((c) => ({
+      left: Math.min(100, (c.tl_start / duration) * 100),
+      width: Math.max(0, (clipDur(c) / duration) * 100),
+    }))
+  }, [previewMode, clips, duration])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -762,6 +872,25 @@ export default function Player() {
           </div>
         )}
 
+        {/* 内容来源标识：一眼看清现在播的是原片还是成片、是否只看筛选 */}
+        <div className="pointer-events-none absolute top-2.5 left-1/2 flex -translate-x-1/2 items-center gap-1.5">
+          <Badge
+            color={previewMode === 'timeline' ? '#38e0a2' : '#94a3b8'}
+            className="backdrop-blur bg-black/55"
+          >
+            {previewMode === 'timeline' ? <Clapperboard size={9} /> : <Film size={9} />}
+            {previewMode === 'timeline'
+              ? tr('player.previewTimelineBadge', { n: clips.length })
+              : tr('player.previewSourceBadge')}
+          </Badge>
+          {previewMode === 'source' && previewFiltered && (
+            <Badge color="#5c9dff" className="backdrop-blur bg-black/55">
+              <ListFilter size={9} />
+              {tr('player.onlyFiltered')}
+            </Badge>
+          )}
+        </div>
+
         {/* 角标 */}
         <div className="pointer-events-none absolute top-2.5 left-3 flex items-center gap-2">
           <Badge className="bg-black/50 backdrop-blur">{media?.width}×{media?.height}</Badge>
@@ -846,6 +975,17 @@ export default function Player() {
 
       {/* 播放进度条：点击 / 拖动定位。值用当前模式的时间轴（源片或成片）。 */}
       <div className="flex items-center gap-2.5 px-3 pt-1.5">
+        {/* 模式标签：颜色与进度条一致 —— 蓝色=成片、绿色=源片，一眼分清在播什么 */}
+        <span
+          title={previewMode === 'timeline' ? tr('player.seekFilmHint') : tr('player.seekSourceHint')}
+          className={cn(
+            'flex shrink-0 items-center gap-1 rounded-md px-1.5 py-[3px] text-[10px] font-semibold whitespace-nowrap',
+            previewMode === 'timeline' ? 'bg-flux-500/15 text-flux-400' : 'bg-court-500/10 text-court-300',
+          )}
+        >
+          {previewMode === 'timeline' ? <Clapperboard size={10} /> : <Film size={10} />}
+          {previewMode === 'timeline' ? tr('player.seekModeFilm') : tr('player.seekModeSource')}
+        </span>
         <span className="mono w-[54px] shrink-0 text-right text-[11px] text-white tabular">
           {timecode(currentTime, false)}
         </span>
@@ -855,6 +995,8 @@ export default function Player() {
           disabled={!src || duration <= 0}
           onSeek={seek}
           onSeekingChange={setUserSeeking}
+          mode={previewMode}
+          segments={filmSegments}
           className="flex-1"
         />
         <span className="mono w-[54px] shrink-0 text-[11px] text-ink-500 tabular">

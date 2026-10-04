@@ -85,14 +85,17 @@ export default function Timeline() {
   const pxToTime = useCallback((px: number) => px / zoom, [zoom])
   const timeToPx = useCallback((t: number) => t * zoom, [zoom])
 
-  /** 跳到某个「原片时刻」：成片模式下换算成成片时间，不在成片里就切回源片 */
+  /** 跳到某个「原片时刻」：成片模式下换算成成片时间，不在成片里就切回源片。
+   *  只认当前素材自己的片段：跨素材成片时不同素材的原片时间会重叠，找错了
+   *  片段会把播放头放到别的片段的成片位置上。 */
   const seekSource = useCallback(
     (src: number) => {
       if (previewMode !== 'timeline') {
         seek(src)
         return
       }
-      const c = clips.find((x) => src >= x.src_in && src <= x.src_out)
+      const mid = media?.id ?? null
+      const c = clips.find((x) => x.media_id === mid && src >= x.src_in && src <= x.src_out)
       if (c) {
         seek(c.tl_start + (src - c.src_in) / c.speed)
         return
@@ -100,7 +103,7 @@ export default function Timeline() {
       setPreviewMode('source')
       seek(src)
     },
-    [previewMode, clips, seek, setPreviewMode],
+    [previewMode, clips, media, seek, setPreviewMode],
   )
 
   const snapPoints = useMemo(() => {
@@ -111,9 +114,10 @@ export default function Timeline() {
     const pts = [0]
     if (previewMode === 'timeline') pts.push(currentTime)
     clips.forEach((c) => {
-      // 排除正在拖的片段自身：否则它的当前边缘一直在吸附容忍范围内，
-      // 拖动会被自己「吸住」，表现为每 8px 卡一下、根本拖不快。
-      if (drag.kind === 'move' && drag.clipId === c.id) return
+      // 排除正在拖动的片段自身：把手吸附点里包含自己的边缘时（尤其 trim-in
+      // 的左边缘跟着把手走），一进入吸附容忍范围就会被自己「吸住」，
+      // 表现为每 8px 卡一下、根本拖不快。
+      if (drag.kind !== 'none' && drag.kind !== 'playhead' && drag.clipId === c.id) return
       pts.push(c.tl_start, c.tl_start + (c.src_out - c.src_in) / c.speed)
     })
     return pts
@@ -165,12 +169,30 @@ export default function Timeline() {
         // 按片段自己所属素材的长度裁剪：跨素材成片时用当前素材会裁错边界
         const lim = project?.media.find((m) => m.id === c.media_id)?.duration ?? media?.duration ?? 1e9
         const delta = (e.clientX - drag.startX) / zoom
-        const nIn = Math.max(0, Math.min(drag.origOut - 0.2, Math.min(lim - 0.2, drag.origIn + delta * c.speed)))
-        // 左端裁剪必须同时挪 tl_start：片段占位是 [tl_start, tl_start+(src_out-src_in)/speed]，
-        // 只改 src_in 会让右端跟着缩、左把手不跟手，看起来像在裁尾部。
-        const newStart = Math.max(0, drag.origStart + (nIn - drag.origIn) / c.speed)
+        // 位置左边界：同一条轨上片段不允许互相覆盖，左端最多挪到前一个片段的末尾。
+        // 只统计在拖动片段之前开始的片段，并用 origStart 封顶（防御历史数据里
+        // 已存在的重叠把把手一次性顶到很远的地方）。
+        let prevEnd = 0
+        for (const v of clips) {
+          if (v.id === drag.clipId || v.tl_start >= drag.origStart - 1e-6) continue
+          prevEnd = Math.max(prevEnd, v.tl_start + (v.src_out - v.src_in) / v.speed)
+        }
+        prevEnd = Math.max(0, Math.min(prevEnd, drag.origStart))
+        // 位置右边界：保住最小片段长度 0.2s（源片单位），换算到成片时间轴
+        const maxStart = drag.origStart + (drag.origOut - 0.2 - drag.origIn) / c.speed
+        // 1) 入点只受素材边界约束：向左拖 = 把更早的原片画面纳入片段（扩展开头），
+        //    下限是素材开头，上限保住最小长度。
+        const nIn = Number(Math.max(0, Math.min(drag.origOut - 0.2, Math.min(lim - 0.2, drag.origIn + delta * c.speed))).toFixed(3))
+        // 2) 位置由同一个 nIn 推出（同源取整，右端点不会亚毫秒漂移），再夹进
+        //    [prevEnd, maxStart]。磁性时间线下片段永远贴死，向左扩时位置会被钉在
+        //    前一片段的末尾（首片段钉在 0）——此时入点仍继续向左扩，多出来的时长
+        //    体现在右端生长，后续片段由 updateClip 的涟漪实时右移，前一片段毫发无损。
+        //    向右缩时位置跟手、右端不动、临时露出的空隙由松手压实收掉。
+        //    这里刻意不用 applySnap：位置被钉住时软吸附只会让缩短操作在前几像素
+        //    出现「钉住↔脱开」的右端点跳动，硬夹取本身就是磁吸。
+        const newStart = Math.max(prevEnd, Math.min(drag.origStart + (nIn - drag.origIn) / c.speed, maxStart))
         beginDrag()
-        updateClip(drag.clipId, { src_in: Number(nIn.toFixed(3)), tl_start: Number(newStart.toFixed(3)) }, false)
+        updateClip(drag.clipId, { src_in: nIn, tl_start: Number(newStart.toFixed(3)) }, false)
       } else if (drag.kind === 'trim-out') {
         const c = clips.find((v) => v.id === drag.clipId)
         if (!c) return
@@ -185,11 +207,19 @@ export default function Timeline() {
   )
 
   const onPointerUp = useCallback(() => {
+    // 拖动/裁剪期间片段允许自由落位（把手要跟手，trim-in 缩短时会临时露出空隙），
+    // 松手后统一压实：按落位顺序首尾相接。成片预览与导出都把这条轨当作无缝
+    // 序列，数据里留空隙只会让时间轴显示和实际播放不一致。
+    // pushHistory=false：拖动开始时已经压过一条撤销快照，压实和拖动算同一步。
+    if (drag.kind === 'move' || drag.kind === 'trim-in' || drag.kind === 'trim-out') {
+      useStore.getState().compactTrack(false)
+    }
     setDrag({ kind: 'none' })
     // 松手后仍要给 video 一点时间追上目标时间，所以 setUserSeeking(false)
-    // 内部会再留一个几百毫秒的屏蔽窗口
+    // 内部会再留一个几百毫秒的屏蔽窗口（顺序上先压实再吸附，播放头落点
+    // 才是压实后的内容位置）
     setUserSeeking(false)
-  }, [setUserSeeking])
+  }, [drag.kind, setUserSeeking])
 
   useEffect(() => {
     if (drag.kind === 'none') return
@@ -264,6 +294,13 @@ export default function Timeline() {
   }, [selectedClipId, clips, timeToPx, drag.kind, menu])
 
   if (!project) return null
+
+  // 拖动中的片段最后渲染（画在别的片段上面）：自由移动穿过邻居时能看清
+  // 自己拖到了哪，不会被排在后面的片段盖住。
+  const dragClipId = drag.kind === 'none' || drag.kind === 'playhead' ? null : drag.clipId
+  const renderClips = dragClipId
+    ? [...clips.filter((v) => v.id !== dragClipId), ...clips.filter((v) => v.id === dragClipId)]
+    : clips
 
   return (
     <div className="flex h-full min-h-0 flex-col border-t border-white/8 bg-ink-950/45">
@@ -408,8 +445,6 @@ export default function Timeline() {
                   tone="#ffb020"
                   content={
                     <span>
-                      <b className="text-amber-glow">{tr('timeline.rallyLaneTitle')}</b>
-                      {'\n\n'}
                       {tr('timeline.rallyLaneIntroBefore')}
                       <b>{tr('timeline.rallyLaneIntroBold')}</b>
                       {tr('timeline.rallyLaneIntroAfter')}
@@ -435,8 +470,6 @@ export default function Timeline() {
                 tone="#5c9dff"
                 content={
                   <span>
-                    <b className="text-flux-400">{tr('timeline.exportTrackTitle')}</b>
-                    {'\n\n'}
                     {tr('timeline.exportTrackIntroBefore')}
                     <b>{tr('timeline.exportTrackIntroBold')}</b>
                     {tr('timeline.exportTrackIntroAfter')}
@@ -559,7 +592,7 @@ export default function Timeline() {
               onContextMenu={(e) => e.preventDefault()}
             >
               <div className="absolute inset-x-0 top-[18px] bottom-1.5 rounded-md bg-white/[0.022]" />
-              {clips.map((c) => {
+              {renderClips.map((c) => {
                 const dur = (c.src_out - c.src_in) / c.speed
                 const left = timeToPx(c.tl_start)
                 const w = Math.max(6, timeToPx(dur))

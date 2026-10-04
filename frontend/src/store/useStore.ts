@@ -4,6 +4,7 @@ import { create } from 'zustand'
 import { api } from '../lib/api'
 import { timecode } from '../lib/format'
 import { ws } from '../lib/ws'
+import { compactTrackClips, filmClipAt, filmTimeOfSource, nearestCoveredFilmTime, orderedClips } from '../lib/timeline'
 import { applyDocumentLang, getLang, setLang as setRuntimeLang, t as tr, type Lang } from '../i18n'
 import type {
   AnalysisParams,
@@ -466,6 +467,13 @@ interface State {
   splitClipAtSourceTime: (clipId: string, sourceTime: number) => void
   moveClipTo: (clipId: string, newStart: number, newTrackIndex?: number) => void
   reorderTrack: () => void
+  /**
+   * 把成片轨按当前顺序首尾相接地压实（磁性时间线）。
+   * 拖动/裁剪期间片段允许自由落位（把手要跟手），松手后统一压实，保证
+   * 「时间轴显示的空隙 = 播放跳过的空隙 = 导出跳过的空隙 = 0」。
+   * 已是压实状态时是空操作，不写盘、不进撤销栈。
+   */
+  compactTrack: (pushHistory?: boolean) => void
   undo: () => void
   redo: () => void
   /** 把当前时间线压入撤销栈：连续操作开始前调用一次，之后用 pushHistory=false 应用变更 */
@@ -479,6 +487,17 @@ interface State {
   seek: (t: number) => void
   syncTime: (t: number) => void
   setUserSeeking: (v: boolean) => void
+  /**
+   * 把播放头吸附到最近的成片片段范围内（成片预览用）。
+   * 播放头落在片段之间的空隙 / 首段之前 / 末段之后时，画面只能停在
+   * 与时间线无关的旧帧上——吸附后时间线和实际播放内容才对得上。
+   */
+  snapPlayheadToContent: () => void
+  /**
+   * 成片预览跨素材续播：切换视频源但保持在成片模式，currentTime 写成片时间。
+   * 与 switchMediaAt 的区别：不切回源片模式、不清空片段选中、不重置回合选中。
+   */
+  switchMediaInFilm: (mid: string, tlTime: number) => void
   /** 当前预览模式下的总时长（秒）：成片模式是成片时长，源片模式是素材时长 */
   durationForMode: () => number
   /** 当前预览模式下一帧的秒数：成片用成片帧率，源片用代理帧率（回退源帧率） */
@@ -797,6 +816,10 @@ export const useStore = create<State>((set, get) => ({
         future: [],
         currentTime: 0,
       })
+      // 历史工程里片段间可能留着旧版拖动/裁剪产生的空隙或重叠。成片预览和
+      // 导出都会把空隙跳过，加载后立即压实（幂等，已是压实状态则什么都不做），
+      // 让时间轴显示与实际播放从打开工程那一刻起就一致。
+      get().compactTrack(false)
       if (location.hash !== `#/studio/${id}`) {
         history.replaceState(null, '', `#/studio/${id}`)
       }
@@ -1628,10 +1651,34 @@ export const useStore = create<State>((set, get) => ({
     const tl = structuredClone(s.project.timeline)
     for (const t of tl.tracks) {
       const i = t.clips.findIndex((c) => c.id === clipId)
-      if (i >= 0) {
-        t.clips[i] = { ...t.clips[i], ...patch }
-        break
+      if (i < 0) continue
+      const old = t.clips[i]
+      const next = { ...old, ...patch }
+      // 「涟漪裁剪」：右端点真正移动时才把后面的片段整体平移，保证无缝衔接、
+      // 不出现空白或重叠。三种情况：拖出点 / 变速改变时长；拖入点「缩短」时
+      // 右端不动（delta = 0）不涟漪；拖入点「向左扩展」时位置被钉在前一片段
+      // 末尾、多出的时长体现在右端（delta = 扩展量），后面的片段实时右移。
+      // 纯移动（只改 tl_start）不改变时长，同样不触发涟漪。
+      const affectsDuration =
+        patch.src_in !== undefined || patch.src_out !== undefined || patch.speed !== undefined
+      let delta = 0
+      if (affectsDuration) {
+        const oldDur = (old.src_out - old.src_in) / old.speed
+        const newDur = (next.src_out - next.src_in) / next.speed
+        delta = next.tl_start + newDur - (old.tl_start + oldDur)
       }
+      t.clips[i] = next
+      // 容差给 1.5ms：拖入点时 tl_start 和 src_in 各自做过 3 位小数取整，
+      // 右端点会出现亚毫秒级的虚假 delta；不设容差的话每次 pointermove 都会
+      // 把后面的片段挪动 ~0.5ms，整段拖下来累积成肉眼可见的缝/叠。
+      if (Math.abs(delta) > 0.0015) {
+        for (const c of t.clips) {
+          if (c.id !== clipId && c.tl_start > old.tl_start + 1e-6) {
+            c.tl_start = Math.max(0, Number((c.tl_start + delta).toFixed(3)))
+          }
+        }
+      }
+      break
     }
     tl.duration = Math.max(
       0,
@@ -1758,15 +1805,25 @@ export const useStore = create<State>((set, get) => ({
     if (!s.project) return
     const tl = structuredClone(s.project.timeline)
     const track = tl.tracks[0]
-    track.clips.sort((a, b) => a.tl_start - b.tl_start)
-    let cursor = 0
-    for (const c of track.clips) {
-      c.tl_start = Number(cursor.toFixed(3))
-      cursor += (c.src_out - c.src_in) / c.speed
-    }
-    tl.duration = cursor
+    if (!track) return
+    const { duration } = compactTrackClips(track)
+    tl.duration = duration
     get().setTimeline(tl)
     get().toast({ kind: 'success', title: tr('toast.gapsRemoved') })
+  },
+
+  compactTrack(pushHistory = true) {
+    const s = get()
+    if (!s.project) return
+    const tl = structuredClone(s.project.timeline)
+    const track = tl.tracks[0]
+    if (!track || !track.clips.length) return
+    const { changed, duration } = compactTrackClips(track)
+    // 已经是压实状态就别动：空拖动后的松手、重复打开工程都不该产生
+    // 写盘请求或多余的渲染。
+    if (!changed && Math.abs(tl.duration - duration) < 1e-6) return
+    tl.duration = duration
+    get().setTimeline(tl, pushHistory)
   },
 
   undo() {
@@ -1869,8 +1926,15 @@ export const useStore = create<State>((set, get) => ({
     // 夹到可播放范围内：否则「快进」越过末尾后时间码会显示到总时长之外，
     // 要等 video 的 timeupdate 把它拉回来，看上去就是读数乱跳。
     const clamped = dur > 0 ? Math.max(0, Math.min(t, dur)) : Math.max(0, t)
+    // 成片预览下播放头不能停在片段之间的空隙里：拖动播放头期间（userSeeking）
+    // 保留原始落点，松手时由 setUserSeeking(false) 统一吸附。
+    let target = clamped
+    if (s.previewMode === 'timeline' && !s.userSeeking) {
+      const snapped = nearestCoveredFilmTime(orderedClips(s.project?.timeline), clamped)
+      if (snapped !== null) target = snapped
+    }
     set({
-      currentTime: clamped,
+      currentTime: target,
       // 不缩短已有的屏蔽窗口：跨素材切源时 switchMediaAt 会设一个更长的窗口，
       // 随后的定位 seek 不能把它覆盖掉，否则视频还没加载完就被旧 timeupdate 拉回去。
       seekingUntil: Math.max(s.seekingUntil, Date.now() + 420),
@@ -1897,10 +1961,71 @@ export const useStore = create<State>((set, get) => ({
     set((s) =>
       s.userSeeking || Date.now() < s.seekingUntil ? {} : { currentTime: Math.max(0, t) },
     ),
-  setUserSeeking: (v) => set(v ? { userSeeking: true } : { userSeeking: false, seekingUntil: Date.now() + 320 }),
+  setUserSeeking: (v) => {
+    if (v) {
+      set({ userSeeking: true })
+      return
+    }
+    // 松手：先解除拖动标记再吸附。拖动播放头 / 拖动片段期间允许播放头停在
+    // 空隙里（跟手、不抢鼠标），但松手后画面必须回到成片内容上。
+    set({ userSeeking: false, seekingUntil: Date.now() + 320 })
+    get().snapPlayheadToContent()
+  },
+  snapPlayheadToContent: () => {
+    const s = get()
+    if (s.previewMode !== 'timeline' || !s.project) return
+    const clips = orderedClips(s.project.timeline)
+    const snapped = nearestCoveredFilmTime(clips, s.currentTime)
+    if (snapped === null || Math.abs(snapped - s.currentTime) < 1e-6) return
+    // 吸附后留一个屏蔽窗口：旧画面位置的 timeupdate 不能把播放头再拽回空隙里
+    set({ currentTime: snapped, seekingUntil: Date.now() + 420 })
+  },
+  switchMediaInFilm: (mid, tlTime) => {
+    set({
+      mediaId: mid,
+      currentTime: tlTime,
+      // video 重挂载前后旧元素还可能再触发一两次 timeupdate，屏蔽掉；
+      // 成片分支里错误位置的 timeupdate 映射不到片段、不会写回，窗口到期后恢复。
+      seekingUntil: Date.now() + 900,
+    })
+    get().ensurePrepare(mid)
+  },
   setZoom: (z) => set({ zoom: Math.max(6, Math.min(600, z)) }),
   setScroll: (s) => set({ scroll: Math.max(0, s) }),
-  setPreviewMode: (m) => set({ previewMode: m }),
+  setPreviewMode: (m) => {
+    const s = get()
+    if (m === s.previewMode || !s.project) {
+      set({ previewMode: m })
+      return
+    }
+    const clips = orderedClips(s.project.timeline)
+    if (m === 'timeline') {
+      // 源片 -> 成片：播放头是原片时间，先换算成成片时间；不在成片里就吸附到
+      // 最近的片段，保证切过去之后画面和播放头指的同一段内容。
+      const ft = filmTimeOfSource(clips, s.mediaId, s.currentTime)
+      if (ft !== null) {
+        set({ previewMode: m, currentTime: Math.max(0, ft) })
+      } else {
+        set({ previewMode: m })
+        get().snapPlayheadToContent()
+      }
+      return
+    }
+    // 成片 -> 源片：成片时间换算回原片时间。落点在别的素材的片段上时直接
+    // 切到那个素材（源片预览看的就是素材本身）；不在任何片段里就保持原数。
+    const c = filmClipAt(clips, s.currentTime)
+    if (c) {
+      const src = c.src_in + (s.currentTime - c.tl_start) / (c.speed || 1)
+      if (c.media_id !== s.mediaId) {
+        get().switchMediaAt(c.media_id, src)
+        return
+      }
+      set({ previewMode: m, currentTime: Math.max(0, src) })
+      return
+    }
+    const dur = s.currentMedia()?.duration ?? 0
+    set({ previewMode: m, currentTime: dur > 0 ? Math.min(s.currentTime, dur) : s.currentTime })
+  },
   setPreviewFiltered: (v) => set({ previewFiltered: v }),
   setShowCourtOverlay: (v) => set({ showCourtOverlay: v }),
   setCourtEditorOpen: (v) => set({ courtEditorOpen: v }),
