@@ -299,9 +299,25 @@ export function SpeedMenu({
   direction?: 'up' | 'down'
 }) {
   const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
   const up = direction === 'up'
+
+  // Close on any pointer press outside this control (button + menu).
+  // Do NOT use a body-level fixed overlay for this: the page shell `.anim-in`
+  // animates transform, so it is its own stacking context and the portal overlay
+  // (z-40 at root level) paints above the panel (z-50 trapped inside), swallowing
+  // every option click — the menu opens but no speed can be picked.
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [open])
+
   return (
-    <div className="relative">
+    <div ref={rootRef} className="relative">
       <Tooltip content={title} side={up ? 'top' : 'bottom'}>
         <Button variant="ghost" size="sm" onClick={() => setOpen((v) => !v)}>
           <Gauge size={13} />
@@ -310,40 +326,31 @@ export function SpeedMenu({
       </Tooltip>
       <AnimatePresence>
         {open && (
-          <>
-            {/* 点击空白处关闭。用 portal 挂到 body：
-                页面外壳 .anim-in 带 transform 动画，留在里面的话 fixed 会以它为参照，
-                遮罩只盖住局部，点别处关不掉这个弹层。 */}
-            {createPortal(
-              <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />,
-              document.body,
+          <motion.div
+            initial={{ opacity: 0, y: up ? 6 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: up ? 6 : -6 }}
+            className={cn(
+              'panel absolute z-50 flex flex-col p-1',
+              up ? 'right-0 bottom-full mb-1.5' : 'left-0 top-full mt-1.5',
             )}
-            <motion.div
-              initial={{ opacity: 0, y: up ? 6 : -6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: up ? 6 : -6 }}
-              className={cn(
-                'panel absolute z-50 flex flex-col p-1',
-                up ? 'right-0 bottom-full mb-1.5' : 'left-0 top-full mt-1.5',
-              )}
-            >
-              {SPEEDS.map((s) => (
-                <button
-                  key={s}
-                  onClick={() => {
-                    onChange(s)
-                    setOpen(false)
-                  }}
-                  className={cn(
-                    'mono rounded-md px-3 py-1 text-[11.5px] transition-colors',
-                    value === s ? 'bg-court-500/20 text-court-300' : 'text-ink-300 hover:bg-white/8',
-                  )}
-                >
-                  {s}×
-                </button>
-              ))}
-            </motion.div>
-          </>
+          >
+            {SPEEDS.map((s) => (
+              <button
+                key={s}
+                onClick={() => {
+                  onChange(s)
+                  setOpen(false)
+                }}
+                className={cn(
+                  'mono rounded-md px-3 py-1 text-[11.5px] transition-colors',
+                  value === s ? 'bg-court-500/20 text-court-300' : 'text-ink-300 hover:bg-white/8',
+                )}
+              >
+                {s}×
+              </button>
+            ))}
+          </motion.div>
         )}
       </AnimatePresence>
     </div>

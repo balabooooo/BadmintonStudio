@@ -64,6 +64,8 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
   const env = useStore((s) => s.env)
   const refreshEnv = useStore((s) => s.refreshEnv)
   const media = useStore((s) => s.currentMedia())
+  const openMediaPicker = useStore((s) => s.openMediaPicker)
+  const selectMedia = useStore((s) => s.selectMedia)
   const analysis = useStore((s) => s.currentAnalysis())
   const jobs = useStore((s) => s.jobs)
   const weights = useStore((s) => s.weights)
@@ -252,6 +254,32 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       {scope === 'all' && (
         <div className="mb-4 rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5 text-[11px] leading-relaxed text-ink-500">
           {tr('analysis.scopeAllNote')}
+        </div>
+      )}
+      {scope === 'current' && media && (
+        <div className="mb-4 flex items-center gap-2.5 rounded-xl border border-white/8 bg-white/[0.02] px-3 py-2">
+          {media.poster ? (
+            <img src={api.assetUrl(media.poster)} alt="" className="h-9 w-16 shrink-0 rounded object-cover" />
+          ) : (
+            <div className="grid h-9 w-16 shrink-0 place-items-center rounded bg-ink-850 text-ink-600">
+              <Video size={14} />
+            </div>
+          )}
+          <div className="min-w-0 flex-1 truncate text-[11.5px] text-ink-200" title={media.path}>
+            {media.name}
+          </div>
+          <Button
+            size="sm"
+            variant="subtle"
+            onClick={() =>
+              openMediaPicker('select', (mid) => {
+                selectMedia(mid)
+                setScope('current')
+              })
+            }
+          >
+            {tr('mediaPicker.change')}
+          </Button>
         </div>
       )}
 

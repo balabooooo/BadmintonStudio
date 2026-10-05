@@ -22,6 +22,9 @@ import type {
 
 export type View = 'library' | 'studio' | 'annotate' | 'exports' | 'settings'
 
+/** Unified media picker mode: switch the global media, or return a pick to a caller dialog. */
+export type MediaPickerMode = 'switch' | 'select'
+
 /**
  * 这个回合在成片里被盖住了多少（0~1），以及盖得最多的那一段。
  *
@@ -283,6 +286,19 @@ let openProjectSeq = 0
 /** 正在申请 preview 任务的素材：api 调用到 WS 任务事件到达之间用它去重，避免重复提交。 */
 const preparingMedia = new Set<string>()
 
+/**
+ * Select-mode result callback (intentionally non-reactive: a changing callback
+ * must not trigger renders). Stored by openMediaPicker, consumed once on confirm.
+ */
+let mediaPickHandler: ((mid: string) => void) | null = null
+
+/** Take and clear the select-mode pick callback. */
+export function consumeMediaPick(): ((mid: string) => void) | null {
+  const fn = mediaPickHandler
+  mediaPickHandler = null
+  return fn
+}
+
 /** 该素材是否有正在排队 / 运行的分析任务（重切分前用它避免被分析结果覆盖）。 */
 function mediaIsAnalyzing(mediaId: string): boolean {
   return Object.values(useStore.getState().jobs).some(
@@ -346,6 +362,9 @@ interface State {
   projects: ProjectSummary[]
   project: Project | null
   mediaId: string | null
+  /** Global media picker dialog visibility + mode (switch global media / return a pick). */
+  mediaPickerOpen: boolean
+  mediaPickerMode: MediaPickerMode
   weights: string
   params: AnalysisParams
   filter: RallyFilter
@@ -411,6 +430,9 @@ interface State {
   /** 批量从工程移除素材；当前选中的素材若被删会自动切到剩下的第一个 */
   removeMediaBulk: (ids: string[]) => Promise<void>
   selectMedia: (mid: string) => void
+  /** Open the global media picker. In 'select' mode onPick receives the chosen media id. */
+  openMediaPicker: (mode?: MediaPickerMode, onPick?: (mid: string) => void) => void
+  closeMediaPicker: () => void
 
   // ---------------- 场景预设（跨工程）
   presets: ScenePreset[]
@@ -630,6 +652,8 @@ export const useStore = create<State>((set, get) => ({
   projects: [],
   project: null,
   mediaId: null,
+  mediaPickerOpen: false,
+  mediaPickerMode: 'switch',
   weights: 'balanced',
   params: { ...DEFAULT_PARAMS },
   filter: { ...DEFAULT_FILTER },
@@ -932,6 +956,9 @@ export const useStore = create<State>((set, get) => ({
         } else if (!firstError) firstError = (await res.text().catch(() => '')) || `HTTP ${res.status}`
       }
       await get().openProject(p.id)
+      // Mirror importMedia: select the first uploaded media so the picker
+      // cursor and the studio follow it.
+      if (addedIds.length) set({ mediaId: addedIds[0] })
       if (okCount) get().toast({ kind: 'success', title: tr('toast.importedFiles', { n: okCount }) })
       const failed = files.length - okCount
       if (failed) get().toast({ kind: 'warn', title: tr('toast.importFailedCount', { n: failed }), detail: firstError })
@@ -1022,6 +1049,16 @@ export const useStore = create<State>((set, get) => ({
     if (s.rallyScope !== 'current' || s.busy.rescore) return
     const a = s.project?.analyses[mid]
     if (a?.status === 'done' && a.stats?.weights !== s.weights) void s.rescore(s.weights)
+  },
+
+  openMediaPicker(mode = 'switch', onPick) {
+    mediaPickHandler = onPick ?? null
+    set({ mediaPickerOpen: true, mediaPickerMode: mode })
+  },
+
+  closeMediaPicker() {
+    // The handler is intentionally kept until a pick resolves (ESC/backdrop just cancels).
+    set({ mediaPickerOpen: false })
   },
 
   // ================================================================= 场景预设

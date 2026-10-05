@@ -4,12 +4,14 @@ import { FRAG as analysis } from './analysis'
 import { FRAG as inspector } from './inspector'
 import { FRAG as annotate } from './annotate'
 import { FRAG as player } from './player'
+import { FRAG as media } from './media'
 
 export const FRAGMENTS: [string, string, string][] = [
   ...analysis,
   ...inspector,
   ...annotate,
   ...player,
+  ...media,
 ]
 
 export function zhDict(): Record<string, string> {

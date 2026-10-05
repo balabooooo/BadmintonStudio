@@ -534,7 +534,9 @@ Workflow:
 2. **Mark rallies.** Play the proxy, mark the start/end of each real rally, add notes. Annotations are saved
    per media clip as `data/annotations/<proxy-name>.anno.json` and exported to CSV on demand.
 3. **Evaluate.** The current parameters are scored against your annotation with IoU-based matching,
-   producing Precision / Recall / F1 (`analysis/annotation.py`).
+   producing Precision / Recall / F1 (`analysis/annotation.py`). Scoring runs inside an evaluation
+   window (the saved focus ∩ your annotation's bounding box): regions you did not annotate are
+   neither positive nor negative evidence, so annotating only part of the video is safe.
 4. **Optimize.** A grid search over the segmentation parameters (four quiet-segment scales + minimum rally
    length) re-runs only "segmentation + finishing" on the stored signals — no AI is re-run — and returns the
    best-F1 combination plus the top results. When F1 ties, recall and precision break the tie, so it does not

@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Check,
   Download,
+  Info,
   Pause,
   PenLine,
   Play,
@@ -27,6 +28,7 @@ import { api } from '../lib/api'
 import { cn, clamp } from '../lib/format'
 import { Badge, Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
 import { stepSpeedValue } from '../lib/playback'
+import MediaChip from './MediaChip'
 import { useStore } from '../store/useStore'
 import { useT } from '../i18n/useT'
 import type {
@@ -177,14 +179,20 @@ export default function AnnotatePage() {
 
   // 键盘 / rAF 回调里读最新状态（避免闭包过期，也避免每帧重绑监听器）。
   // 用 effect 而不是在 render 里直接赋值：并发渲染下在 render 期间写 ref 不安全。
-  const stateRef = useRef({ ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop })
+  const stateRef = useRef({ ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop, note, dirty })
   useEffect(() => {
-    stateRef.current = { ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop }
+    stateRef.current = { ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop, note, dirty }
   })
+  // The media id whose data stateRef currently holds. Null while a reload is in
+  // flight: flushing during that window would write the previous media's draft
+  // against a media that has not loaded yet (rapid A -> B -> C switches).
+  const loadedMidRef = useRef<string | null>(null)
 
   /* ---------------------------------------------------------------- 加载 */
   const reload = useCallback(async () => {
     if (!pid || !mid) return
+    // Snapshot is not trustworthy until the GET below resolves.
+    loadedMidRef.current = null
     try {
       const info = await api.getAnnotation(pid, mid)
       setDuration(info.duration || media?.duration || 0)
@@ -212,6 +220,7 @@ export default function AnnotatePage() {
       setDirty(false)
       setSaveState(info.rallies?.length ? tr('annotate.loadedRallies', { n: info.rallies.length }) : tr('annotate.newAnnotation'))
       undoRef.current = []
+      loadedMidRef.current = mid
     } catch (e) {
       toast({ kind: 'error', title: tr('annotate.loadFailed'), detail: String(e) })
     }
@@ -259,6 +268,39 @@ export default function AnnotatePage() {
     [],
   )
 
+  // Switching media from the global picker must flush the OLD media's draft
+  // immediately (no debounce, no confirm). The listener runs synchronously
+  // inside the store update, before React re-renders this page, so stateRef
+  // still holds the outgoing media's data. Switching projects must not save
+  // A's annotation into B (project id guard), and a clean draft is skipped.
+  useEffect(() => {
+    const unsub = useStore.subscribe((next, prev) => {
+      if (next.project?.id !== prev.project?.id) return
+      if (next.mediaId === prev.mediaId || !prev.project || !prev.mediaId) return
+      // Deleting the current media also changes mediaId; never save a draft
+      // against the removed id.
+      if (!prev.project.media.some((m) => m.id === prev.mediaId)) return
+      // stateRef must hold this exact media's loaded data. During a reload the
+      // snapshot still belongs to the previous media (A -> B -> C guard).
+      if (loadedMidRef.current !== prev.mediaId) return
+      const snap = stateRef.current
+      if (!snap.dirty) return
+      if (saveTimer.current) {
+        window.clearTimeout(saveTimer.current)
+        saveTimer.current = null
+      }
+      void api
+        .saveAnnotation(prev.project.id, prev.mediaId, {
+          rallies: snap.ann.map(({ start, end, source, note: n }) => ({ start, end, source, note: n })),
+          hits: snap.hits.map(({ t, ours }) => ({ t, ours })),
+          focus: snap.focus,
+          note: snap.note,
+        })
+        .catch(() => undefined)
+    })
+    return unsub
+  }, [])
+
   const pushUndo = useCallback(() => {
     undoRef.current.push({
       rallies: stateRef.current.ann.map(({ id: _id, ...r }) => r),
@@ -291,6 +333,50 @@ export default function AnnotatePage() {
     setHits([])
     markDirty()
   }, [markDirty, pushUndo])
+
+  // 键盘修正击球标注时的搜索半径（秒）：超出则视为播放头附近没有击球，不做操作，
+  // 避免误改远处（可能是几十秒外）的标注。击球间隔通常 <2s。
+  const HIT_KEY_RADIUS = 2.0
+
+  const nearestHit = useCallback((t: number): AnnHit | null => {
+    let best: AnnHit | null = null
+    let bd = Infinity
+    for (const h of stateRef.current.hits) {
+      const d = Math.abs(h.t - t)
+      if (d < bd) {
+        bd = d
+        best = h
+      }
+    }
+    return best && bd <= HIT_KEY_RADIUS ? best : null
+  }, [])
+
+  /** H：切换播放头最近一颗击球的「我方 / 邻场」归属。 */
+  const toggleNearestHit = useCallback(() => {
+    const h = nearestHit(videoRef.current?.currentTime ?? 0)
+    if (!h) return
+    pushUndo()
+    setHits((prev) => prev.map((x) => (x.id === h.id ? { ...x, ours: !x.ours } : x)))
+    markDirty()
+  }, [markDirty, nearestHit, pushUndo])
+
+  /** Shift+H：在播放头处补一颗击球（检测漏检时用）；0.2s 内已有则忽略，防手抖加重。 */
+  const addHitAtPlayhead = useCallback(() => {
+    const t = videoRef.current?.currentTime ?? 0
+    if (stateRef.current.hits.some((h) => Math.abs(h.t - t) <= 0.2)) return
+    pushUndo()
+    setHits((prev) => [...prev, { t, ours: true, id: nextId() }])
+    markDirty()
+  }, [markDirty, pushUndo])
+
+  /** X：删除播放头最近的一颗击球（误检时用）。 */
+  const deleteNearestHit = useCallback(() => {
+    const h = nearestHit(videoRef.current?.currentTime ?? 0)
+    if (!h) return
+    pushUndo()
+    setHits((prev) => prev.filter((x) => x.id !== h.id))
+    markDirty()
+  }, [markDirty, nearestHit, pushUndo])
 
   /* ---------------------------------------------------------------- 播放控制 */
   const seek = useCallback((t: number, center = true, pause = true) => {
@@ -479,6 +565,9 @@ export default function AnnotatePage() {
   /* ---------------------------------------------------------------- 键盘 */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Global media picker owns the keyboard while open (its grid handles
+      // Space/arrows/Enter); do not also seek/play the annotate video.
+      if (useStore.getState().mediaPickerOpen) return
       const el = e.target as HTMLElement | null
       const tag = (el?.tagName || '').toUpperCase()
       if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return
@@ -535,6 +624,16 @@ export default function AnnotatePage() {
         case 'A':
           selectNearest()
           break
+        case 'h':
+        case 'H':
+          // H 切换最近击球归属，Shift+H 在播放头处补一颗击球。
+          if (e.shiftKey) addHitAtPlayhead()
+          else toggleNearestHit()
+          break
+        case 'x':
+        case 'X':
+          deleteNearestHit()
+          break
         case 'Escape':
           setPending(null)
           setSel(null)
@@ -553,7 +652,7 @@ export default function AnnotatePage() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [acceptAuto, delSel, doSave, finishSeg, jumpAuto, newSeg, selectNearest, step, stepSpeed, togglePlay, undo])
+  }, [acceptAuto, addHitAtPlayhead, delSel, deleteNearestHit, doSave, finishSeg, jumpAuto, newSeg, selectNearest, step, stepSpeed, toggleNearestHit, togglePlay, undo])
 
   /* ---------------------------------------------------------------- rAF：时间同步 + 播放跟随 */
   useEffect(() => {
@@ -884,8 +983,9 @@ export default function AnnotatePage() {
       <div className="flex items-center gap-2 border-b border-white/7 px-3 py-2">
         <PenLine size={15} className="text-court-300" />
         <div className="text-[13px] font-semibold text-white">{tr('annotate.title')}</div>
-        <span className="text-[11px] text-ink-500">
-          {media.name} · {fmt(duration)} · {tr('annotate.headerMeta', { auto: auto.length, ann: ann.length })}
+        <span className="flex items-center gap-1.5 text-[11px] text-ink-500">
+          <MediaChip />
+          {fmt(duration)} · {tr('annotate.headerMeta', { auto: auto.length, ann: ann.length })}
         </span>
         <div className="flex-1" />
         <span className={cn('text-[11px]', dirty ? 'text-amber-glow' : 'text-ink-500')}>{saveState}</span>
@@ -954,10 +1054,28 @@ export default function AnnotatePage() {
             <SpeedMenu value={speed} onChange={setSpeed} title={tr('annotate.speed')} direction="down" />
             <Button size="sm" variant={loop ? 'primary' : 'ghost'} onClick={() => setLoop((v) => !v)}>{tr('annotate.loopSelected')}</Button>
             <div className="flex-1" />
-            <Tooltip content={tr('annotate.markStart')} kbd={['[', 'i']}>
+            <Tooltip
+              content={
+                <span>
+                  {tr('annotate.markStart')}
+                  <br />
+                  <span className="text-ink-400">{tr('annotate.partialHintShort')}</span>
+                </span>
+              }
+              kbd={['[', 'i']}
+            >
               <Button size="sm" onClick={newSeg}>{tr('annotate.markStart')}</Button>
             </Tooltip>
-            <Tooltip content={tr('annotate.markEnd')} kbd={[']', 'o']}>
+            <Tooltip
+              content={
+                <span>
+                  {tr('annotate.markEnd')}
+                  <br />
+                  <span className="text-ink-400">{tr('annotate.partialHintShort')}</span>
+                </span>
+              }
+              kbd={[']', 'o']}
+            >
               <Button size="sm" onClick={finishSeg}>{tr('annotate.markEnd')}</Button>
             </Tooltip>
             <Tooltip content={tr('annotate.confirmAuto')} kbd="c">
@@ -1088,8 +1206,14 @@ export default function AnnotatePage() {
           </div>
 
           <div className="px-3 py-2 text-[10.5px] leading-relaxed text-ink-500">
+            <div className="mb-1 flex items-start gap-1 text-court-300/90">
+              <Info size={12} className="mt-0.5 shrink-0" />
+              <span>{tr('annotate.partialHint')}</span>
+            </div>
             <b>← →</b> {tr('annotate.helpSeek')} · <b>- / =</b> {tr('annotate.helpSpeed')} · <b>[ ]</b> {tr('annotate.helpMark')} · <b>c</b> {tr('annotate.helpConfirm')} ·
             <b> n / p</b> {tr('annotate.helpJump')} · <b>d</b> {tr('annotate.helpDelete')} · <b>z</b> {tr('annotate.undo')} · <b>s</b> {tr('common.save')} · {tr('annotate.helpDrag')}
+            <br />
+            <b>h</b> {tr('annotate.helpHitToggle')} · <b>⇧H</b> {tr('annotate.helpHitAdd')} · <b>x</b> {tr('annotate.helpHitDelete')}
           </div>
         </section>
 

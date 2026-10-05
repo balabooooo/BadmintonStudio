@@ -22,6 +22,7 @@ import ExportsPage from './components/ExportsPage'
 import SettingsPage from './components/SettingsPage'
 import JobTray from './components/JobTray'
 import CourtEditor from './components/CourtEditor'
+import MediaPickerDialog from './components/MediaPickerDialog'
 
 function Logo() {
   const t = useT()
@@ -330,6 +331,8 @@ export default function App() {
         open={courtEditorOpen}
         onClose={() => setCourtEditorOpen(false)}
       />
+      {/* 素材选择弹窗是跨页面的：剪辑台 / 标注页 / AI 分析设置共用同一个实例 */}
+      <MediaPickerDialog />
       <ToastHost />
     </ConfirmProvider>
   )

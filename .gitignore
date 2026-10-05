@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .npmcache/
 .trae/
+.superpowers/
 node_modules/
 frontend/dist/
 # PyInstaller / release build artifacts

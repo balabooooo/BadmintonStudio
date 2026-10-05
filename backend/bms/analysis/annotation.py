@@ -333,7 +333,9 @@ def _predict_hit_times(ctx: _Context, params: AnalysisParams, hits=None) -> list
         hits = _gated_hits(ctx, params)
     if hits is None or hits.times.size == 0:
         return []
-    return [float(t) for t in hits.times]
+    # Only hits inside the evaluation window are scoreable: hit labels cover just the annotated
+    # region, so a kept hit outside it would count as a false positive it does not deserve.
+    return [float(t) for t in hits.times if ctx.lo <= t <= ctx.hi]
 
 
 def _grid_search(ctx: _Context, gt: list[tuple[float, float]], base: AnalysisParams,
@@ -403,6 +405,10 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     * **stage C — hit sensitivity**: ``hit_sensitivity`` via ``sensitivity_fn(sensitivity)`` which
       re-detects hits from the cached audio; only meaningful with ``hit_labels``.
 
+    Scoring happens inside an evaluation window = ``focus`` ∩ annotation bounding box. Anything
+    outside is unscored (neither positive nor negative evidence), so annotating only part of the
+    video is safe.
+
     Returns a dict with ``baseline``, ``best`` (combined parameters), ``results`` and per-stage
     ``stages``. This is **only a search**; applying it still requires writing ``best`` back into params
     and resegmenting.
@@ -411,8 +417,17 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     if not gt:
         raise ValueError(tr("analysis.annotation.empty_gt"))
     hit_labels = [(float(t), bool(o)) for t, o in (hit_labels or [])]
-    lo = float(focus[0]) if focus else min(a for a, _ in gt)
-    hi = float(focus[1]) if focus else max(b for _, b in gt)
+    # Evaluation window = saved focus ∩ annotation bounding box. Regions without annotations are
+    # **not** negative evidence ("no rally here") — they are simply unscored: a partial annotation
+    # (say 0:10~1:00 of a 12min video) must not count correctly detected rallies in the rest of the
+    # video as false positives, or the search would be biased toward over-suppressed segmentation.
+    bbox_lo = min(a for a, _ in gt)
+    bbox_hi = max(b for _, b in gt)
+    lo, hi = bbox_lo, bbox_hi
+    if focus:
+        lo, hi = max(bbox_lo, float(focus[0])), min(bbox_hi, float(focus[1]))
+        if hi <= lo:  # focus does not overlap the annotations at all: fall back to the bbox
+            lo, hi = bbox_lo, bbox_hi
     ctx = _build_context(res, lo, hi)
     base = res.params
     grid = grid or SEARCH_GRID

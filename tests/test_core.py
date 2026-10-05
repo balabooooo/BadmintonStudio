@@ -1033,6 +1033,77 @@ def test_annotation_optimizer_runs() -> None:
           f"{out['best']['f1']} < {out['baseline']['f1']}")
 
 
+def test_annotation_eval_window_intersection() -> None:
+    """The evaluation window must be ``focus ∩ annotation bbox``; unannotated regions are unscored.
+
+    Regression for a real bug: with focus set to the whole video and annotations covering only
+    the middle section, every AI-detected rally outside the annotated span was counted as a false
+    positive, biasing the parameter search toward over-suppressed segmentation. The fix tightens
+    the window to the intersection of the saved focus and the annotation bounding box; regions
+    without ground truth are simply not scored.
+    """
+    print("\n标注：评估窗 = focus ∩ 标注外接区间")
+    fps = 12.0
+    dur = 120.0
+    n = int(dur * fps)
+    act = np.full(n, 0.4, dtype=np.float32)
+    pm = np.zeros(n, dtype=np.float32)
+    # Two real rallies: one inside the annotated span, one outside it.
+    for a, b in ((10, 35), (60, 90)):
+        pm[int(a * fps):int(b * fps)] = 1.0
+        act[int(a * fps):int(b * fps)] = 0.9
+    hit_times = [t for a, b in ((10, 35), (60, 90)) for t in np.arange(a, b, 1.2)]
+    res = AnalysisResult(
+        media_id="m_win", status="done",
+        params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.5, post_roll=0.5),
+        signals={
+            "activity_full": act.tolist(),
+            "player_motion_full": pm.tolist(),
+            "player_coverage_full": np.ones(n, dtype=np.float32).tolist(),
+            "fps": [fps], "duration": [dur], "player_fps": [fps],
+            "hit_times": [round(float(t), 3) for t in hit_times],
+            "hit_strength": [0.8] * len(hit_times),
+            "hit_confidence": [0.9] * len(hit_times),
+        },
+        stats={"audio_reliability": 0.8},
+    )
+    # User annotated only the first rally; focus covers the whole video (the old default).
+    gt = [(10.0, 34.0)]
+    focus = (0.0, dur)
+    out = AN.optimize(res, gt, focus=focus,
+                      grid=[("seg_min_core", [1.8]), ("min_rally_seconds", [2.0])])
+    lo, hi = out["focus"]
+    # Window must be the intersection of focus [0,120] and the annotation bbox [10,34].
+    check("评估窗收紧到 focus ∩ 标注外接区间", abs(lo - 10.0) < 1e-6 and abs(hi - 34.0) < 1e-6,
+          f"focus={out['focus']}")
+
+    # The second rally (60-90) is correctly detected by the AI but lives outside the annotation
+    # window. It must NOT appear in predictions that get scored, so it is not a false positive.
+    base = out["baseline"]
+    preds_inside = all(10.0 - 5 <= p[0] and p[1] <= 34.0 + 5 for p in out["results"][0].get("preds", [])) \
+        if "preds" in out["results"][0] else True
+    # Directly check the baseline n (prediction count) is small: with the window filter, the
+    # 60-90 rally is dropped, so n should be ~1, not 2.
+    check("未标注区域的正确预测不计入 FP（baseline n 不大）", int(base.get("n", 0)) <= 1,
+          f"n={base.get('n')} fp={base.get('fp')}")
+    check("baseline precision 不为 0（未被未标注区拉低）",
+          float(base.get("precision", 0.0)) > 0.0, str(base))
+
+    # Edge case: focus does not overlap the annotations at all -> fall back to the bbox.
+    out2 = AN.optimize(res, gt, focus=(100.0, 110.0),
+                       grid=[("seg_min_core", [1.8]), ("min_rally_seconds", [2.0])])
+    lo2, hi2 = out2["focus"]
+    check("focus 与标注无交集时回退到标注外接区间",
+          abs(lo2 - 10.0) < 1e-6 and abs(hi2 - 34.0) < 1e-6, f"focus={out2['focus']}")
+
+    # Edge case: no focus given -> window defaults to the annotation bbox.
+    out3 = AN.optimize(res, gt, focus=None,
+                       grid=[("seg_min_core", [1.8]), ("min_rally_seconds", [2.0])])
+    lo3, hi3 = out3["focus"]
+    check("无 focus 时窗口等于标注外接区间",
+          abs(lo3 - 10.0) < 1e-6 and abs(hi3 - 34.0) < 1e-6, f"focus={out3['focus']}")
+
+
 def test_annotation_hit_gate_stage() -> None:
     """Hit-level labels must unlock the gate stage and produce hit-level precision/recall."""
     print("\n标注：击球门控分阶段搜索")
@@ -1957,6 +2028,7 @@ def main() -> int:
     test_merge_by_availability_windows()
     test_annotation_evidence_and_metrics()
     test_annotation_optimizer_runs()
+    test_annotation_eval_window_intersection()
     test_annotation_hit_gate_stage()
     test_preset_hit_params()
     test_api_filters_and_id_safety()
