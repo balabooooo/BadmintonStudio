@@ -20,6 +20,7 @@ import math
 import os
 import random
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,10 @@ _SINGLES_SIDE = 0.46
 
 # Fixed seed: the demos are deterministic, so a regenerated clip looks the same.
 _RNG_SEED = 20261006
+
+# Serializes generation within one process (the API layer may call this from
+# several threads); the pid-suffixed temp file covers cross-process overlap.
+_GEN_LOCK = threading.Lock()
 
 
 # ------------------------------------------------------------------ Clip specs
@@ -328,7 +333,7 @@ def _encode(spec: _Spec, target: Path, ffmpeg: str) -> None:
     that only replaces ``target`` once the encode succeeded."""
     plan = _build_plan(spec)
     total = int(round(spec.seconds * spec.fps))
-    tmp = target.with_name(target.name + ".part")
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.part")
     cmd = [
         str(ffmpeg), "-y", "-nostats", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -377,11 +382,12 @@ def ensure_sample_files(data_dir: Path, ffmpeg: str, *, small: bool = False) -> 
     specs = _small_specs() if small else _full_specs()
     out_dir = Path(data_dir) / "samples"
     targets = [out_dir / s.name for s in specs]
-    if all(p.is_file() and p.stat().st_size > 0 for p in targets):
+    with _GEN_LOCK:
+        if all(p.is_file() and p.stat().st_size > 0 for p in targets):
+            return targets
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for spec, target in zip(specs, targets):
+            if target.is_file() and target.stat().st_size > 0:
+                continue
+            _encode(spec, target, ffmpeg)
         return targets
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for spec, target in zip(specs, targets):
-        if target.is_file() and target.stat().st_size > 0:
-            continue
-        _encode(spec, target, ffmpeg)
-    return targets
