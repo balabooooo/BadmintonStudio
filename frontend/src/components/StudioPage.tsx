@@ -175,6 +175,7 @@ export default function StudioPage() {
         )}
 
         <Button
+          data-tour="btn-court"
           variant={manualPoly ? 'subtle' : 'ghost'}
           onClick={() => setCourtEditorOpen(true)}
           disabled={!hasMedia}
@@ -189,6 +190,7 @@ export default function StudioPage() {
         </Button>
 
         <Button
+          data-tour="btn-analysis"
           variant={running ? 'outline' : analyzed ? 'subtle' : 'primary'}
           onClick={() => setAnalysisOpen(true)}
           disabled={!hasMedia}
@@ -201,6 +203,7 @@ export default function StudioPage() {
         </Button>
 
         <Button
+          data-tour="btn-export"
           variant="primary"
           onClick={() => setExportOpen(true)}
           disabled={!project?.timeline.tracks[0]?.clips.length}
@@ -238,7 +241,7 @@ export default function StudioPage() {
         <div className="flex min-w-0 flex-1 flex-col">
           {!hasMedia ? (
             <div className="grid min-h-0 flex-1 place-items-center">
-              <Card className="max-w-[420px] border-dashed py-2">
+              <Card data-tour="studio-empty" className="max-w-[420px] border-dashed py-2">
                 <Empty
                   icon={<Film size={32} />}
                   title={tr('studio.emptyTitle')}

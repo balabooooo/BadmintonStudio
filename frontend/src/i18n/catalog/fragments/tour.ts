@@ -68,6 +68,8 @@ export const FRAG: [string, string, string][] = [
   ['tour.samples.projectName', '示例工程', 'Sample project'],
   ['tour.samples.title', '示例素材', 'Sample media'],
   ['tour.settings.body', '「功能引导」随时重看；此处可切换中英文', 'Replay this tour anytime under "Feature tour"; switch between Chinese and English here'],
+  ['tour.settings.cardDesc', '重新查看各功能的引导说明', 'Replay the guided tour anytime'],
+  ['tour.settings.cardTitle', '功能引导', 'Feature tour'],
   ['tour.settings.title', '设置', 'Settings'],
   ['tour.timeline.body', '成片轨与工具条：分割、删除、自动剪辑', 'The film track and its toolbar: split, delete, auto-cut'],
   ['tour.timeline.title', '时间线', 'Timeline'],

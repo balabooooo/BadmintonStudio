@@ -303,7 +303,7 @@ export default function Timeline() {
     : clips
 
   return (
-    <div className="flex h-full min-h-0 flex-col border-t border-white/8 bg-ink-950/45">
+    <div data-tour="timeline" className="flex h-full min-h-0 flex-col border-t border-white/8 bg-ink-950/45">
       {/* 工具栏 */}
       <div className="flex items-center gap-1.5 border-b border-white/7 px-3 py-1.5">
         <span className="mr-1 shrink-0 text-[10.5px] font-semibold tracking-[0.14em] whitespace-nowrap text-ink-400 uppercase">
@@ -385,6 +385,7 @@ export default function Timeline() {
           </Button>
         </Tooltip>
         <input
+          data-tour="timeline-zoom"
           type="range"
           min={6}
           max={600}

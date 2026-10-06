@@ -10,11 +10,13 @@ import {
   Film,
   AlertTriangle,
   Languages,
+  Sparkles,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { bytes, cn } from '../lib/format'
 import { Button, Card, Progress, SectionTitle, Segmented, Stat, useConfirm } from './ui'
 import { useStore } from '../store/useStore'
+import { useTourStore } from '../tour/tourStore'
 import { useT } from '../i18n/useT'
 import type { Lang } from '../i18n'
 
@@ -80,6 +82,18 @@ export default function SettingsPage() {
               ]}
               onChange={(v) => setLang(v)}
             />
+          </div>
+        </Card>
+
+        <Card data-tour="settings-guide" className="mb-4 p-5">
+          <SectionTitle>
+            <Sparkles size={13} /> {t('tour.settings.cardTitle')}
+          </SectionTitle>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[12.5px] text-ink-300">{t('tour.settings.cardDesc')}</span>
+            <Button variant="outline" size="sm" onClick={() => useTourStore.getState().start('manual')}>
+              {t('tour.welcome.start')}
+            </Button>
           </div>
         </Card>
 

@@ -23,6 +23,9 @@ import SettingsPage from './components/SettingsPage'
 import JobTray from './components/JobTray'
 import CourtEditor from './components/CourtEditor'
 import MediaPickerDialog from './components/MediaPickerDialog'
+import TourOverlay from './tour/TourOverlay'
+import { isFirstRun } from './tour/prefs'
+import { useTourStore } from './tour/tourStore'
 
 function Logo() {
   const t = useT()
@@ -59,7 +62,7 @@ function NavRail() {
     { id: 'settings' as const, icon: Settings2, label: t('nav.settings'), hint: t('nav.settingsHint') },
   ]
   return (
-    <nav className="flex w-[68px] shrink-0 flex-col items-center gap-1.5 border-r border-white/6 bg-ink-950/40 py-3">
+    <nav data-tour="nav-rail" className="flex w-[68px] shrink-0 flex-col items-center gap-1.5 border-r border-white/6 bg-ink-950/40 py-3">
       {items.map((it) => {
         const Icon = it.icon
         const active = view === it.id
@@ -225,6 +228,15 @@ export default function App() {
     bootstrap()
   }, [bootstrap])
 
+  // First-run guided tour: give the first screen a beat to finish mounting
+  // before the overlay starts measuring anchors.
+  useEffect(() => {
+    if (booted && isFirstRun()) {
+      const t = setTimeout(() => useTourStore.getState().start('auto'), 600)
+      return () => clearTimeout(t)
+    }
+  }, [booted])
+
   // 往窗口里拖文件时别让浏览器直接打开文件把界面顶掉；剪辑台会自己接管导入。
   useEffect(() => {
     const guard = (e: DragEvent) => {
@@ -334,6 +346,7 @@ export default function App() {
       {/* 素材选择弹窗是跨页面的：剪辑台 / 标注页 / AI 分析设置共用同一个实例 */}
       <MediaPickerDialog />
       <ToastHost />
+      <TourOverlay />
     </ConfirmProvider>
   )
 }

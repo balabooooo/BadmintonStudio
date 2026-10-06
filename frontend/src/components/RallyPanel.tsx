@@ -450,7 +450,7 @@ export default function RallyPanel() {
   )
 
   return (
-    <div className="flex h-full flex-col">
+    <div data-tour="rally-panel" className="flex h-full flex-col">
       {/* 固定顶栏：搜索 + 范围/排序 + 统计 + 当前评分口径。
           挑回合是主战场，控制项尽量少，其余收进下方折叠区。 */}
       <div className="shrink-0 border-b border-white/7 px-3 py-2.5">

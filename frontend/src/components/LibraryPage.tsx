@@ -109,6 +109,7 @@ export default function LibraryPage() {
             <Button
               variant="primary"
               size="lg"
+              data-tour="library-new-project"
               onClick={() => {
                 setName(defaultProjectName())
                 setCreating(true)

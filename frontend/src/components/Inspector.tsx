@@ -241,7 +241,7 @@ export default function Inspector() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="border-b border-white/7 px-3 py-2">
+      <div data-tour="insp-tabs" className="border-b border-white/7 px-3 py-2">
         <Segmented
           size="sm"
           value={tab}
@@ -261,7 +261,7 @@ export default function Inspector() {
         {tab === 'rally' &&
           (rally ? (
             <div className="space-y-4">
-              <div className="flex items-center gap-3">
+              <div data-tour="insp-rally-summary" className="flex items-center gap-3">
                 <ScoreRing score={rally.scores.total} size={58} color={scoreColor(rally.scores.total)} label={scoreGrade(rally.scores.total)} />
                 <div className="min-w-0 flex-1">
                   <div className="text-[14px] font-semibold text-white">{tr('inspector.rallyTitle', { index: rally.index })}</div>
@@ -325,7 +325,7 @@ export default function Inspector() {
                 </Tooltip>
               </div>
 
-              <div>
+              <div data-tour="insp-rally-scores">
                 <SectionTitle>
                   {tr('inspector.scoreBreakdownTitle')}
                 </SectionTitle>
@@ -430,7 +430,7 @@ export default function Inspector() {
                 </div>
               )}
 
-              <div>
+              <div data-tour="insp-rally-range">
                 <SectionTitle>{tr('inspector.clipRangeTitle')}</SectionTitle>
                 <div className="mb-1.5 text-[10.5px] leading-relaxed text-ink-500">
                   {tr('inspector.clipRangeHint1')}
@@ -528,7 +528,7 @@ export default function Inspector() {
                 </div>
               </div>
 
-              <div className="flex gap-1.5">
+              <div data-tour="insp-clip-split" className="flex gap-1.5">
                 <Button
                   variant="ghost"
                   size="sm"
@@ -579,7 +579,7 @@ export default function Inspector() {
                 </div>
               </div>
 
-              <div className="space-y-2.5">
+              <div data-tour="insp-clip-speed" className="space-y-2.5">
                 <Slider
                   label={tr('inspector.playbackSpeed')}
                   value={clip.speed}
@@ -638,7 +638,7 @@ export default function Inspector() {
 
         {tab === 'info' && (
           <div className="space-y-4">
-            <div>
+            <div data-tour="insp-info-chart">
               <SectionTitle>
                 <Activity size={12} /> {tr('inspector.signalChartTitle')}
               </SectionTitle>
@@ -687,7 +687,7 @@ export default function Inspector() {
             </div>
 
             {analysis?.stats && (
-              <div>
+              <div data-tour="insp-info-stats">
                 <SectionTitle>{tr('inspector.statsTitle')}</SectionTitle>
                 <div className="space-y-1.5 text-[11.5px]">
                   {[

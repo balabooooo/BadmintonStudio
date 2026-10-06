@@ -141,7 +141,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
             )}
           </div>
           <div className="flex gap-2">
-            <Button variant="ghost" onClick={onClose}>
+            <Button variant="ghost" data-tour="dlg-close" onClick={onClose}>
               {tr('common.close')}
             </Button>
             <Button
@@ -229,7 +229,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       <SectionTitle>
         <ListChecks size={12} /> {tr('analysis.scopeTitle')}
       </SectionTitle>
-      <div className="mb-4 flex flex-wrap gap-1.5">
+      <div data-tour="dlg-scope" className="mb-4 flex flex-wrap gap-1.5">
         {([
           { value: 'all' as const, label: tr('analysis.scopeAll', { n: mediaCount }), hint: tr('analysis.scopeAllHint') },
           { value: 'current' as const, label: tr('analysis.scopeCurrent'), hint: media?.name || tr('analysis.scopeCurrentHint') },
@@ -362,7 +362,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       <SectionTitle>
         <Wand2 size={12} /> {tr('analysis.modulesTitle')}
       </SectionTitle>
-      <div className="mb-4 grid gap-1.5 md:grid-cols-2">
+      <div data-tour="dlg-modules" className="mb-4 grid gap-1.5 md:grid-cols-2">
         <Toggle
           checked={params.use_audio}
           onChange={(v) => setParams({ use_audio: v })}
@@ -500,7 +500,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       <SectionTitle>
         <Video size={12} /> {tr('analysis.viewpoint.title')}
       </SectionTitle>
-      <div className="mb-4 rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-3">
+      <div data-tour="dlg-viewpoint" className="mb-4 rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-3">
         <div className="text-[11.5px] leading-relaxed text-ink-400">
           {tr('analysis.viewpoint.desc')}
         </div>
@@ -594,13 +594,16 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       <SectionTitle>
         <Ruler size={12} /> {tr('analysis.sizeFilterTitle')}
       </SectionTitle>
-      <SizeFilterPanel />
+      {/* SizeFilterPanel takes no props, so the tour anchor wraps it here. */}
+      <div data-tour="dlg-size-filter">
+        <SizeFilterPanel />
+      </div>
 
       {/* 评分口径 */}
       <SectionTitle>
         <Sparkles size={12} /> {tr('analysis.weightTitle')}
       </SectionTitle>
-      <div className="mb-4 flex flex-wrap gap-1.5">
+      <div data-tour="dlg-weights" className="mb-4 flex flex-wrap gap-1.5">
         {WEIGHT_PRESETS_MAP.map((w) => (
           <button
             key={w.value}
@@ -628,7 +631,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
       }>
         <Activity size={12} /> {tr('analysis.advanced.title')}
       </SectionTitle>
-      <div className="grid gap-x-5 gap-y-1 md:grid-cols-2">
+      <div data-tour="dlg-params" className="grid gap-x-5 gap-y-1 md:grid-cols-2">
         <Slider
           label={tr('analysis.slider.gap.label')}
           value={params.gap_seconds}
