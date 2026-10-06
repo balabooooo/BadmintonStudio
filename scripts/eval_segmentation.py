@@ -113,18 +113,10 @@ def _as_intervals(res: AnalysisResult, lo: float, hi: float) -> list[tuple[float
 
 
 def _post_process(intervals, hits, fused, params, method: str):
-    """Mirror the boundary anchoring and dedup cleanup of run_analysis / resegment."""
-    if hits is not None and hits.times.size:
-        intervals = RA.refine_with_hits(
-            intervals, hits,
-            pre_roll=params.pre_roll, post_roll=params.post_roll,
-            tail_seconds=params.hit_tail_seconds,
-            trim_start=method != "player_motion",
-        )
-    intervals = RA.dedupe_overlaps(intervals, hits=hits, fps=fused.fps, activity=fused.activity)
-    intervals = [iv for iv in intervals if iv.end - iv.start >= params.min_rally_seconds]
-    intervals.sort(key=lambda v: v.start)
-    return P._join_abutting(intervals)
+    """Use the canonical finishing pipeline shared with run_analysis / resegment."""
+    return P._finish_intervals(
+        intervals, hits=hits, params=params, fused=fused,
+        duration=fused.duration, method=method)
 
 
 def build_fused(res: AnalysisResult) -> RA.FusedSignal:

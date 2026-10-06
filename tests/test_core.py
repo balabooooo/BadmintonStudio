@@ -12,7 +12,9 @@ just get worse.
 
 from __future__ import annotations
 
+import copy
 import inspect
+import os
 import sys
 from pathlib import Path
 
@@ -535,6 +537,43 @@ def test_detection_coverage() -> None:
           f"{float(np.mean(cov > 0.5)):.2f}")
 
 
+def test_match_format_stats() -> None:
+    """singles/doubles recommendation from per-frame active-player counts."""
+    print("\n单/双打识别（仅推荐，不自动切预设）")
+    rng = np.random.default_rng(1)
+    n = 6000
+    # Singles: 1-2 players with a few 3-player ID-split noise frames.
+    singles = rng.integers(1, 3, n).astype(np.float32)
+    singles[rng.random(n) < 0.02] = 3
+    s = PL.match_format_stats(singles, fps=12.0)
+    check("单打：format=single", s["format"] == PL.MATCH_FORMAT_SINGLE, s["format"])
+    check("frac_ge3 处于噪声带", 0.0 <= s["frac_ge3"] <= PL.MATCH_FRAC_GE3_MAX_SINGLE + 0.03)
+    # Doubles: 4 players most frames, 3 in some, detection gaps excluded by denominator.
+    doubles = np.zeros(n, dtype=np.float32)
+    doubles[:] = 4
+    doubles[rng.random(n) < 0.25] = 3
+    doubles[rng.random(n) < 0.1] = 0  # detection gaps
+    d = PL.match_format_stats(doubles, fps=12.0)
+    check("双打：format=doubles", d["format"] == PL.MATCH_FORMAT_DOUBLES, d["format"])
+    check("检测空洞不计入分母", abs(d["present_frac"] - 0.9) < 0.03, str(d["present_frac"]))
+    check("frac_ge4 证据充足", d["frac_ge4"] >= PL.MATCH_FRAC_GE4_DOUBLES - 0.03)
+    # Ambiguous: three players present 40% of the time (between the two thresholds).
+    amb = np.full(n, 2, dtype=np.float32)
+    amb[rng.random(n) < 0.4] = 3
+    a = PL.match_format_stats(amb, fps=12.0)
+    check("ge3 证据落在模糊带 -> unknown", a["format"] == PL.MATCH_FORMAT_UNKNOWN,
+          f"{a['format']} ge3={a['frac_ge3']}")
+    # Insufficient evidence -> unknown.
+    weak = PL.match_format_stats(np.full(100, 2, dtype=np.float32))
+    check("证据帧数不足 -> unknown", weak["format"] == PL.MATCH_FORMAT_UNKNOWN)
+    check("空输入安全降级",
+          PL.match_format_stats(np.zeros(0, dtype=np.float32))["format"]
+          == PL.MATCH_FORMAT_UNKNOWN)
+    check("稳定 code 集合",
+          {PL.MATCH_FORMAT_SINGLE, PL.MATCH_FORMAT_DOUBLES, PL.MATCH_FORMAT_UNKNOWN}
+          == {"single", "doubles", "unknown"})
+
+
 def test_join_abutting() -> None:
     print("\n消除首尾相接")
     ivs = [RA.RallyInterval(start=0, end=10), RA.RallyInterval(start=10, end=20),
@@ -671,6 +710,631 @@ def test_join_abutting_keeps_shots() -> None:
     check("拍数被保留", len(out[0].hit_indices) == 5, f"{out[0].hit_indices}")
 
 
+def test_finish_intervals_padding_once() -> None:
+    """The canonical finishing pass must add rolls exactly once.
+
+    Regression for the P0口径分叉: rally_vision segments already carry
+    pre_roll/post_roll internally, but run_analysis/resegment added them a second
+    time when no hit sequence existed, while the annotation optimizer added them
+    zero times. Only the legacy hysteresis state machine emits tight intervals and
+    still needs the post-hoc rolls.
+    """
+    print("\n收尾口径：padding 只生效一次")
+    params = AnalysisParams(pre_roll=1.0, post_roll=0.6,
+                            hit_tail_seconds=0.9, min_rally_seconds=2.0)
+    act = np.full(int(120 * 12), 0.5, dtype=np.float32)
+    fused = RA.FusedSignal(fps=12.0, duration=120.0, activity=act)
+
+    # rally_vision path: the interval already includes the rolls; anchoring must not touch it,
+    # and running the finishing pass again must be idempotent (no accumulated double padding).
+    out = P._finish_intervals([RA.RallyInterval(start=9.0, end=35.6)], hits=None,
+                              params=params, fused=fused, duration=120.0,
+                              method="player_motion+activity")
+    check("vision 路径不二次 padding",
+          len(out) == 1 and abs(out[0].start - 9.0) < 1e-9 and abs(out[0].end - 35.6) < 1e-9,
+          str([(x.start, x.end) for x in out]))
+    out2 = P._finish_intervals([RA.RallyInterval(start=out[0].start, end=out[0].end)], hits=None,
+                               params=params, fused=fused, duration=120.0,
+                               method="player_motion+activity")
+    check("vision 路径重复收尾结果不变",
+          abs(out2[0].start - 9.0) < 1e-9 and abs(out2[0].end - 35.6) < 1e-9,
+          str([(x.start, x.end) for x in out2]))
+
+    # Empty HitDetection must be treated like "no hits" (the old run_analysis path called
+    # refine_with_hits with an empty sequence and got its internal padding branch — another
+    # source of double padding on the vision path).
+    empty_hits = RA.HitDetection(
+        times=np.zeros(0, dtype=np.float64),
+        strength=np.zeros(0, dtype=np.float32),
+        confidence=np.zeros(0, dtype=np.float32),
+        envelope=np.zeros(0, dtype=np.float32), env_fps=250.0)
+    out3 = P._finish_intervals([RA.RallyInterval(start=9.0, end=35.6)], hits=empty_hits,
+                               params=params, fused=fused, duration=120.0,
+                               method="activity_valleys")
+    check("空击球序列等价于无击球（vision 不二次 pad）",
+          abs(out3[0].start - 9.0) < 1e-9 and abs(out3[0].end - 35.6) < 1e-9,
+          str([(x.start, x.end) for x in out3]))
+
+    # Legacy hysteresis path: tight intervals get the rolls exactly once.
+    legacy = P._finish_intervals([RA.RallyInterval(start=10.0, end=35.0)], hits=None,
+                                 params=params, fused=fused, duration=120.0,
+                                 method="activity_state_machine")
+    check("legacy 路径补一次 pre/post roll",
+          len(legacy) == 1 and abs(legacy[0].start - 9.0) < 1e-9
+          and abs(legacy[0].end - 35.6) < 1e-9,
+          str([(x.start, x.end) for x in legacy]))
+
+    # With hit evidence the canonical helper anchors like refine_with_hits: the end must be
+    # pullable back to the last shot + tail even on the vision path.
+    times = np.asarray([10.0, 10.8, 11.6, 12.4, 13.2], dtype=np.float64)
+    hits = RA.HitDetection(
+        times=times,
+        strength=np.full(times.size, 0.7, dtype=np.float32),
+        confidence=np.full(times.size, 0.9, dtype=np.float32),
+        envelope=np.zeros(10, dtype=np.float32), env_fps=250.0)
+    anchored = P._finish_intervals([RA.RallyInterval(start=9.0, end=40.0)], hits=hits,
+                                   params=params, fused=fused, duration=120.0,
+                                   method="player_motion+activity")
+    check("有击球时统一收尾做终点锚定",
+          abs(anchored[0].end - (13.2 + 0.9)) < 0.01, f"{anchored[0].end:.2f}")
+
+
+# ------------------------------------------------------------------ P3 boundary evidence
+
+
+def _boundary_motion_fixture() -> tuple:
+    """Square-wave player motion (3 rallies, 4 s gaps) at 12 fps, 60 s."""
+    from bms.analysis import boundary as BD
+    fps = 12.0
+    n = int(60 * fps)
+    motion = np.zeros(n, dtype=np.float32)
+    swing = np.zeros(n, dtype=np.float32)
+    rallies = [(10.0, 18.0), (22.0, 30.0), (34.0, 42.0)]
+    for s, e in rallies:
+        a, b = int(s * fps), int(e * fps)
+        motion[a:b] = 1.0
+        swing[a:b] = 1.2
+    motion = np.convolve(motion, np.ones(5) / 5, mode="same").astype(np.float32)
+    return BD, fps, n, motion, swing, rallies
+
+
+def test_boundary_evidence_direction() -> None:
+    """Feature channels must point "boundary-like" at onsets/decays, not inside pauses."""
+    print("\n边界证据：onset/decay 方向正确")
+    BD, fps, n, motion, swing, rallies = _boundary_motion_fixture()
+    ev = BD.build_evidence(
+        fps=fps, duration=60.0, motion=motion,
+        coverage=np.ones(n, dtype=np.float32),
+        swing=swing, swing_fps=fps, overhead=np.zeros(n, dtype=np.float32),
+        pose_coverage=0.9, swing_quiet=0.3, hit_times=[])
+    check("证据可用（pose coverage 充足）", ev.available_for_refine())
+    # onset slope: max near the labeled start, ~0 mid-pause
+    for s, e in rallies:
+        around = ev.channels["start"]["motion_slope"][
+            ev.frame(s - 0.3):ev.frame(s + 0.3)].max()
+        midgap = ev.channels["start"]["motion_slope"][
+            ev.frame(s - 2.0):ev.frame(s - 1.2)].max()
+        check(f"onset slope 在 {s}s 起跳处高于前段", around > midgap + 0.2,
+              f"{around:.3f} vs {midgap:.3f}")
+        dec = ev.channels["end"]["motion_slope"][
+            ev.frame(e - 0.3):ev.frame(e + 0.3)].max()
+        after = ev.channels["end"]["motion_slope"][
+            ev.frame(e + 1.2):ev.frame(e + 2.0)].max()
+        check(f"decay slope 在 {e}s 收尾处高于后段", dec > after + 0.2,
+              f"{dec:.3f} vs {after:.3f}")
+    # hit proximity is 1 right at a hit and 0 far away
+    ev2 = BD.build_evidence(
+        fps=fps, duration=60.0, motion=motion,
+        swing=swing, swing_fps=fps, pose_coverage=0.9,
+        hit_times=[11.0, 12.0])
+    check("hit 特征：起跳点紧邻首击", abs(ev2.hit_feature("start", ev2.frame(11.0)) - 1.0) < 1e-6)
+    check("hit 特征：4s 外归零", ev2.hit_feature("start", ev2.frame(7.0)) == 0.0)
+
+
+def test_boundary_fit_weights() -> None:
+    """fit_template keeps only directionally separating channels; degenerate classes refuse."""
+    print("\n边界模板：权重方向与退化保护")
+    BD, *_ = _boundary_motion_fixture()
+    rows_pos = [{"motion_contrast": 0.8, "motion_slope": 0.7, "swing": 0.8,
+                 "overhead": 0.2, "hit": 0.7}] * 8
+    rows_neg = [{"motion_contrast": 0.1, "motion_slope": 0.9, "swing": 0.1,
+                 "overhead": 0.2, "hit": 0.1}] * 8
+    fit = BD.fit_template(rows_pos, rows_neg, "start", name="unit")
+    tpl = fit.template
+    check("正分离通道有权重", tpl.weights["motion_contrast"] > 0
+          and tpl.weights["hit"] > 0)
+    check("反方向通道权重为 0", tpl.weights["motion_slope"] == 0.0
+          and tpl.weights["overhead"] == 0.0)
+    check("阈值落在 0..1", 0.0 <= tpl.thr_start <= 1.0)
+    acc_pos = BD.acceptance(tpl, "start", rows_pos)["accepted"]
+    acc_neg = BD.acceptance(tpl, "start", rows_neg)["accepted"]
+    check("正样本高接受、负样本低接受", acc_pos >= 0.8 and acc_neg <= 0.2,
+          f"pos={acc_pos} neg={acc_neg}")
+    bad = BD.fit_template(rows_pos, [], "start", name="unit")
+    check("缺负样本时拒绝拟合（返回中性占位）",
+          bad.template.name.endswith("insufficient")
+          and bad.template.weights["motion_contrast"] == 1.0)
+    merged = BD.merge_templates(tpl, tpl, name="m")
+    check("merge 保留双侧阈值", merged.thr_start == tpl.thr_start
+          and merged.thr_end == tpl.thr_end)
+
+
+def _snap_evidence(bottom_frame: int, win: int = 5):
+    """Evidence whose end-side channels peak at one quiet-span bottom frame."""
+    BD, fps, n, motion, swing, _rallies = _boundary_motion_fixture()
+    tpl = BD.Template(
+        ranges={"motion_contrast": (0.0, 1.0), "motion_slope": (0.0, 1.0),
+                "swing": (0.0, 1.0), "overhead": (0.0, 1.0), "hit": (0.0, 1.0)},
+        weights={"motion_contrast": 1.0, "motion_slope": 1.0, "swing": 0.0,
+                 "overhead": 0.0, "hit": 0.0},
+        thr_start=0.55, thr_end=0.5, name="snap-fixture")
+    ev = BD.build_evidence(
+        fps=fps, duration=60.0, motion=motion,
+        coverage=np.ones(n, dtype=np.float32),
+        swing=swing, swing_fps=fps, overhead=np.zeros(n, dtype=np.float32),
+        pose_coverage=0.9, swing_quiet=0.3, hit_times=[], template=tpl)
+    for ch in ("motion_contrast", "motion_slope"):
+        band = ev.channels["end"][ch]
+        band[:] = 0.0
+        a, b = max(0, bottom_frame - win), min(n, bottom_frame + win + 1)
+        band[a:b] = 1.0
+    ev.curves["end"] = BD._pack_curve(ev.channels["end"], tpl)
+    return BD, ev, tpl
+
+
+def test_boundary_refine_guardrails() -> None:
+    """refine_boundaries snaps only through threshold/margin/channel/neighbor guardrails."""
+    print("\n边界 refine：guardrail 全套")
+    BD, fps, n, motion, swing, rallies = _boundary_motion_fixture()
+    spans = RV.find_quiet_spans(motion, fps, 0.6, prominence_ratio=0.10)
+    # quiet span between rally 1 and 2
+    bottom_t = spans[0].bottom / fps
+    BD, ev, tpl = _snap_evidence(spans[0].bottom)
+
+    def run(ivs, params, duration=60.0):
+        return BD.refine_boundaries(
+            [RA.RallyInterval(start=a, end=b) for a, b in ivs],
+            ev, params, duration, method="player_motion")
+
+    # current end placed 1 s past the quiet bottom (still inside the gap); candidate wins
+    p = AnalysisParams(use_boundary_refine=True, boundary_max_move=3.0,
+                       boundary_score_margin=0.1)
+    ivs = [(10.0, bottom_t + 1.0), (22.0, 33.0), (34.0, 45.0)]
+    _out, tr = run(ivs, p)
+    check("高分谷底触发 end snap", tr["moved"] == 1 and tr["status"] == "applied",
+          str(tr))
+    moved = tr["snaps"][0]
+    check("snap 落在谷底且向内（提前终点）",
+          abs(moved["to"] - bottom_t) < 0.12 and moved["to"] < moved["frm"],
+          str(moved))
+
+    # margin too high -> refuse (candidate gain is ~1.0 here)
+    p_hi = AnalysisParams(use_boundary_refine=True, boundary_max_move=3.0,
+                          boundary_score_margin=1.01)
+    _, tr_hi = run(ivs, p_hi)
+    check("score margin 不足不动", tr_hi["moved"] == 0)
+
+    # max_move too small -> candidate out of legal window
+    p_small = AnalysisParams(use_boundary_refine=True, boundary_max_move=0.5,
+                             boundary_score_margin=0.1)
+    _, tr_small = run(ivs, p_small)
+    check("超出 max_move 不动", tr_small["moved"] == 0, str(tr_small))
+
+    # neighbor guard: the next rally starts just before the candidate bottom, so snapping
+    # would make interval 0 overlap interval 1 -> blocked.
+    ivs_cross = [(10.0, bottom_t + 1.0), (bottom_t - 0.3, 33.0), (34.0, 45.0)]
+    _, tr_cross = run(ivs_cross, p)
+    check("不跨越相邻回合起点", all(s["index"] != 0 or s["side"] != "end"
+                                    for s in tr_cross.get("snaps", [])),
+          str(tr_cross.get("snaps")))
+
+    # switch off -> same object, untouched; no pose -> status pose_coverage_low
+    iv_objs = [RA.RallyInterval(start=a, end=b) for a, b in ivs]
+    same, tr_off = BD.refine_boundaries(iv_objs, ev, AnalysisParams(), 60.0)
+    check("开关关闭原样返回", tr_off["status"] == "off" and same is iv_objs)
+    ev_nopose = BD.build_evidence(
+        fps=fps, duration=60.0, motion=motion, coverage=np.ones(n, np.float32),
+        swing=None, pose_coverage=0.0, hit_times=[])
+    _, tr_nopose = BD.refine_boundaries(iv_objs, ev_nopose, p, 60.0)
+    check("低 pose coverage 不动", tr_nopose["status"] == "pose_coverage_low")
+    _, tr_empty = BD.refine_boundaries([], ev, p, 60.0)
+    check("空区间安全", tr_empty["status"] == "empty")
+
+
+def test_boundary_pack_roundtrip() -> None:
+    """Packed curves survive the signals dict; missing keys rebuild; defaults stay off."""
+    print("\n边界证据：pack 往返 / 缺键重建 / 默认关")
+    BD, fps, n, motion, swing, _rallies = _boundary_motion_fixture()
+    tpl = BD.NEUTRAL_TEMPLATE
+    ev = BD.build_evidence(
+        fps=fps, duration=60.0, motion=motion,
+        coverage=np.ones(n, dtype=np.float32),
+        swing=swing, swing_fps=fps, overhead=np.zeros(n, dtype=np.float32),
+        pose_coverage=0.9, swing_quiet=0.3, hit_times=[])
+    packed = BD.pack_signals(ev)
+    check("pack 版本键", packed["boundary_version"] == [BD.BOUNDARY_EVIDENCE_VERSION])
+    sig = {
+        "activity_full": [round(float(v), 4) for v in motion],
+        "fps": [fps], "duration": [60.0],
+        "player_motion_full": [round(float(v), 4) for v in motion],
+        "player_coverage_full": [1.0] * n, "player_fps": [fps],
+        "pose_swing_full": [round(float(v), 4) for v in swing],
+        "pose_overhead_full": [0.0] * n,
+        "pose_fps": [fps], "pose_coverage": [0.9], "pose_quiet": [0.3],
+    }
+    sig.update(packed)
+    ev2 = BD.evidence_from_signals(sig, None)
+    check("packed 曲线逐帧复用",
+          np.allclose(ev2.curves["start"], ev.curves["start"], atol=2e-4)
+          and np.allclose(ev2.curves["end"], ev.curves["end"], atol=2e-4))
+    raw = {k: v for k, v in sig.items()
+           if not k.startswith("boundary_")}
+    ev3 = BD.evidence_from_signals(raw, None)
+    check("缺 boundary 键时从原始数组重建",
+          ev3 is not None and ev3.n == n and ev3.available_for_refine())
+    # activity-only fallback (old project without player curves)
+    old = {"activity_full": sig["activity_full"], "fps": [fps], "duration": [60.0]}
+    ev4 = BD.evidence_from_signals(old, None)
+    check("无 player/pose 曲线也能降级建证据（但不可 refine）",
+          ev4 is not None and not ev4.available_for_refine())
+    check("AnalysisParams 默认关闭边界 refine",
+          AnalysisParams().use_boundary_refine is False
+          and AnalysisParams().boundary_max_move == BD.DEFAULT_MAX_MOVE
+          and AnalysisParams().boundary_score_margin == BD.DEFAULT_SCORE_MARGIN)
+    meta = BD.boundary_meta(ev)
+    check("stats 元数据带 available/version",
+          meta["available"] is True and meta["version"] == BD.BOUNDARY_EVIDENCE_VERSION)
+
+
+def _fuse_fixture() -> RA.FusedSignal:
+    """Synthetic fused signal with rally-like bursts on players + motion channels."""
+    rng = np.random.default_rng(0)
+    fps, dur = 12.0, 60.0
+    n = int(dur * fps)
+    base = np.zeros(n, dtype=np.float32)
+    for s, e in ((10, 18), (22, 30), (34, 42)):
+        base[int(s * fps):int(e * fps)] = 1.0
+    motion_arr = np.clip(base + rng.normal(0, 0.1, n), 0, None).astype(np.float32)
+    return RA.fuse(
+        fps=fps, duration=dur,
+        motion={"fps": fps, "court_motion": motion_arr},
+        players={"fps": fps, "active_count": base.copy(),
+                 "active_speed": motion_arr, "max_speed": motion_arr * 1.5})
+
+
+def test_fuse_weight_defaults() -> None:
+    """Params defaults stay the single source of truth shared with rally fuse constants."""
+    print("\n融合权重：默认值与 rally 常量一致")
+    p = AnalysisParams()
+    base = p.fuse_weight_base()
+    check("5 个组件键齐全",
+          tuple(sorted(base)) == tuple(sorted(RA.FUSE_COMPONENT_KEYS)))
+    check("默认权重 == DEFAULT_BASE_WEIGHTS",
+          all(abs(base[k] - RA.DEFAULT_BASE_WEIGHTS[k]) < 1e-12
+              for k in RA.FUSE_COMPONENT_KEYS))
+    p2 = p.model_copy(update={"fuse_weight_players": 2.0})
+    check("model_copy 覆盖生效且不污染默认实例",
+          p2.fuse_weight_base()["players"] == 2.0 and p.fuse_weight_base()["players"] == 1.35)
+
+
+def test_fuse_components_roundtrip() -> None:
+    """Re-fusing fuse()'s own components must reproduce the activity exactly (default weights)."""
+    print("\n融合分量：往返一致 / 覆盖改变方向 / 长度漂移守卫")
+    f = _fuse_fixture()
+    g = RA.fuse_from_components(
+        f.components, fps=f.fps, duration=f.duration, audio_rel=f.audio_reliability)
+    check("默认权重重融合逐帧一致",
+          np.array_equal(f.activity, g.activity)
+          and abs(f.threshold_hi - g.threshold_hi) < 1e-9
+          and abs(f.threshold_lo - g.threshold_lo) < 1e-9)
+    check("5 条分量齐全",
+          set(f.components) == set(RA.FUSE_COMPONENT_KEYS))
+    wb = dict(RA.DEFAULT_BASE_WEIGHTS)
+    wb["players"] = 0.0
+    h = RA.fuse_from_components(
+        f.components, fps=f.fps, duration=f.duration,
+        audio_rel=f.audio_reliability, weight_base=wb)
+    check("权重覆盖确实改变活动度曲线",
+          not np.array_equal(f.activity, h.activity))
+    # Rounded (packed) components stay numerically close at default weights.
+    rounded = {k: np.round(v, 4) for k, v in f.components.items()}
+    g3 = RA.fuse_from_components(
+        rounded, fps=f.fps, duration=f.duration, audio_rel=f.audio_reliability)
+    check("4 位小数落盘分量重融合误差 < 5e-4",
+          float(np.abs(f.activity - g3.activity).max()) < 5e-4)
+    # Unknown weight keys are ignored; length drift is resampled.
+    g4 = RA.fuse_from_components(
+        {k: v[:-7] for k, v in f.components.items()},
+        fps=f.fps, duration=f.duration, audio_rel=f.audio_reliability,
+        weight_base={"players": 1.35, "bogus": 9.0})
+    check("漂移长度自动 resample、未知权重键忽略",
+          g4.activity.size == f.activity.size)
+
+
+def test_shuttle_in_flight_build() -> None:
+    """Validated-track coverage bridges association gaps and takes max confidence."""
+    print("\n羽毛球在飞曲线：跨丢帧覆盖 / 置信度取大 / 空输入")
+    from bms.analysis import shuttle as SH
+    t1 = SH.ShuttleTrack(
+        points=[SH.ShuttlePoint(f, f / 12.0, 0.1, 0.2, 0.9) for f in (10, 11, 13)],
+        start=10 / 12.0, end=13 / 12.0, confidence=0.8)
+    t2 = SH.ShuttleTrack(
+        points=[SH.ShuttlePoint(12, 1.0, 0.1, 0.2, 0.9),
+                SH.ShuttlePoint(99, 8.0, 0.1, 0.2, 0.9)],
+        start=1.0, end=8.0, confidence=0.4)
+    flight = SH.build_in_flight([t1, t2], 20)
+    check("丢帧 12 被桥接覆盖", flight[12] == 0.8)
+    check("整段跨度连续在飞", all(flight[10:14] == 0.8))
+    check("重叠轨迹取最大置信度", flight[12] == 0.8)
+    check("独立点轨迹正常覆盖、越界点忽略",
+          flight[12] == 0.8 and flight.size == 20 and float(flight[:10].sum()) == 0.0)
+    check("空轨迹 / 空长度安全",
+          SH.build_in_flight([], 5).sum() == 0.0 and SH.build_in_flight([t1], 0).size == 0)
+
+
+def test_fuse_shuttle_in_flight_blend() -> None:
+    """Fuse shuttle comp: legacy presence/speed blend unchanged; in_flight only adds when nonzero."""
+    print("\n融合 shuttle 分量：缺省零差异 / 在飞曲线生效")
+    fps, dur, n = 12.0, 20.0, 240
+    burst = np.zeros(n, dtype=np.float32)
+    burst[60:120] = 1.0
+    base_sh = {"fps": fps, "presence": np.zeros(n, np.float32),
+               "max_candidate_speed": np.zeros(n, np.float32)}
+    f0 = RA.fuse(fps=fps, duration=dur, shuttle=dict(base_sh))
+    fz = RA.fuse(fps=fps, duration=dur,
+                 shuttle={**base_sh, "in_flight": np.zeros(n, np.float32)})
+    check("零在飞曲线与缺省逐帧一致",
+          np.array_equal(f0.components["shuttle"], fz.components["shuttle"]))
+    check("无在飞信息时 shuttle 分量恒零", float(np.abs(f0.components["shuttle"]).max()) == 0.0)
+    ff = RA.fuse(fps=fps, duration=dur,
+                 shuttle={**base_sh, "in_flight": burst})
+    check("非零在飞曲线进入 shuttle 分量",
+          ff.components["shuttle"][90] > 0.0 and ff.components["shuttle"][10] == 0.0)
+    check("在飞曲线改变最终活动度", not np.array_equal(ff.activity, f0.activity))
+
+
+def _write_synthetic_shuttle_video(path: Path, *, w: int = 640, h: int = 360,
+                                   n: int = 45, fps: float = 30.0) -> Path:
+    """Write a near-lossless AVI: flat green court, a static white court-line bar,
+    and a 3x3 white dot moving diagonally across frames 5..40."""
+    import cv2
+
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    vw = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
+    assert vw.isOpened(), "cv2.VideoWriter MJPG unavailable"
+    try:
+        vw.set(cv2.VIDEOWRITER_PROP_QUALITY, 100.0)
+    except Exception:
+        pass
+    bg = np.zeros((h, w, 3), np.uint8)
+    bg[:] = (40, 130, 40)                       # BGR saturated green court
+    bg[300:306, 80:560] = 235                   # constantly-white line: exercises static-white mask
+    for f in range(n):
+        fr = bg.copy()
+        if 5 <= f <= 40:
+            x = 60 + (f - 5) * 6
+            y = 60 + (f - 5) * 3
+            fr[max(0, y - 1):y + 2, max(0, x - 1):x + 2] = 255
+        vw.write(fr)
+    vw.release()
+    return path
+
+
+def test_shuttle_backend_selection() -> None:
+    """Backend resolver honors force/env and torch CUDA availability."""
+    print("\nshuttle 后端选择：force/env 与 CUDA 可用性")
+    from bms.analysis import shuttle as SH
+
+    old = os.environ.pop("BMS_SHUTTLE_BACKEND", None)
+    try:
+        check("force=cpu 永远选 cpu", SH._resolve_backend("cpu") == "cpu")
+        have_gpu = bool(SH._gpu_available())
+        check("auto 依 CUDA 可用性选择", SH._resolve_backend("auto") == ("gpu" if have_gpu else "cpu"))
+        os.environ["BMS_SHUTTLE_BACKEND"] = "cpu"
+        check("env=cpu 覆盖 auto", SH._resolve_backend(None) == "cpu")
+        os.environ["BMS_SHUTTLE_BACKEND"] = "garbage"
+        check("env 非法值按 auto 处理", SH._resolve_backend(None) == ("gpu" if have_gpu else "cpu"))
+        if not have_gpu:
+            os.environ["BMS_SHUTTLE_BACKEND"] = "gpu"
+            check("env=gpu 但 CUDA 不可用静默回退 cpu", SH._resolve_backend(None) == "cpu")
+            raised = False
+            try:
+                SH._resolve_backend("gpu")
+            except RuntimeError:
+                raised = True
+            check("force=gpu 但 CUDA 不可用硬失败", raised)
+    finally:
+        if old is None:
+            os.environ.pop("BMS_SHUTTLE_BACKEND", None)
+        else:
+            os.environ["BMS_SHUTTLE_BACKEND"] = old
+
+
+def test_shuttle_gpu_morph_equivalence() -> None:
+    """GPU binary morphology kernels must match cv2's exact structuring elements."""
+    from bms.analysis import shuttle as SH
+    if not SH._gpu_available():
+        print("\nshuttle GPU 形态学等价：skip（无可用 CUDA）")
+        return
+    print("\nshuttle GPU 形态学与 cv2 逐像素等价")
+    import cv2
+
+    rng = np.random.default_rng(7)
+    m = (rng.random((60, 80)) > 0.85).astype(np.uint8)
+    cross = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cpu_open = cv2.morphologyEx(m, cv2.MORPH_OPEN, cross)
+    gpu_open = SH._gpu_binary_open(m, "cuda")
+    check("cross 3x3 open 逐像素一致", np.array_equal(cpu_open, gpu_open))
+    cpu_dil = cv2.dilate(m, np.ones((3, 3), np.uint8))
+    gpu_dil = SH._gpu_binary_dilate(m, "cuda")
+    check("square 3x3 dilate 逐像素一致", np.array_equal(cpu_dil, gpu_dil))
+
+
+def test_shuttle_gpu_cpu_parity() -> None:
+    """Same synthetic video through both backends: same candidate frames and sub-2px centers."""
+    from bms.analysis import shuttle as SH
+    if not SH._gpu_available():
+        print("\nshuttle GPU/CPU 合成片一致性：skip（无可用 CUDA）")
+        return
+    print("\nshuttle GPU/CPU 合成片候选一致性")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        vp = _write_synthetic_shuttle_video(Path(td) / "syn.avi")
+        kw = dict(sample_fps=30.0, window=2, work_width=640, sensitivity=0.5)
+        sig_c, dbg_c = SH.analyze_shuttle_debug(str(vp), backend="cpu", **kw)
+        sig_g, dbg_g = SH.analyze_shuttle_debug(str(vp), backend="gpu", **kw)
+
+    kc = {f for f, v in dbg_c["candidates"].items() if v}
+    kg = {f for f, v in dbg_g["candidates"].items() if v}
+    check("两后端都检出移动白点（>=12 帧）", len(kc) >= 12 and len(kg) >= 12)
+    union = kc | kg
+    jacc = len(kc & kg) / max(1, len(union))
+    check(f"候选帧集合 Jaccard>=0.8（cpu={len(kc)} gpu={len(kg)} J={jacc:.2f}）", jacc >= 0.8)
+    dists: list[float] = []
+    for f in kc & kg:
+        pc = max(dbg_c["candidates"][f], key=lambda p: p[2])
+        pg = max(dbg_g["candidates"][f], key=lambda p: p[2])
+        dists.append(float(np.hypot((pc[0] - pg[0]) * 640.0, (pc[1] - pg[1]) * 360.0)))
+    check("公共帧最强候选位置中位差<=1px 最大<=2px",
+          bool(dists) and float(np.median(dists)) <= 1.0 and max(dists) <= 2.0)
+    check("信号记录实际后端", sig_c.backend == "cpu" and sig_g.backend == "gpu")
+
+
+def test_shuttle_gpu_runtime_error_falls_back() -> None:
+    """GPU scan exception degrades silently to the full CPU scan with the reason recorded."""
+    from bms.analysis import shuttle as SH
+    if not SH._gpu_available():
+        print("\nshuttle GPU 异常回退 CPU：skip（无可用 CUDA）")
+        return
+    print("\nshuttle GPU 异常时整段静默回退 CPU")
+    import tempfile
+
+    orig = SH._scan_candidates_gpu
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("synthetic gpu failure")
+
+    SH._scan_candidates_gpu = _boom
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            vp = _write_synthetic_shuttle_video(Path(td) / "syn.avi")
+            sig, _dbg = SH.analyze_shuttle_debug(
+                str(vp), backend="gpu", sample_fps=30.0, window=2, work_width=640)
+    finally:
+        SH._scan_candidates_gpu = orig
+    check("回退后结果可用且后端标记为 cpu", sig.backend == "cpu")
+    check("fallback 原因写入 backend_fallback", "synthetic gpu failure" in (sig.backend_fallback or ""))
+
+
+def test_shuttle_budget_seconds_frame_unit() -> None:
+    """max_seconds must cap reads in SAMPLED frames, not source frames.
+
+    The scan limit used to be ``int(max_seconds * src_fps)`` while the loop counter
+    only increments on sampled frames (one per ``step`` grabs), so the analyzed span
+    was stretched ``step``-fold (0.5 s budget -> 1.5 s analyzed at step=3). pipeline.py
+    reports ``coverage = min(duration, budget) / duration`` from this same budget, so
+    an over-scanned signal makes that reported coverage wrong as well; the pipeline
+    side itself needs no change.
+    """
+    from bms.analysis import shuttle as SH
+    import tempfile
+
+    # Synthetic clip: 30 fps / 45 frames = 1.5 s. sample_fps=10 -> step=3, eff_fps=10,
+    # so max_seconds=0.5 must read round(0.5*10)=5 sampled frames (~0.5 s), instead of
+    # all 15 sampled frames (1.5 s) allowed by the old source-frame limit.
+    print("\nshuttle max_seconds budget honored in sampled frames (cpu/gpu)")
+    with tempfile.TemporaryDirectory() as td:
+        vp = _write_synthetic_shuttle_video(Path(td) / "syn.avi")
+        kw = dict(sample_fps=10.0, window=2, work_width=640,
+                  sensitivity=0.5, max_seconds=0.5)
+        sig_c, _dbg_c = SH.analyze_shuttle_debug(str(vp), backend="cpu", **kw)
+        check(f"cpu duration within one sampled interval of 0.5s (got {sig_c.duration:.3f}s)",
+              0.25 < sig_c.duration < 0.75)
+        if SH._gpu_available():
+            sig_g, _dbg_g = SH.analyze_shuttle_debug(str(vp), backend="gpu", **kw)
+            check(f"gpu duration within one sampled interval of 0.5s (got {sig_g.duration:.3f}s)",
+                  0.25 < sig_g.duration < 0.75)
+        else:
+            print("  (gpu assertion skipped: no CUDA)")
+
+
+def test_rebuild_fused_weight_overrides() -> None:
+    """Offline rebuild: default weights reuse stored activity verbatim; override re-fuses."""
+    print("\n离线重建：缺省逐帧复用 / 覆盖重融合 / 旧工程静默降级")
+    f = _fuse_fixture()
+    sig = {
+        "fps": [f.fps], "duration": [f.duration],
+        "activity_full": [round(float(x), 4) for x in f.activity],
+    }
+    sig.update({f"component_{k}_full": [round(float(x), 4) for x in v]
+                for k, v in f.components.items()})
+    p_def = AnalysisParams()
+    rb = P._rebuild_fused(sig, p_def, act=f.activity, fps=f.fps,
+                          duration=f.duration, audio_rel=f.audio_reliability)
+    check("默认权重：存储 activity 原样返回（逐帧相等）",
+          np.array_equal(rb.activity, f.activity))
+    p_ov = p_def.model_copy(update={"fuse_weight_players": 0.0})
+    ro = P._rebuild_fused(sig, p_ov, act=f.activity, fps=f.fps,
+                          duration=f.duration, audio_rel=f.audio_reliability)
+    check("覆盖权重：走重融合路径",
+          not np.array_equal(ro.activity, f.activity))
+    old = {"fps": [f.fps], "duration": [f.duration],
+           "activity_full": sig["activity_full"]}
+    ro2 = P._rebuild_fused(old, p_ov, act=f.activity, fps=f.fps,
+                           duration=f.duration, audio_rel=f.audio_reliability)
+    check("旧工程无 component_*_full：覆盖静默降级到存储曲线",
+          np.array_equal(ro2.activity, f.activity))
+
+
+def _optimizer_consistency_fixture(with_hits: bool) -> AnalysisResult:
+    fps = 12.0
+    dur = 120.0
+    n = int(dur * fps)
+    act = np.full(n, 0.4, dtype=np.float32)
+    pm = np.zeros(n, dtype=np.float32)
+    for a, b in ((10, 35), (60, 90)):
+        pm[int(a * fps):int(b * fps)] = 1.0
+        act[int(a * fps):int(b * fps)] = 0.9
+    signals = {
+        "activity_full": act.tolist(),
+        "player_motion_full": pm.tolist(),
+        "player_coverage_full": np.ones(n, dtype=np.float32).tolist(),
+        "fps": [fps], "duration": [dur], "player_fps": [fps],
+    }
+    if with_hits:
+        hit_times = [t for a, b in ((10, 35), (60, 90)) for t in np.arange(a, b, 1.2)]
+        signals.update({
+            "hit_times": [round(float(t), 3) for t in hit_times],
+            "hit_strength": [0.8] * len(hit_times),
+            "hit_confidence": [0.9] * len(hit_times),
+        })
+    return AnalysisResult(
+        media_id="m_consistency", status="done",
+        params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.5, post_roll=0.5),
+        signals=signals, stats={"audio_reliability": 0.8})
+
+
+def test_resegment_matches_optimizer_finishing() -> None:
+    """resegment and the annotation optimizer must emit the same interval set for the same archive.
+
+    The P0 fix routes both through ``_finish_intervals``; historically the optimizer skipped the
+    no-hit padding while production double-padded vision intervals, so the F1 seen while tuning
+    did not correspond to the F1 production shipped.
+    """
+    print("\n收尾口径：resegment 与优化器一致")
+    for with_hits in (False, True):
+        res = _optimizer_consistency_fixture(with_hits)
+        prod = P.resegment(copy.deepcopy(res), res.params, "balanced")
+        prod_ivs = [(round(r.start, 4), round(r.end, 4)) for r in prod.rallies]
+        ctx = AN._build_context(copy.deepcopy(res), 0.0, 1e9)
+        pred_ivs = sorted((round(a, 4), round(b, 4)) for a, b in AN._predict(ctx, res.params))
+        tag = "有击球" if with_hits else "无击球"
+        check(f"{tag}：两路径区间集合一致（{len(prod_ivs)} 段）",
+              prod_ivs == pred_ivs,
+              f"prod={prod_ivs[:4]} pred={pred_ivs[:4]}")
+
+
 def _synthetic_pose(fps: float = 12.0, dur: float = 30.0, peaks=(3.0, 8.0, 15.0),
                     coverage: float = 1.0):
     """Build a synthetic pose signal: place one swing peak at each given time."""
@@ -759,6 +1423,160 @@ def test_pose_gate_degrades() -> None:
     mask3, _ = POSE.gate_hits(hits, None)
     check("pose 为 None 时返回 None", mask3 is None)
     check("filter_hits 收到 None 掩码时原样返回", POSE.filter_hits(hits, None) is hits)
+
+
+def test_pose_keypoint_crop_inverse_map() -> None:
+    """Patch-space keypoints must map back to frame coords by MULTIPLYING with the crop scale.
+
+    The 192px pose patch is ``cv2.resize`` of the crop window: patch pixel p corresponds to frame
+    ``x0 + p * crop_w / 192``. Dividing instead amplifies every offset and projects skeletons
+    onto empty floor away from the player (the visual-cache bug seen on clip1).
+    """
+    print("\n姿态：关键点裁剪逆映射正确")
+    from bms.analysis import pose as POSE
+
+    x0, y0, x1, y1 = 607, 225, 742, 360
+    kp_raw = np.asarray([[0.0, 0.0], [192.0, 192.0], [96.0, 96.0]], dtype=np.float32)
+    mapped = POSE._map_keypoints(kp_raw, x0, y0, (x1 - x0) / 192.0, (y1 - y0) / 192.0)
+    # Patch corners land exactly on the crop-window corners; center on the center.
+    check("左上角映射到裁剪窗左上角",
+          abs(mapped[0][0] - x0) < 1e-3 and abs(mapped[0][1] - y0) < 1e-3)
+    check("右下角映射到裁剪窗右下角",
+          abs(mapped[1][0] - x1) < 1e-3 and abs(mapped[1][1] - y1) < 1e-3)
+    check("中心点映射到裁剪窗中心",
+          abs(mapped[2][0] - (x0 + x1) / 2) < 1e-3
+          and abs(mapped[2][1] - (y0 + y1) / 2) < 1e-3)
+
+
+def test_pose_boxes_signature_quantization_stable() -> None:
+    """Float boxes and their uint16 npz roundtrip must hash to the same pose cache signature.
+
+    rebuild_visual_cache resolves the pose path from boxes loaded back from the compact npz;
+    without quantization-stable hashing the tiny dequant error flips the %.4f rounding and the
+    v2 pose cache misses, rerunning GPU pose on every rebuild.
+    """
+    print("\n姿态：框缓存量化前后签名一致")
+    from bms.analysis import pose as POSE
+
+    rng = np.random.RandomState(123)
+    frames = [
+        [(1, float(rng.rand()), float(rng.rand()), float(rng.rand()), float(rng.rand())),
+         (2, float(rng.rand()), float(rng.rand()), float(rng.rand()), float(rng.rand()))]
+        for _ in range(120)
+    ]
+    # Mirror players.save_boxes_cache: round(clip(coord, 0, 1) * 65535) on the uint16 grid
+    def _deq(x: float) -> float:
+        return round(min(1.0, max(0.0, x)) * 65535.0) / 65535.0
+
+    quant = [
+        [(int(track), _deq(x1), _deq(y1), _deq(x2), _deq(y2))
+         for (track, x1, y1, x2, y2) in fr]
+        for fr in frames
+    ]
+    check("量化前后 boxes 签名一致",
+          POSE._boxes_signature(frames) == POSE._boxes_signature(quant))
+
+
+def test_boxes_cache_v2_roundtrip_and_v1_compat() -> None:
+    """v2 npz roundtrip (per-row conf + raw detections) and v1 back-compat loading.
+
+    The v2 layout adds ``conf`` (uint8 ×255) aligned with the tracked-box rows and the
+    ``raw_frame`` / ``raw_boxes`` / ``raw_conf`` detection layer. v1 files (written before the
+    conf/raw columns existed) must keep loading with ``frame_confs=None, raw_dets=None`` —
+    existing analyses reference them and the overlay must degrade, not break.
+    """
+    print("\n球员：框缓存 v2 读写与 v1 兼容")
+    import tempfile
+
+    rng = np.random.RandomState(7)
+    n_frames = 40
+    frame_boxes = []
+    frame_confs = []
+    for i in range(n_frames):
+        if i % 3 == 2:
+            frame_boxes.append([])
+            frame_confs.append([])
+            continue
+        row = []
+        conf_row = []
+        for tid in (11, 12):
+            x1, y1 = rng.rand() * 0.5, rng.rand() * 0.5
+            row.append((tid, x1, y1, x1 + 0.1, y1 + 0.3))
+            conf_row.append(round(float(rng.uniform(0.1, 0.9)), 3))
+        frame_boxes.append(row)
+        frame_confs.append(conf_row)
+    raw_dets = [
+        [((0.2, 0.3, 0.4, 0.8), 0.12), ((0.6, 0.3, 0.7, 0.8), 0.55)]
+        if i % 2 == 0 else []
+        for i in range(n_frames)
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        ok = PL.save_boxes_cache("unittest_v2", frame_boxes, 12.0, n_frames / 12.0,
+                                 (11, 12), cache_dir=td,
+                                 frame_confs=frame_confs, raw_dets=raw_dets)
+        check("v2 保存成功", ok)
+        doc = PL.load_boxes_cache("unittest_v2", cache_dir=td)
+        check("v2 加载成功", doc is not None)
+        if doc is None:
+            return
+        check("frame_boxes 行对齐", len(doc["frame_boxes"]) == n_frames
+              and all(len(a) == len(b) for a, b in zip(doc["frame_boxes"], frame_boxes)))
+        check("frame_boxes track/坐标一致",
+              all(tuple(r)[:1] == tuple(o)[:1] and all(abs(a - b) < 1e-4 for a, b in zip(r[1:], o[1:]))
+                  for got, want in zip(doc["frame_boxes"], frame_boxes)
+                  for r, o in zip(got, want)))
+        got_confs = doc["frame_confs"]
+        check("v2 带 conf 列",
+              got_confs is not None
+              and all(abs(a - b) <= 1 / 255 + 1e-6
+                      for got, want in zip(got_confs, frame_confs)
+                      for a, b in zip(got, want)))
+        got_raw = doc["raw_dets"]
+        check("v2 带原始检测层",
+              got_raw is not None and len(got_raw) == n_frames
+              and len(got_raw[0]) == 2
+              and abs(got_raw[0][0][4] - 0.12) <= 1 / 255 + 1e-6
+              and all(abs(a - b) < 1e-4
+                      for a, b in zip(got_raw[0][0][:4], (0.2, 0.3, 0.4, 0.8))))
+
+        # ---- v1 compatibility: a file without the conf / raw arrays must still load ----
+        v1_path = Path(td) / "boxes_unittest_v1.npz"
+        rows = [(i, tid, *b[1:]) for i, fr in enumerate(frame_boxes) for tid, *b in [(r[0], r) for r in fr]]
+        np.savez_compressed(
+            v1_path,
+            version=np.int64(1),
+            fps=np.float64(12.0), duration=np.float64(n_frames / 12.0), n=np.int64(n_frames),
+            active_ids=np.asarray([11, 12], dtype=np.int32),
+            frame=np.asarray([r[0] for r in rows], dtype=np.int32),
+            track=np.asarray([r[1] for r in rows], dtype=np.int32),
+            boxes=np.round(np.clip(np.asarray([r[2:] for r in rows], dtype=np.float64), 0, 1)
+                           * 65535.0).astype(np.uint16),
+        )
+        doc1 = PL.load_boxes_cache("unittest_v1", cache_dir=td)
+        check("v1 文件可加载", doc1 is not None)
+        if doc1 is not None:
+            check("v1 无 conf（前端不过滤）", doc1["frame_confs"] is None)
+            check("v1 无原始检测层", doc1["raw_dets"] is None)
+            check("v1 frame_boxes 数量一致", len(doc1["frame_boxes"]) == n_frames)
+
+        # ---- unknown future version must be a miss, not a crash ----
+        v3_path = Path(td) / "boxes_unittest_v3.npz"
+        np.savez_compressed(v3_path, version=np.int64(99), n=np.int64(0))
+        check("未知版本视为未命中", PL.load_boxes_cache("unittest_v3", cache_dir=td) is None)
+
+    # ---- cache tag must embed the detection floor so v1/v2 key spaces split ----
+    tag_a = PL.boxes_cache_tag("some/video.mp4", sample_fps=12.0)
+    tag_b = PL.boxes_cache_tag("some/video.mp4", sample_fps=13.0)
+    check("不同采样率产生不同 tag", tag_a != tag_b and len(tag_a) == 16)
+    orig_low = PL.LOW_CONF
+    try:
+        PL.LOW_CONF = 0.15
+        tag_old = PL.boxes_cache_tag("some/video.mp4", sample_fps=12.0)
+    finally:
+        PL.LOW_CONF = orig_low
+    check("tag 含检测下限分量（v1/v2 键空间分流）", tag_a != tag_old)
+    check("检测下限为 0.10（v2 行为）", abs(PL.LOW_CONF - 0.10) < 1e-9)
 
 
 def test_pose_gate_force() -> None:
@@ -998,6 +1816,154 @@ def test_annotation_evidence_and_metrics() -> None:
     check("建议：给出时长统计", s.get("duration_median") == 4.0 and s.get("count") == 3.0, str(s))
 
 
+def test_annotation_boundary_metrics() -> None:
+    """Boundary-localization stats: paired start/end error quantiles + tolerance-band hit rates/F1.
+
+    Pairing is deliberately loose (IoU>=0.3) so nearly-correct intervals still contribute boundary
+    statistics. Within a band, a matched pair counts TP; a pair whose error exceeds the band counts
+    on both the FP and FN side (it "moved" the boundary); unmatched predictions/GT add FP/FN.
+    """
+    print("\n标注边界容差指标")
+    bm = AN.boundary_metrics([(0.0, 10.0)], [(0.0, 10.0)], bands=(0.5, 1.0))
+    check("完全重合：误差为 0", bm["start"]["errors"] == [0.0] and bm["end"]["errors"] == [0.0])
+    check("完全重合：带命中率 1", bm["start"]["bands"]["0.5"] == 1.0
+          and bm["start"]["bands_f1"]["0.5"]["f1"] == 1.0)
+
+    # One shifted pair (start +0.6s, end -0.6s, IoU still high) plus one spurious pred and one
+    # missed GT; each side: 1 matched, 1 unmatched pred, 1 unmatched GT.
+    preds = [(10.6, 29.4), (40.0, 50.0)]
+    gt = [(10.0, 30.0), (60.0, 70.0)]
+    bm = AN.boundary_metrics(preds, gt, bands=(0.5, 1.0))
+    check("宽松配对：配到 1 对", bm["matched"] == 1 and bm["start"]["matched"] == 1)
+    check("起点带符号误差正确", len(bm["start"]["errors"]) == 1
+          and abs(bm["start"]["errors"][0] - 0.6) < 1e-9, str(bm["start"]["errors"]))
+    check("终点带符号误差正确", abs(bm["end"]["errors"][0] - (-0.6)) < 1e-9)
+    check("0.5s 带外：命中率 0", bm["start"]["bands"]["0.5"] == 0.0)
+    f105 = bm["start"]["bands_f1"]["0.5"]
+    check("0.5s 带外：F1=0 且配对外各计 FP/FN", f105 == {"tp": 0, "fp": 2, "fn": 2, "f1": 0.0},
+          str(f105))
+    f110 = bm["start"]["bands_f1"]["1.0"]
+    # The pair is inside the 1.0s band: tp=1, no moved-pair penalty; the unmatched pred and
+    # unmatched GT add one FP / one FN: F1 = 2/(2+1+1)=0.5.
+    check("1.0s 带内：F1=2/(2+1+1)", f110["tp"] == 1 and f110["fp"] == 1 and f110["fn"] == 1
+          and abs(f110["f1"] - 0.5) < 1e-9, str(f110))
+    check("分位数给出中位/p90", bm["start"]["median"] == 0.6 and bm["start"]["p90"] == 0.6)
+
+    empty = AN.boundary_metrics([], [])
+    check("空输入安全降级", empty["matched"] == 0
+          and empty["start"]["median"] is None
+          and empty["start"]["bands"] == {"0.5": None, "1.0": None, "1.5": None})
+
+    m = AN.metrics(preds, gt, 0.3, include_pairs=True)
+    check("metrics 可选返回配对", len(m["pairs"]) == 1 and len(m["pairs"][0]) == 3)
+    m_plain = AN.metrics(preds, gt, 0.3)
+    check("metrics 默认不含配对（向后兼容）", "pairs" not in m_plain)
+
+
+def _lq_result(plateaus, dur, fps=12.0, valleys=()):
+    """Synthetic AnalysisResult: 0.25 base player motion, 0.9 plateaus, V-shaped valleys."""
+    n = int(dur * fps)
+    pm = np.full(n, 0.25, dtype=np.float32)
+    for a, b in plateaus:
+        pm[int(a * fps):int(b * fps)] = 0.9
+    for c in valleys:
+        h = int(1.0 * fps)
+        ci = int(c * fps)
+        for k in range(-h, h + 1):
+            j = ci + k
+            if 0 <= j < n:
+                pm[j] = min(float(pm[j]), 0.25 * abs(k) / h)
+    hits = [t for a, b in plateaus for t in np.arange(a + 0.5, b, 1.5)]
+    return AnalysisResult(
+        media_id="m_lq", status="done", params=AnalysisParams(),
+        signals={
+            "activity_full": pm.tolist(),
+            "player_motion_full": pm.tolist(),
+            "player_coverage_full": np.ones(n, dtype=np.float32).tolist(),
+            "fps": [fps], "duration": [dur], "player_fps": [fps],
+            "hit_times": [round(float(t), 3) for t in hits],
+            "hit_strength": [0.8] * len(hits),
+            "hit_confidence": [0.9] * len(hits),
+        },
+    )
+
+
+def test_annotation_objective_and_grid() -> None:
+    """Blended IoU+boundary-band objective and data-driven grid clamps/superset behavior."""
+    print("\n容忍带目标与动态网格")
+    check("组合分：IoU 权重占主", abs(AN.combo_score(1.0, 0.0) - 0.7) < 1e-9)
+    check("组合分：完全正确为 1", AN.combo_score(1.0, 1.0) == 1.0)
+    # Same IoU F1 (both pair at thr 0.5, no unmatched) but different boundary localization:
+    # at the 0.5s band the 0.1s shift is correct and the 0.9s shift misses.
+    g1 = [(10.0, 30.0)]
+    p_centered = [(10.1, 29.9)]
+    p_shifted = [(10.9, 29.1)]
+    b1 = AN.boundary_band_f1(p_centered, g1, band=0.5)
+    b2 = AN.boundary_band_f1(p_shifted, g1, band=0.5)
+    s1 = AN.combo_score(AN.metrics(p_centered, g1)["f1"], b1)
+    s2 = AN.combo_score(AN.metrics(p_shifted, g1)["f1"], b2)
+    check("IoU 打平时边界更准者胜", s1 > s2, f"{s1} vs {s2}")
+    check("边界带 F1 随误差下降", b1 > b2)
+
+    gt = [(0.0, 3.5), (4.5, 9.0), (10.0, 14.0), (15.0, 19.0),
+          (20.0, 24.0), (25.0, 35.0)]  # short 3.5s rally, ~1.0s tight gaps
+    grid = dict(AN.dynamic_grid(gt))
+    check("动态网格覆盖静态候选", all(set(dict(AN.SEARCH_GRID)[k]) <= set(grid[k])
+                                    for k in dict(AN.SEARCH_GRID)))
+    for k, (lo, hi) in AN._GRID_CLAMP.items():
+        check(f"{k} 候选全部安全夹取", all(lo <= v <= hi for v in grid[k]), str(grid[k]))
+    check("短回合拉低 min_rally 候选", min(grid["min_rally_seconds"]) <= 2.5,
+          str(grid["min_rally_seconds"]))
+    check("紧 gap 拉低 min_rest 候选", min(grid["seg_min_rest"]) < 0.6,
+          str(grid["seg_min_rest"]))
+
+
+def test_annotation_label_quality() -> None:
+    """Label audit: structural + signal warnings with guarded snap suggestions; never rewrites."""
+    print("\n标注质量审计")
+
+    # --- no signals at all: structural checks still work, no exception
+    empty_res = AnalysisResult(media_id="m0", status="done", params=AnalysisParams(),
+                               signals={"activity_full": []})
+    gt_struct = [(0.0, 18.0), (17.0, 37.0), (40.0, 62.0), (70.0, 90.0), (95.0, 97.0)]
+    q = AN.label_quality(empty_res, gt_struct)
+    check("无信号：条目数正确", q["count"] == 5)
+    codes = {w["code"] for w in q["items"][1]["warnings"]}
+    check("无信号：重叠仍报", "overlap" in codes, str(codes))
+    check("无信号：时长离群仍报（MAD z）",
+          any(w["code"] == "duration_outlier" for w in q["items"][4]["warnings"]),
+          str(q["items"][4]["warnings"]))
+    check("审计不回写标注", gt_struct[1][0] == 17.0)
+
+    # --- signals: plateaus [12,40] and [44,62], gap valleys at 10/42/64 plus an INTRA-rally
+    # valley at 25 which must never become a boundary reference or snap target.
+    res = _lq_result([(12, 40), (44, 62)], 70.0, valleys=(10.0, 25.0, 42.0, 64.0))
+    # Rally 0 start sits 2.5s off its external-gap valley (warn + snap); rally 1 starts 4s late.
+    q = AN.label_quality(res, [(12.5, 40.0), (46.0, 62.0)])
+    w0 = {(w["code"], w.get("side")): w for w in q["items"][0]["warnings"]}
+    check("起点远离 quiet 谷 → 告警", ("boundary_off_quiet", "start") in w0, str(w0))
+    check("给出吸附建议", w0[("boundary_off_quiet", "start")].get("snap_t") == 10.0
+          and w0[("boundary_off_quiet", "start")].get("snap_kind") == "quiet",
+          str(w0[("boundary_off_quiet", "start")]))
+    check("回合内谷绝不作为吸附点",
+          all(w.get("snap_t") != 25.0 for w in q["items"][0]["warnings"]),
+          str(q["items"][0]["warnings"]))
+    w1 = {(w["code"], w.get("side")): w for w in q["items"][1]["warnings"]}
+    late = w1.get(("boundary_off_quiet", "start"))
+    check("超出吸附半径：告警但无 snap_t", late is not None and late.get("snap_t") is None,
+          str(late))
+    check("严重级别汇总", q["severity_counts"]["warn"] >= 1)
+    check("严重条目标 warn", q["items"][0]["severity"] == "warn")
+
+    # --- snap guard: a candidate valley before the previous rally's end must not be suggested
+    res2 = _lq_result([(0, 8), (12, 30)], 40.0, valleys=(10.0,))
+    q2 = AN.label_quality(res2, [(12.0, 30.0)])
+    # Only one label -> no neighbor guard here; instead verify min-length guard directly.
+    cand = AN._snap_candidate(20.0, [(10.0, 1.0)], lo_guard=19.8, hi_guard=30.0)
+    check("吸附守卫：候选在合法区间外 → None", cand is None)
+    check("审计结果结构稳定", set(q2.keys()) == {"count", "severity_counts", "items"})
+
+
 def test_annotation_optimizer_runs() -> None:
     """ "Search parameters from annotations" must run through and return usable best parameters (offline, without rerunning AI)."""
     print("\n标注搜参")
@@ -1031,6 +1997,45 @@ def test_annotation_optimizer_runs() -> None:
     check("给出了 baseline 指标", "f1" in out["baseline"])
     check("最优 F1 不低于 baseline F1", out["best"]["f1"] >= out["baseline"]["f1"] - 1e-9,
           f"{out['best']['f1']} < {out['baseline']['f1']}")
+
+
+def test_annotation_weights_stage() -> None:
+    """Stage E runs only with component_*_full; acceptance never regresses the objective."""
+    print("\n标注搜参：融合权重 stage")
+    f = _fuse_fixture()
+    gt = [(10.0, 18.0), (22.0, 30.0), (34.0, 42.0)]
+    sig = {
+        "activity_full": [round(float(x), 4) for x in f.activity],
+        "fps": [f.fps], "duration": [f.duration],
+    }
+    sig.update({f"component_{k}_full": [round(float(x), 4) for x in v]
+                for k, v in f.components.items()})
+    res = AnalysisResult(
+        media_id="m_w", status="done",
+        params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.3, post_roll=0.3,
+                              sample_fps=f.fps),
+        signals=sig, stats={"audio_reliability": float(f.audio_reliability)})
+    out = AN.optimize(res, gt, focus=(0.0, f.duration),
+                      grid=[("min_rally_seconds", [2.0])])
+    check("P4-1+ 工程出现 weights stage", "weights" in out["stages"])
+    w = out["stages"]["weights"]
+    check("stage tried>0 且 trace 键稳定",
+          w["tried"] > 0 and w["accepted_moves"] >= 0
+          and set(w["search_fields"]) == set(AN.WEIGHT_FIELDS.values()))
+    check("best.params 带 5 个 fuse_weight_*",
+          all(fld in out["best"]["params"] for fld in AN.WEIGHT_FIELDS.values()))
+    check("最终 score 不低于 baseline（接受守卫）",
+          out["best"]["score"] >= out["baseline"]["score"] - 0.02,
+          f"{out['best']['score']} < {out['baseline']['score']}")
+    # Old project: stage skipped entirely and no weight fields leak into best params.
+    old_sig = {"activity_full": sig["activity_full"],
+               "fps": [f.fps], "duration": [f.duration]}
+    res_old = res.model_copy(update={"signals": old_sig})
+    out_old = AN.optimize(res_old, gt, focus=(0.0, f.duration),
+                          grid=[("min_rally_seconds", [2.0])])
+    check("旧工程跳过 weights stage", "weights" not in out_old["stages"])
+    check("旧工程 best.params 无 fuse_weight_*",
+          not any(k.startswith("fuse_weight_") for k in out_old["best"]["params"]))
 
 
 def test_annotation_eval_window_intersection() -> None:
@@ -2012,14 +3017,34 @@ def main() -> int:
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()
+    test_match_format_stats()
     test_join_abutting()
     test_activity_segmentation_has_gaps()
     test_split_by_hit_gaps()
     test_refine_trims_tail()
     test_join_abutting_keeps_shots()
+    test_finish_intervals_padding_once()
+    test_resegment_matches_optimizer_finishing()
+    test_boundary_evidence_direction()
+    test_boundary_fit_weights()
+    test_boundary_refine_guardrails()
+    test_boundary_pack_roundtrip()
+    test_fuse_weight_defaults()
+    test_fuse_components_roundtrip()
+    test_shuttle_in_flight_build()
+    test_fuse_shuttle_in_flight_blend()
+    test_shuttle_backend_selection()
+    test_shuttle_gpu_morph_equivalence()
+    test_shuttle_gpu_cpu_parity()
+    test_shuttle_gpu_runtime_error_falls_back()
+    test_shuttle_budget_seconds_frame_unit()
+    test_rebuild_fused_weight_overrides()
     test_pose_swing_peaks()
     test_pose_hit_gating_one_to_one()
     test_pose_gate_degrades()
+    test_pose_keypoint_crop_inverse_map()
+    test_pose_boxes_signature_quantization_stable()
+    test_boxes_cache_v2_roundtrip_and_v1_compat()
     test_pose_gate_force()
     test_resegment_regates_hits()
     test_resegment_gate_degrades_without_raw()
@@ -2027,7 +3052,11 @@ def main() -> int:
     test_segment_rallies_reuses_player_signal()
     test_merge_by_availability_windows()
     test_annotation_evidence_and_metrics()
+    test_annotation_boundary_metrics()
+    test_annotation_objective_and_grid()
+    test_annotation_label_quality()
     test_annotation_optimizer_runs()
+    test_annotation_weights_stage()
     test_annotation_eval_window_intersection()
     test_annotation_hit_gate_stage()
     test_preset_hit_params()

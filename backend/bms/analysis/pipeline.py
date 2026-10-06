@@ -33,6 +33,7 @@ from ..core.models import (
 )
 from ..core import media as M
 from . import audio_hits as AH
+from . import boundary as BD
 from . import court_calib as CC
 from . import motion as MO
 from . import rally as RA
@@ -428,6 +429,12 @@ def run_analysis(
                         cancel=cancel,
                     )
                     shuttle_trace = {"tracks": len(getattr(shuttle_sig, "tracks", []) or [])}
+                    shuttle_backend = getattr(shuttle_sig, "backend", "")
+                    if shuttle_backend:
+                        shuttle_trace["backend"] = shuttle_backend
+                    shuttle_fallback = getattr(shuttle_sig, "backend_fallback", "")
+                    if shuttle_fallback:
+                        shuttle_trace["backend_fallback"] = shuttle_fallback
                     if coverage < 0.6:
                         # only part of the timeline is covered; keeping it would badly skew the fusion weights, so drop it
                         shuttle_trace["skipped"] = tr(
@@ -441,7 +448,12 @@ def run_analysis(
                             "fps": float(getattr(shuttle_sig, "fps", params.sample_fps)),
                             "presence": getattr(shuttle_sig, "presence", np.zeros(0)),
                             "max_candidate_speed": getattr(shuttle_sig, "max_candidate_speed", np.zeros(0)),
+                            "in_flight": getattr(shuttle_sig, "in_flight", np.zeros(0)),
                         }
+                        flight = getattr(shuttle_sig, "in_flight", None)
+                        if flight is not None and len(flight):
+                            shuttle_trace["in_flight_frac"] = round(
+                                float(np.count_nonzero(flight)) / float(len(flight)), 3)
                         shuttle_trace["coverage"] = round(coverage, 3)
                 except Exception as e:
                     shuttle_trace = {"error": f"{type(e).__name__}: {e}"}
@@ -463,6 +475,7 @@ def run_analysis(
             players=players_dict,
             shuttle=shuttle_dict,
             roi_activity=motion_sig.motion if motion_sig is not None else None,
+            weight_base=params.fuse_weight_base(),
         )
 
         # Player detection has finished; determine the camera angle once more with real player boxes (this time backed by data)
@@ -478,6 +491,16 @@ def run_analysis(
             except Exception as e:
                 calib.note(f"机位二次判定失败：{type(e).__name__}: {e}")
 
+        # ---------------------------------------------------------- 6.5 boundary evidence (P3)
+        # Optional boundary-refinement tie-breaker (boundary.py): the per-frame evidence curves
+        # are always built here (cheap, pure numpy/scipy, no AI rerun) and packed into signals so
+        # resegment / the optimizer reuse the exact same curves. The refinement itself is a no-op
+        # unless params.use_boundary_refine is on. Any failure degrades silently.
+        boundary_ev = _build_boundary_evidence(
+            fused=fused, player_sig=player_sig, pose_sig=pose_sig,
+            hits=hits, duration=duration)
+        boundary_refine_trace: dict[str, Any] = {}
+
         intervals, seg_trace = _segment_rallies(
             fused=fused,
             params=params,
@@ -487,46 +510,35 @@ def run_analysis(
             hits=hits,
         )
 
-        # ---------------------------------------------------------- 7. boundary anchoring
-        # Regardless of the segmentation method, pin the boundaries once with the **hit sequence**:
-        #   1. split at large gaps in the hit sequence — removes "the next rally mixed into one rally";
-        #   2. anchor the end to the last shot + the flight time needed for the shuttle to land —
-        #      removes "a long stretch remaining after the shuttle lands". The old code used max()
-        #      here, so the end could only be pushed later and could never come back, meaning even a
-        #      69-second, 72-shot interval could not be fixed.
-        # The **start** given by player-motion segmentation is "the player starts moving", which
-        # already includes the serve preparation, so for it only the end is trimmed and the start is
-        # not delayed.
-        player_path = seg_trace.get("method") == "player_motion"
-        if hits is not None:
-            intervals = RA.refine_with_hits(
-                intervals, hits,
-                pre_roll=params.pre_roll,
-                post_roll=params.post_roll,
-                tail_seconds=params.hit_tail_seconds,
-                trim_start=not player_path,
-            )
-        else:
-            for iv in intervals:
-                iv.start = max(0.0, iv.start - params.pre_roll)
-                iv.end = min(duration, iv.end + params.post_roll)
+        # ---------------------------------------------------------- 7. boundary anchoring + cleanup
+        # All boundary finishing lives in one canonical helper (_anchor_intervals
+        # + _post_filter) shared with resegment and the annotation optimizer, so
+        # the three copies cannot drift apart again. In short: pin boundaries to
+        # the hit sequence when it exists (split at large hit gaps; anchor the
+        # end to the last shot plus the shuttle's landing flight time — the old
+        # max() could only push ends later, so even a 69s/72-shot interval could
+        # not be fixed); without hits add the rolls once, and only for segmenters
+        # whose intervals do not already carry them (rally_vision rolls internally).
+        seg_method = str(seg_trace.get("method") or "")
+        intervals = _anchor_intervals(
+            intervals, hits=hits, params=params, duration=duration, method=seg_method)
 
         if not intervals and hits is not None and hits.times.size:
             # when vision has no signal at all, fall back to audio only
             intervals = RA.fallback_from_audio(hits, params)
             seg_trace["method"] = "audio_fallback"
 
-        # The padding before/after adjacent rallies overlaps, which would make the same frame appear twice when concatenating clips
-        intervals = RA.dedupe_overlaps(intervals, hits=hits, fps=fused.fps, activity=fused.activity)
+        # Overlapping padding would show the same frame twice in concatenated clips; too-short
+        # rallies are dropped; and "abutting" intervals (gap < 0.3s) are one rally split in two —
+        # a real match always has a pause after a point, so a fake boundary only misleads users.
+        intervals = _post_filter(intervals, hits=hits, fps=fused.fps,
+                                 activity=fused.activity,
+                                 min_rally_seconds=params.min_rally_seconds)
 
-        # Filter out too-short rallies again
-        intervals = [iv for iv in intervals if (iv.end - iv.start) >= params.min_rally_seconds]
-        intervals.sort(key=lambda v: v.start)
-
-        # Wrap-up: merge intervals that are still "abutting" into one. A real match necessarily has
-        # a pause after a point, so two "rallies" within 0.3 seconds of each other must be one rally
-        # split in two; leaving a fake boundary only makes people think "a new shuttle started here".
-        intervals = _join_abutting(intervals)
+        # Optional local-evidence tie-breaker (boundary.py); returns the intervals untouched when
+        # the switch is off / pose unavailable, so default output is identical to the chain above.
+        intervals, boundary_refine_trace = BD.refine_boundaries(
+            intervals, boundary_ev, params, duration, method=seg_method)
 
         # ---------------------------------------------------------- 7.5 speech recall pass
         # The full-file decode is unstable on some 30 s chunks and can drop a clear short shout
@@ -602,7 +614,19 @@ def run_analysis(
             # resolution as the original ±window match. The downsampled copy above is display-only
             # and far too coarse (about one sample per 0.75 s) for a ±0.35 s window.
             res.signals["pose_swing_full"] = [round(float(v), 4) for v in pose_sig.swing]
+            # Full-rate overhead-arm fraction: boundary evidence needs it when curves are rebuilt
+            # from raw arrays (e.g. after a template/version bump); same numeric-curve convention.
+            res.signals["pose_overhead_full"] = [round(float(v), 4) for v in pose_sig.overhead]
             res.signals["pose_quiet"] = [round(float(pose_sig.quiet), 5)]
+            # Reference to the v2 pose npz holding per-frame keypoint skeletons; lives in stats
+            # (a reference, not a float curve) and survives resegment via keep_keys.
+            ptag = str((pose_sig.trace or {}).get("cache_tag", "") or "")
+            if ptag:
+                res.stats["pose_cache"] = ptag
+        # Packed boundary-evidence curves (boundary.py): resegment / the annotation optimizer read
+        # these instead of recomputing the template-normalized motion part of the score.
+        if boundary_ev is not None:
+            res.signals.update(BD.pack_signals(boundary_ev))
         # Note: what is stored here is the **post-gating** hit sequence, so the mask does not need to
         # be stored separately. Fast resegmentation (resegment) does not re-run AI; it reads the same
         # hits, so the gating result is naturally consistent. Storing the mask is instead risky: once
@@ -615,6 +639,8 @@ def run_analysis(
         res.stats["shuttle_trace"] = shuttle_trace
         res.stats["pose_trace"] = pose_trace
         res.stats["speech_trace"] = speech_trace
+        res.stats["boundary"] = BD.boundary_meta(boundary_ev)
+        res.stats["boundary_refine"] = boundary_refine_trace
         # Speech events go into stats (not signals): the convention for signals is "pure float
         # curves", whereas these carry phrase strings; resegmentation reads them back to recompute the bonus.
         res.stats["speech"] = {
@@ -630,6 +656,21 @@ def run_analysis(
         # The polygon actually used for "in-court determination" (the court boundary when calibration succeeded; otherwise None)
         res.stats["effective_poly"] = [list(p) for p in eff_poly] if eff_poly else None
         res.stats["player_size_filter"] = dict(size_filter)
+        # Reference to the compact per-frame box npz (data/cache/boxes/); resolved by the overlay
+        # API. Empty/missing means the cache write was skipped and visualization degrades.
+        btag = str(getattr(player_sig, "cache_tag", "") or "")
+        if btag:
+            res.stats["boxes_cache"] = btag
+        # P4-3: singles/doubles recommendation from the per-frame active-player count.
+        # Recommendation only — no parameter preset is switched automatically.
+        ac = getattr(player_sig, "active_count", None) if player_sig is not None else None
+        if ac is not None and getattr(ac, "size", 0):
+            try:
+                from . import players as PL
+                res.stats["match_format"] = PL.match_format_stats(
+                    ac, float(getattr(player_sig, "fps", 0.0) or 0.0))
+            except Exception:  # noqa: BLE001
+                pass
         res.stats["duration"] = duration
         res.stats["segmentation"] = seg_trace
         if motion_sig is not None:
@@ -894,6 +935,10 @@ def _pack_signals(fused, motion_sig, player_sig, shuttle_sig, hits, duration: fl
     }
     for k, v in fused.components.items():
         out[f"component_{k}"] = _downsample(v)
+        # Full-frame-rate component curves: resegment / the optimizer can then re-fuse the
+        # activity with calibrated weight overrides in milliseconds, without re-running any AI.
+        # ~0.4 MB extra per project at 15 fps / 1800 s, same order as the other *_full arrays.
+        out[f"component_{k}_full"] = [round(float(x), 4) for x in v]
     out["weights"] = [round(fused.weights.get(k, 0.0), 3) for k in
                       ("players", "motion", "audio_hits", "shuttle", "roi")]
     if motion_sig is not None:
@@ -954,6 +999,12 @@ def _pack_signals(fused, motion_sig, player_sig, shuttle_sig, hits, duration: fl
     if shuttle_sig is not None:
         out["shuttle_presence"] = _downsample(getattr(shuttle_sig, "presence", np.zeros(0)))
         out["shuttle_fps"] = [round(float(getattr(shuttle_sig, "fps", 0.0)), 3)]
+        # Full-rate validated-flight coverage, for the signal tracks view and offline
+        # inspection; the fusion weight path reads component_shuttle_full instead.
+        flight_full = getattr(shuttle_sig, "in_flight", None)
+        if flight_full is not None and len(flight_full):
+            out["shuttle_in_flight"] = _downsample(flight_full)
+            out["shuttle_in_flight_full"] = [round(float(v), 4) for v in flight_full]
     if hits is not None and hits.times.size:
         out["hit_times"] = [round(float(v), 3) for v in hits.times]
         out["hit_strength"] = [round(float(v), 3) for v in hits.strength]
@@ -1079,6 +1130,129 @@ def _segments_to_intervals(segs: list[RV.RawSegment]) -> list[RA.RallyInterval]:
                     iv.features[k] = float(v)
         out.append(iv)
     return out
+
+
+#: Segmentation methods whose segments already include ``pre_roll`` / ``post_roll``.
+#: Every rally_vision segmenter applies the rolls internally (``_add`` /
+#: ``segment_activity``); only the legacy hysteresis state machine (``RA.segment``)
+#: emits tight, un-padded intervals. ``audio_fallback`` clusters are bounded by
+#: their first/last hit and historically never received rolls either.
+_PADDED_METHODS = ("player_motion", "player_motion+activity",
+                   "activity_valleys", "audio_fallback")
+
+
+def _post_filter(intervals: list[RA.RallyInterval], *, hits: Any,
+                 fps: float, activity: np.ndarray,
+                 min_rally_seconds: float) -> list[RA.RallyInterval]:
+    """Structural cleanup shared by every segmentation caller.
+
+    Order matters and must stay identical on the full-run / resegment /
+    annotation-optimizer paths: overlap cut -> minimum length -> sort ->
+    abutting merge.
+    """
+    intervals = RA.dedupe_overlaps(intervals, hits=hits, fps=fps, activity=activity)
+    intervals = [iv for iv in intervals if (iv.end - iv.start) >= min_rally_seconds]
+    intervals.sort(key=lambda v: v.start)
+    return _join_abutting(intervals)
+
+
+def _anchor_intervals(intervals: list[RA.RallyInterval], *, hits: Any,
+                      params: AnalysisParams, duration: float, method: str,
+                      raw_padding: bool | None = None) -> list[RA.RallyInterval]:
+    """Anchor boundaries to the hit sequence, or add rolls to tight legacy intervals.
+
+    Canonical replacement for the three drifted copies of this logic. With hit
+    evidence, :func:`RA.refine_with_hits` re-anchors every interval (its
+    hit-less branch still pads intervals containing no hit, on purpose).
+    Without hit evidence the rolls are added **only** for segmenters that emit
+    tight intervals (the legacy state machine); rally_vision segments already
+    carry the rolls internally and must never be padded twice.
+    """
+    if raw_padding is None:
+        raw_padding = method not in _PADDED_METHODS
+    has_hit_times = hits is not None and getattr(hits, "times", np.zeros(0)).size > 0
+    if has_hit_times:
+        intervals = RA.refine_with_hits(
+            intervals, hits,
+            pre_roll=params.pre_roll,
+            post_roll=params.post_roll,
+            tail_seconds=params.hit_tail_seconds,
+            # Player-motion segments start at "the player starts moving", which
+            # already includes serve preparation; anchoring the start to the
+            # first hit would cut the preparation off. The merged/activity
+            # paths behave like the old hysteresis path here.
+            trim_start=method != "player_motion",
+        )
+    elif raw_padding:
+        for iv in intervals:
+            iv.start = max(0.0, iv.start - params.pre_roll)
+            iv.end = min(duration, iv.end + params.post_roll)
+    return intervals
+
+
+def _build_boundary_evidence(*, fused, player_sig, pose_sig, hits, duration: float):
+    """Build the P3 boundary evidence on the segmentation grid.
+
+    The player-motion curve is computed with the exact recipe :func:`_pack_signals`
+    stores as ``player_motion_full`` so a fresh run, resegment and the optimizer all
+    share identical evidence. Returns ``None`` on any failure (silent degradation).
+    """
+    try:
+        n = int(fused.activity.size)
+        fps = float(fused.fps)
+        motion: np.ndarray | None = None
+        coverage: np.ndarray | None = None
+        boxes = getattr(player_sig, "frame_boxes", None) if player_sig is not None else None
+        pfps = float(getattr(player_sig, "fps", 0.0) or 0.0) if player_sig is not None else 0.0
+        if boxes and pfps > 0:
+            pm = RV.box_motion(list(boxes), pfps, window=1.0)
+            pm = RV._robust_norm(RV._smooth(pm, max(1, int(pfps * 0.5))))
+            cov = RV.detection_coverage(list(boxes), pfps)
+            motion = RV._resample_to(np.asarray(pm, dtype=np.float32), pfps, fps, n)
+            coverage = RV._resample_to(np.asarray(cov, dtype=np.float32), pfps, fps, n)
+        else:
+            motion = np.asarray(fused.activity, dtype=np.float32)
+        hit_times = getattr(hits, "times", None)
+        return BD.build_evidence(
+            fps=fps, duration=float(duration), motion=motion, coverage=coverage,
+            swing=getattr(pose_sig, "swing", None),
+            swing_fps=float(getattr(pose_sig, "fps", 0.0) or 0.0),
+            overhead=getattr(pose_sig, "overhead", None),
+            pose_coverage=float(getattr(pose_sig, "coverage", 0.0) or 0.0),
+            swing_quiet=float(getattr(pose_sig, "quiet", 0.0) or 0.0),
+            hit_times=hit_times,
+        )
+    except Exception as e:  # silent degradation, same contract as every AI module
+        log.opt(exception=e).warning("boundary evidence degraded")
+        return None
+
+
+def _finish_intervals(intervals: list[RA.RallyInterval], *, hits: Any,
+                      params: AnalysisParams, fused: RA.FusedSignal,
+                      duration: float, method: str,
+                      raw_padding: bool | None = None,
+                      boundary_ev=None,
+                      boundary_trace: dict[str, Any] | None = None
+                      ) -> list[RA.RallyInterval]:
+    """The single canonical "anchor -> dedupe -> min length -> join" finishing pass.
+
+    Shared by :func:`run_analysis` (minus the audio-only fallback, which keeps
+    its historical cleanup-only handling), :func:`resegment` and the annotation
+    optimizer's ``_predict`` so that "the F1 seen while tuning" is exactly the
+    F1 production produces.
+    """
+    intervals = _anchor_intervals(intervals, hits=hits, params=params,
+                                  duration=duration, method=method,
+                                  raw_padding=raw_padding)
+    intervals = _post_filter(intervals, hits=hits, fps=fused.fps,
+                             activity=fused.activity,
+                             min_rally_seconds=params.min_rally_seconds)
+    if boundary_ev is not None:
+        intervals, trace = BD.refine_boundaries(
+            intervals, boundary_ev, params, duration, method=method)
+        if boundary_trace is not None:
+            boundary_trace.update(trace)
+    return intervals
 
 
 def _seg_quality(segs: list[RV.RawSegment], fps: float = 15.0,
@@ -1518,6 +1692,51 @@ __all__ = ["run_analysis", "resegment", "regate_hits", "recover_pose_from_cache"
 # ------------------------------------------------------------------ fast resegmentation
 
 
+def _fuse_weight_is_default(params: AnalysisParams) -> bool:
+    base = params.fuse_weight_base()
+    return all(abs(base[k] - RA.DEFAULT_BASE_WEIGHTS[k]) < 1e-9
+               for k in RA.FUSE_COMPONENT_KEYS)
+
+
+def _rebuild_fused(sig: dict[str, Any], params: AnalysisParams, *,
+                   act: np.ndarray, fps: float, duration: float,
+                   audio_rel: float) -> RA.FusedSignal:
+    """Rebuild the fused signal for offline segmentation.
+
+    With default weights (and for old projects lacking ``component_*_full``) the stored
+    ``activity_full`` is reused **exactly**, preserving byte-identical intervals. Only when
+    the params carry a calibrated weight override are the stored full-rate components
+    re-fused (milliseconds, no AI rerun); missing components degrade to zero like fuse().
+    """
+    if _fuse_weight_is_default(params):
+        med = float(np.median(act))
+        return RA.FusedSignal(
+            fps=fps, duration=duration, activity=act,
+            components={}, weights={},
+            threshold_hi=max(float(np.percentile(act, 78)), med * 1.25),
+            threshold_lo=max(float(np.percentile(act, 55)) * 0.92, med * 1.05),
+            audio_reliability=audio_rel)
+
+    comps: dict[str, np.ndarray] = {}
+    for k in RA.FUSE_COMPONENT_KEYS:
+        raw = sig.get(f"component_{k}_full")
+        if raw:
+            comps[k] = np.asarray(raw, dtype=np.float32)
+    if not comps:
+        # Override requested but the old project never stored full components: degrade
+        # silently to the stored activity rather than raising mid-resegment.
+        med = float(np.median(act))
+        return RA.FusedSignal(
+            fps=fps, duration=duration, activity=act,
+            components={}, weights={},
+            threshold_hi=max(float(np.percentile(act, 78)), med * 1.25),
+            threshold_lo=max(float(np.percentile(act, 55)) * 0.92, med * 1.05),
+            audio_reliability=audio_rel)
+    return RA.fuse_from_components(
+        comps, fps=fps, duration=duration, audio_rel=audio_rel,
+        weight_base=params.fuse_weight_base())
+
+
 def resegment(
     res: AnalysisResult,
     params: AnalysisParams | None = None,
@@ -1545,17 +1764,9 @@ def resegment(
         duration = len(full) / fps
 
     act = np.asarray(full, dtype=np.float32)
-    med = float(np.median(act))
-    fused = RA.FusedSignal(
-        fps=fps,
-        duration=duration,
-        activity=act,
-        components={},
-        weights={},
-        threshold_hi=max(float(np.percentile(act, 78)), med * 1.25),
-        threshold_lo=max(float(np.percentile(act, 55)) * 0.92, med * 1.05),
-        audio_reliability=float(res.stats.get("audio_reliability", 1.0) or 1.0),
-    )
+    audio_rel = float(res.stats.get("audio_reliability", 1.0) or 1.0)
+    fused = _rebuild_fused(sig, params, act=act, fps=fps, duration=duration,
+                           audio_rel=audio_rel)
 
     # Resegmentation has no player boxes, but the player **motion curve** and detection coverage were
     # stored during analysis (``player_motion_full`` / ``player_coverage_full``), so here it can take
@@ -1586,34 +1797,27 @@ def resegment(
     )
     seg_method = str(seg_trace.get("method") or "")
 
-    # Boundary anchoring: both the fast and slow paths must do it, otherwise the "the end cannot be
-    # pulled back" problem resurfaces on the resegmentation path (the user would see "it got longer again after resegmentation").
-    if hits is not None:
-        intervals = RA.refine_with_hits(
-            intervals, hits,
-            pre_roll=params.pre_roll,
-            post_roll=params.post_roll,
-            tail_seconds=params.hit_tail_seconds,
-            # Kept consistent with run_analysis: the start from player segmentation is "the player
-            # starts moving", which already includes the serve preparation, and should not be delayed
-            # to the first shot. The old resegment missed this switch (default True), so for the same
-            # project "fast resegmentation" shifted the start later overall, not matching the boundaries
-            # a full re-run gives.
-            trim_start=seg_method != "player_motion",
-        )
-    else:
-        for iv in intervals:
-            iv.start = max(0.0, iv.start - params.pre_roll)
-            iv.end = min(duration, iv.end + params.post_roll)
+    # P3 boundary evidence: rebuilt from the stored full-rate curves (no AI rerun). The packed
+    # template-normalized curves are reused when their version matches; otherwise channels are
+    # recomputed. Refinement stays a no-op unless params.use_boundary_refine is on.
+    boundary_ev = None
+    boundary_refine_trace: dict[str, Any] = {}
+    try:
+        boundary_ev = BD.evidence_from_signals(
+            sig, getattr(hits, "times", None) if hits is not None else None)
+    except Exception as e:
+        log.opt(exception=e).warning("boundary evidence rebuild degraded")
 
-    intervals = RA.dedupe_overlaps(intervals, hits=hits, fps=fps, activity=act)
-    intervals = [iv for iv in intervals if (iv.end - iv.start) >= params.min_rally_seconds]
-    intervals.sort(key=lambda v: v.start)
-    # Kept consistent with run_analysis: two abutting segments are the two halves of one rally split
-    # apart, and leaving a fake boundary only makes people think "a new shuttle started here".
-    # (The old resegment missed this step, so "fast resegmentation" and "full re-run" gave different
-    #  results — the rally count would change after resegmentation for the same project.)
-    intervals = _join_abutting(intervals)
+    # Canonical finishing, identical to run_analysis: boundary anchoring (the end must be pullable
+    # back to the last shot, otherwise "it gets longer again after resegmentation"), overlap cut,
+    # minimum length and the abutting merge. The old resegment carried its own copy of this block,
+    # which is exactly how the fast/slow paths drifted apart (double padding without hits, a missing
+    # trim_start switch, a missing abutting merge).
+    intervals = _finish_intervals(
+        intervals, hits=hits, params=params, fused=fused,
+        duration=duration, method=seg_method,
+        boundary_ev=boundary_ev, boundary_trace=boundary_refine_trace,
+    )
 
     motion_dict = _dict_from(sig, "motion", "motion_fps")
     players_dict = _dict_from_multi(sig, ("active_count", "active_speed", "max_speed"), "player_fps")
@@ -1660,7 +1864,8 @@ def resegment(
     keep_keys = ("hit_trace", "player_trace", "shuttle_trace", "pose_trace",
                  "audio_reliability", "component_weights", "duration", "auto_roi",
                  "roi", "effective_roi", "effective_poly", "player_size_filter",
-                 "segmentation", "speech", "speech_trace")
+                 "segmentation", "speech", "speech_trace",
+                 "boxes_cache", "pose_cache", "boundary", "match_format")
     carried = {k: v for k, v in (res.stats or {}).items() if k in keep_keys}
     carried.setdefault("duration", duration)
     res.stats = SC.derive_stats(feats, scores)
@@ -1679,6 +1884,9 @@ def resegment(
                       "count": len(intervals), "resegmented": True})
     res.stats["segmentation"] = seg_trace
     res.stats["weights"] = weights_key
+    if boundary_ev is not None:
+        res.stats.setdefault("boundary", BD.boundary_meta(boundary_ev))
+    res.stats["boundary_refine"] = boundary_refine_trace
     res.stats["resegmented"] = True
     res.signal_fps = fps
     return res

@@ -92,6 +92,7 @@ Iteration log (measured on the 480x270 test proxy, to explain where these thresh
 from __future__ import annotations
 
 import collections
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -136,6 +137,14 @@ class ShuttleSignal:
     candidate_count: np.ndarray = field(default_factory=lambda: np.zeros(0))
     #: Maximum speed among all candidate points per frame (normalized/second)
     max_candidate_speed: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: Continuous "shuttle in flight" curve 0~1 per frame: validated tracks fill their
+    #: whole span (bridging the up-to-max_gap lost frames), so this stays high across a
+    #: real flight where ``presence`` flickers. Built from parabola-fit tracks only.
+    in_flight: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: Candidate-scan backend actually used ("cpu" or "gpu"); diagnostic only.
+    backend: str = "cpu"
+    #: When the GPU scan raised, the error text; non-empty means a silent CPU fallback happened.
+    backend_fallback: str = ""
 
 
 # ---------------------------------------------------------------- constants / defaults
@@ -208,6 +217,85 @@ def _pctl_axis0(stack: np.ndarray, q: float) -> np.ndarray:
     k = int(round((t - 1) * q / 100.0))
     k = max(0, min(t - 1, k))
     return np.partition(stack, k, axis=0)[k]
+
+
+# ---------------------------------------------------------------- GPU backend selection / primitives
+
+
+#: Environment override for the candidate-scan backend: "auto" (default) | "cpu" | "gpu".
+BACKEND_ENV = "BMS_SHUTTLE_BACKEND"
+
+
+def _gpu_available() -> bool:
+    """True when a usable torch CUDA device exists. Import failures degrade to False."""
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_backend(force: str | None = None) -> str:
+    """Resolve the scan backend ("cpu"/"gpu") from the explicit arg or :data:`BACKEND_ENV`.
+
+    ``auto`` picks GPU when torch CUDA is usable, otherwise CPU. An env-level ``gpu`` request
+    on a CUDA-less machine silently falls back to CPU; an explicit ``force="gpu"`` raises,
+    so callers opting into "GPU, no fallback" get a hard failure instead of silent CPU work.
+    """
+    want = str(force if force else os.environ.get(BACKEND_ENV, "auto")).strip().lower()
+    if want == "cpu":
+        return "cpu"
+    if want == "gpu":
+        if _gpu_available():
+            return "gpu"
+        if force:
+            raise RuntimeError("shuttle backend 'gpu' requested but torch.cuda is unavailable")
+        return "cpu"
+    return "gpu" if _gpu_available() else "cpu"
+
+
+# cv2.getStructuringElement(MORPH_ELLIPSE, (3, 3)) is a 5-cell cross; dilate uses a full 3x3 square.
+_CROSS3 = ((0.0, 1.0, 0.0), (1.0, 1.0, 1.0), (0.0, 1.0, 0.0))
+_SQUARE3 = ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0))
+
+
+def _bin_kernel(pattern, device):
+    import torch
+
+    return torch.tensor(pattern, dtype=torch.float32, device=device)[None, None]
+
+
+def _bin_erode(x, kernel):
+    """Binary erosion via thresholded convolution; x/kernel are float/bool tensors on one device."""
+    import torch.nn.functional as F
+
+    return F.conv2d(x.float()[None, None], kernel, padding=1)[0, 0] == float(kernel.sum())
+
+
+def _bin_dilate_t(x, kernel):
+    import torch.nn.functional as F
+
+    return F.conv2d(x.float()[None, None], kernel, padding=1)[0, 0] > 0.0
+
+
+def _gpu_binary_open(mask_u8: np.ndarray, device: str = "cuda") -> np.ndarray:
+    """GPU equivalent of ``cv2.morphologyEx(m, MORPH_OPEN, cross3)``; uint8 in/out."""
+    import torch
+
+    x = torch.from_numpy(np.ascontiguousarray(mask_u8)).to(device).bool()
+    k = _bin_kernel(_CROSS3, device)
+    out = _bin_dilate_t(_bin_erode(x, k), k)
+    return out.to(torch.uint8).cpu().numpy()
+
+
+def _gpu_binary_dilate(mask_u8: np.ndarray, device: str = "cuda") -> np.ndarray:
+    """GPU equivalent of ``cv2.dilate(m, np.ones((3,3)))``; uint8 in/out."""
+    import torch
+
+    x = torch.from_numpy(np.ascontiguousarray(mask_u8)).to(device).bool()
+    out = _bin_dilate_t(x, _bin_kernel(_SQUARE3, device))
+    return out.to(torch.uint8).cpu().numpy()
 
 
 def _sensitivity_thresholds(sensitivity: float, scale: float, work_h: int,
@@ -286,6 +374,30 @@ def _detect_candidates(
         if not m8.any():
             return []
 
+    return _score_components(m8, w, w_ref, gex, th)
+
+
+def _score_components(
+    m8: np.ndarray,
+    w: np.ndarray,
+    w_ref: np.ndarray,
+    gex: np.ndarray,
+    th: dict,
+) -> list[tuple[float, float, float, float]]:
+    """Connected-component extraction + per-component scoring on an already-built binary mask.
+
+    Shared by the CPU and GPU scan paths: each backend builds ``m8`` (novelty + absolute
+    whiteness + static-white/ROI masks + opening) with its own primitives, then the component
+    selection/scoring logic runs identically here. Returns [(x, y, score, novelty), ...].
+
+    ``gex`` is **this frame's green-excess map**, used only to judge whether the area **around** the
+    candidate is green court. Note that it must not be used to require the candidate itself to be
+    green — the shuttle is white with green excess near 0, and an early version fell into exactly
+    this reversed prior (see the iteration log in the module docstring).
+    """
+    import cv2
+
+    nov = w - w_ref
     nl, _lab, st, cent = cv2.connectedComponentsWithStats(m8, connectivity=8)
     if nl <= 1:
         return []
@@ -552,6 +664,7 @@ def analyze_shuttle(
     min_span: float = DEFAULT_MIN_SPAN,
     min_accel: float = DEFAULT_MIN_ACCEL,
     court_gex: float | None = None,
+    backend: str | None = None,
 ) -> ShuttleSignal:
     """Analyze the video, returning shuttlecock candidate trajectories and per-frame auxiliary signals.
 
@@ -578,6 +691,8 @@ def analyze_shuttle(
             None means it is taken automatically from sensitivity (45 when s=0.5). Set to -999 to disable
             this prior and let the module look for the shuttle over the whole frame (suited to a camera
             where the shuttle often flies against a dark ceiling/wall).
+        backend: Candidate-scan backend override: "auto" (default; GPU via torch CUDA when available),
+            "cpu" or "gpu". An auto GPU failure silently re-runs the scan on CPU (see backend_fallback).
 
     Returns:
         :class:`ShuttleSignal`. ``fps`` is the **actual sampling frame rate** (lower than ``sample_fps`` when the source frame rate is low).
@@ -586,7 +701,8 @@ def analyze_shuttle(
         video_path, sample_fps, roi, max_seconds, sensitivity, on_progress, cancel,
         work_width=work_width, window=window, min_points=min_points, max_gap=max_gap,
         min_speed=min_speed, max_speed=max_speed, max_resid=max_resid,
-        min_span=min_span, min_accel=min_accel, court_gex=court_gex, want_debug=False,
+        min_span=min_span, min_accel=min_accel, court_gex=court_gex,
+        backend=backend, want_debug=False,
     )
     return sig
 
@@ -613,81 +729,46 @@ def analyze_shuttle_debug(
     )
 
 
-def _run(
+def build_in_flight(tracks: list["ShuttleTrack"], n_frames: int) -> np.ndarray:
+    """Build the per-frame "shuttle in flight" curve from validated tracks.
+
+    Each track fills its whole observed span (``min(point.frame) .. max(point.frame)``)
+    with its confidence, bridging the short lost-frame gaps that association allows;
+    overlapping tracks take the maximum confidence. Unlike point-level ``presence``,
+    this curve stays continuously high through one real flight.
+    """
+    flight = np.zeros(max(0, int(n_frames)), dtype=np.float32)
+    for tk in tracks or []:
+        frames = [p.frame for p in tk.points if 0 <= p.frame < flight.size]
+        if not frames:
+            continue
+        conf = float(np.clip(tk.confidence, 0.0, 1.0))
+        flight[min(frames):max(frames) + 1] = np.maximum(
+            flight[min(frames):max(frames) + 1], conf)
+    return flight
+
+
+def _scan_candidates_cpu(
     video_path: str,
-    sample_fps: float,
-    roi: tuple[float, float, float, float] | None,
-    max_seconds: float,
-    sensitivity: float,
-    on_progress,
-    cancel,
     *,
-    work_width: int = 0,
-    window: int = DEFAULT_WINDOW,
-    min_points: int = DEFAULT_MIN_POINTS,
-    max_gap: int = DEFAULT_MAX_GAP,
-    min_speed: float = DEFAULT_MIN_SPEED,
-    max_speed: float = DEFAULT_MAX_SPEED,
-    max_resid: float = DEFAULT_MAX_RESID,
-    min_span: float = DEFAULT_MIN_SPAN,
-    min_accel: float = DEFAULT_MIN_ACCEL,
-    court_gex: float | None = None,
-    want_debug: bool = False,
-) -> tuple[ShuttleSignal, dict]:
+    ww: int, wh: int, step: int, limit_src: int, limit_sampled: int,
+    K: int, WIN: int,
+    thr: dict, mask_roi: np.ndarray | None, total: int, emit, cancel,
+) -> tuple[dict, list, int, int]:
+    """Stream sampled frames and extract per-frame candidates (numpy/cv2 reference path).
+
+    ``limit_sampled`` caps the number of sampled frames actually read (time budget in
+    sampled-frame units), while ``limit_src`` is the same budget in source-frame units
+    and is used only for progress reporting.
+
+    Returns ``(per_frame, top_frames, n_samp, n_read)`` where per_frame maps the timeline
+    frame index to [(x, y, score, novelty), ...] in pixel coordinates.
+    """
     import cv2
-
-    def emit(p: float, s: str) -> None:
-        if on_progress is not None:
-            try:
-                on_progress(float(np.clip(p, 0.0, 1.0)), s)
-            except Exception:
-                pass
-
-    empty = ShuttleSignal(fps=0.0, duration=0.0)
-    if not video_path:
-        return empty, {}
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
-
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if src_w <= 0 or src_h <= 0:
-        cap.release()
-        return empty, {}
-
-    # ---- working resolution
-    ww = int(work_width) if work_width and work_width > 0 else min(src_w, DEFAULT_WORK_WIDTH)
-    ww = max(64, min(ww, src_w))
-    scale = ww / float(src_w)
-    wh = max(2, int(round(src_h * scale)))
-    wf = float(wh) / REF_HEIGHT            # scaling relative to the reference height
-    thr = _sensitivity_thresholds(sensitivity, wf, wh, court_gex)
-
-    step = max(1, int(round(src_fps / max(1e-3, float(sample_fps)))))
-    eff_fps = src_fps / step
-    limit_frames = int(max_seconds * src_fps) if max_seconds and max_seconds > 0 else (total or 10 ** 9)
-
-    # ---- ROI mask
-    mask_roi = None
-    if roi is not None:
-        x0, y0, x1, y1 = roi
-        ax0 = int(np.clip(round(min(x0, x1) * ww), 0, ww))
-        ax1 = int(np.clip(round(max(x0, x1) * ww), 0, ww))
-        ay0 = int(np.clip(round(min(y0, y1) * wh), 0, wh))
-        ay1 = int(np.clip(round(max(y0, y1) * wh), 0, wh))
-        if ax1 <= ax0 or ay1 <= ay0:
-            cap.release()
-            return empty, {}
-        mask_roi = np.zeros((wh, ww), bool)
-        mask_roi[ay0:ay1, ax0:ax1] = True
-
-    K = max(1, int(window))
-    WIN = 2 * K + 1
-    emit(0.02, tr("shuttle.detect_candidates"))
 
     # The ring buffer stores only uint8: W = min(R,G,B) is naturally in 0..255, and GEX with a 128
     # offset also fits (the court prior only cares whether gex is greater than ~35, so clipping to
@@ -695,7 +776,7 @@ def _run(
     wq: collections.deque = collections.deque(maxlen=WIN)
     gq: collections.deque = collections.deque(maxlen=WIN)
     bright_acc = np.zeros((wh, ww), np.float32)             # static white-region accumulation
-    n_read = 0          # number of source frames read
+    n_read = 0          # number of sampled frames read
     n_samp = 0          # number of frames sampled (= output timeline length)
     per_frame: dict[int, list[tuple[float, float, float, float]]] = {}
     top_frames: list[tuple[int, int]] = []
@@ -724,56 +805,313 @@ def _run(
             per_frame[frame_no] = pts
             top_frames.append((frame_no, len(pts)))
 
-    idx = 0
-    while True:
-        if cancel is not None and cancel():
-            break
-        if not cap.grab():
-            break
-        if idx % step != 0 and idx != 0:
+    try:
+        idx = 0
+        while True:
+            if cancel is not None and cancel():
+                break
+            if not cap.grab():
+                break
+            if idx % step != 0 and idx != 0:
+                idx += 1
+                continue
+            ok, frame = cap.retrieve()
             idx += 1
-            continue
-        ok, frame = cap.retrieve()
-        idx += 1
-        if not ok or frame is None:
-            continue
-        if n_read >= limit_frames:
-            break
-        n_read += 1
+            if not ok or frame is None:
+                continue
+            if n_read >= limit_sampled:
+                break
+            n_read += 1
 
-        if frame.shape[1] != ww or frame.shape[0] != wh:
-            frame_w = cv2.resize(frame, (ww, wh), interpolation=cv2.INTER_AREA)
-        else:
-            frame_w = frame
-        w, gex = _white_map(frame_w)
-        # GEX is stored as uint8 after adding 128 (saves memory); the court prior only cares whether it exceeds ~35
-        gq.append(np.clip(gex + 128.0, 0, 255).astype(np.uint8))
-        bright_acc += (w > 150.0)
-        wq.append(np.clip(w, 0, 255).astype(np.uint8))
+            if frame.shape[1] != ww or frame.shape[0] != wh:
+                frame_w = cv2.resize(frame, (ww, wh), interpolation=cv2.INTER_AREA)
+            else:
+                frame_w = frame
+            w, gex = _white_map(frame_w)
+            # GEX is stored as uint8 after adding 128 (saves memory); the court prior only cares whether it exceeds ~35
+            gq.append(np.clip(gex + 128.0, 0, 255).astype(np.uint8))
+            bright_acc += (w > 150.0)
+            wq.append(np.clip(w, 0, 255).astype(np.uint8))
 
-        if len(wq) < WIN:
-            # Warm-up: the temporal reference has not been established yet, so any "novelty" is
-            # untrustworthy. The footage measurably has an auto-exposure rise at the start (+22 gray
-            # levels / 8 frames), and forcing candidates during warm-up would explode hundreds of
-            # false points at once, so simply wait for the window to fill before starting.
+            if len(wq) < WIN:
+                # Warm-up: the temporal reference has not been established yet, so any "novelty" is
+                # untrustworthy. The footage measurably has an auto-exposure rise at the start (+22 gray
+                # levels / 8 frames), and forcing candidates during warm-up would explode hundreds of
+                # false points at once, so simply wait for the window to fill before starting.
+                n_samp += 1
+                continue
+
+            cur = n_samp                      # index of the current frame on the timeline
             n_samp += 1
-            continue
+            # Window full: the target is the center frame, i.e. the frame K frames back
+            process(K, cur - K)
 
-        cur = n_samp                      # index of the current frame on the timeline
-        n_samp += 1
-        # Window full: the target is the center frame, i.e. the frame K frames back
-        process(K, cur - K)
+            if n_read % 16 == 0:
+                # Progress is measured in source-frame grabs (idx counts every grab,
+                # including the step-1 frames skipped between samples).
+                p = idx / float(min(total, limit_src)) if total else 0.5
+                emit(0.02 + 0.73 * min(1.0, p), tr("shuttle.detect_candidates"))
 
-        if n_read % 16 == 0:
-            p = n_read / float(min(total, limit_frames)) if total else 0.5
-            emit(0.02 + 0.73 * min(1.0, p), tr("shuttle.detect_candidates"))
+        # Wrap-up: once the window is full, the last K frames have not been processed; finish them in the final window from the center onward
+        done_all = cancel is None or not cancel()
+        if done_all and len(wq) == WIN and n_samp > K:
+            for r in range(K + 1, WIN):
+                process(r, n_samp - (WIN - 1 - r))
+    finally:
+        cap.release()
+    return per_frame, top_frames, n_samp, n_read
 
-    # Wrap-up: once the window is full, the last K frames have not been processed; finish them in the final window from the center onward
-    done_all = cancel is None or not cancel()
-    if done_all and len(wq) == WIN and n_samp > K:
-        for r in range(K + 1, WIN):
-            process(r, n_samp - (WIN - 1 - r))
+
+def _scan_candidates_gpu(
+    video_path: str,
+    *,
+    ww: int, wh: int, step: int, limit_src: int, limit_sampled: int,
+    K: int, WIN: int,
+    thr: dict, mask_roi: np.ndarray | None, total: int, emit, cancel,
+) -> tuple[dict, list, int, int]:
+    """GPU twin of :func:`_scan_candidates_cpu` (torch CUDA).
+
+    Hot per-frame numpy work — window float32 rebuild, per-frame global medians and the
+    per-pixel 85th-percentile reference — runs as tensor ops; binary morphology uses
+    thresholded 3x3 convolutions with the exact cv2 structuring elements. Only the final
+    uint8 mask is downloaded for cv2 connected-components + the shared component scorer,
+    and full frames are downloaded only when an area-sized component actually survives.
+    """
+    import cv2
+    import torch
+    import torch.nn.functional as F
+
+    if not _gpu_available():
+        raise RuntimeError("torch.cuda is unavailable")
+    dev = "cuda"
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频: {video_path}")
+
+    # Ring kept in insertion order (torch.roll on each new frame once full): ~2*32 MB fp16,
+    # vs rebuilding a WINxHxW float32 stack every frame on the CPU path.
+    ring = torch.empty((WIN, wh, ww), dtype=torch.float16, device=dev)
+    gex_ring = torch.empty((WIN, wh, ww), dtype=torch.uint8, device=dev)
+    medians: collections.deque = collections.deque(maxlen=WIN)      # per-frame W median, window order
+    bright = torch.zeros((wh, ww), dtype=torch.float32, device=dev)
+    roi_t = torch.from_numpy(mask_roi).to(dev) if mask_roi is not None else None
+    cross_k = _bin_kernel(_CROSS3, dev)
+    square_k = _bin_kernel(_SQUARE3, dev)
+    # numpy uses 0-based np.partition index round((T-1)*0.85); torch.kthvalue is 1-based
+    kth = int(round((WIN - 1) * 0.85)) + 1
+    n_read = 0
+    n_samp = 0
+    n_seen = 0                  # frames inserted (warm-up included)
+    per_frame: dict[int, list[tuple[float, float, float, float]]] = {}
+    top_frames: list[tuple[int, int]] = []
+
+    def process(target_local: int, frame_no: int) -> None:
+        gm_list = list(medians)
+        off = gm_list[target_local]
+        gm_t = torch.tensor(gm_list, dtype=torch.float16, device=dev)
+        if any(abs(g - off) > 0.5 for g in gm_list):
+            aligned = ring + (off - gm_t).view(WIN, 1, 1)
+        else:
+            aligned = ring
+        w_now = aligned[target_local]
+        w_ref = torch.kthvalue(aligned, kth, dim=0).values
+        m = (w_now - w_ref > float(thr["nov"])) & (w_now > float(thr["w"]))
+
+        frac = n_samp / max(1.0, float(n_read))
+        if frac > 0.15:
+            sw = (bright > (0.35 * n_read))
+            static_t = _bin_dilate_t(sw, square_k)
+            m = m & ~static_t
+        if roi_t is not None:
+            m = m & roi_t
+        if int(thr["open"]) >= 3:
+            ero = _bin_erode(m, cross_k)
+            m = _bin_dilate_t(ero, cross_k)
+        if not bool(m.any()):
+            return
+
+        m8 = m.to(torch.uint8).cpu().numpy()
+        # Cheap area pre-gate before paying for the full-frame downloads the scorer needs.
+        nl, _lab, st, _cent = cv2.connectedComponentsWithStats(m8, connectivity=8)
+        if nl <= 1:
+            return
+        areas = st[1:, cv2.CC_STAT_AREA]
+        if not int(((areas >= int(thr["area_min"])) & (areas <= int(thr["area_max"]))).sum()):
+            return
+
+        w_np = w_now.float().cpu().numpy()
+        ref_np = w_ref.float().cpu().numpy()
+        g_np = (gex_ring[target_local].to(torch.float32) - 128.0).cpu().numpy()
+        pts = _score_components(m8, w_np, ref_np, g_np, thr)
+        if pts:
+            per_frame[frame_no] = pts
+            top_frames.append((frame_no, len(pts)))
+
+    try:
+        idx = 0
+        while True:
+            if cancel is not None and cancel():
+                break
+            if not cap.grab():
+                break
+            if idx % step != 0 and idx != 0:
+                idx += 1
+                continue
+            ok, frame = cap.retrieve()
+            idx += 1
+            if not ok or frame is None:
+                continue
+            if n_read >= limit_sampled:
+                break
+            n_read += 1
+
+            if frame.shape[1] != ww or frame.shape[0] != wh:
+                frame_w = cv2.resize(frame, (ww, wh), interpolation=cv2.INTER_AREA)
+            else:
+                frame_w = frame
+            w, gex = _white_map(frame_w)
+            w_t = torch.from_numpy(np.clip(w, 0, 255).astype(np.uint8)).to(dev)
+            g_t = torch.from_numpy(np.clip(gex + 128.0, 0, 255).astype(np.uint8)).to(dev)
+            w_h = w_t.to(torch.float16)
+            bright += (w_h > 150.0).to(torch.float32)
+            if n_seen < WIN:
+                ring[n_seen] = w_h
+                gex_ring[n_seen] = g_t
+            else:
+                ring = torch.roll(ring, -1, dims=0)
+                gex_ring = torch.roll(gex_ring, -1, dims=0)
+                ring[-1] = w_h
+                gex_ring[-1] = g_t
+            n_seen += 1
+            medians.append(float(w_h.median()))
+
+            if len(medians) < WIN:
+                # Warm-up identical to the CPU path: no candidate until the temporal window is full.
+                n_samp += 1
+                continue
+
+            cur = n_samp
+            n_samp += 1
+            process(K, cur - K)
+
+            if n_read % 16 == 0:
+                # Progress is measured in source-frame grabs (idx counts every grab,
+                # including the step-1 frames skipped between samples).
+                p = idx / float(min(total, limit_src)) if total else 0.5
+                emit(0.02 + 0.73 * min(1.0, p), tr("shuttle.detect_candidates"))
+
+        done_all = cancel is None or not cancel()
+        if done_all and len(medians) == WIN and n_samp > K:
+            for r in range(K + 1, WIN):
+                process(r, n_samp - (WIN - 1 - r))
+    finally:
+        cap.release()
+    return per_frame, top_frames, n_samp, n_read
+
+
+def _run(
+    video_path: str,
+    sample_fps: float,
+    roi: tuple[float, float, float, float] | None,
+    max_seconds: float,
+    sensitivity: float,
+    on_progress,
+    cancel,
+    *,
+    work_width: int = 0,
+    window: int = DEFAULT_WINDOW,
+    min_points: int = DEFAULT_MIN_POINTS,
+    max_gap: int = DEFAULT_MAX_GAP,
+    min_speed: float = DEFAULT_MIN_SPEED,
+    max_speed: float = DEFAULT_MAX_SPEED,
+    max_resid: float = DEFAULT_MAX_RESID,
+    min_span: float = DEFAULT_MIN_SPAN,
+    min_accel: float = DEFAULT_MIN_ACCEL,
+    court_gex: float | None = None,
+    backend: str | None = None,
+    want_debug: bool = False,
+) -> tuple[ShuttleSignal, dict]:
+    import cv2
+
+    def emit(p: float, s: str) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(float(np.clip(p, 0.0, 1.0)), s)
+            except Exception:
+                pass
+
+    empty = ShuttleSignal(fps=0.0, duration=0.0)
+    if not video_path:
+        return empty, {}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频: {video_path}")
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
+    if src_w <= 0 or src_h <= 0:
+        return empty, {}
+
+    # ---- working resolution
+    ww = int(work_width) if work_width and work_width > 0 else min(src_w, DEFAULT_WORK_WIDTH)
+    ww = max(64, min(ww, src_w))
+    scale = ww / float(src_w)
+    wh = max(2, int(round(src_h * scale)))
+    wf = float(wh) / REF_HEIGHT            # scaling relative to the reference height
+    thr = _sensitivity_thresholds(sensitivity, wf, wh, court_gex)
+
+    step = max(1, int(round(src_fps / max(1e-3, float(sample_fps)))))
+    eff_fps = src_fps / step
+    # The scan break compares against a counter of SAMPLED frames, so the budget must
+    # be converted in sampled-frame units; the source-frame limit is only the progress
+    # denominator. Mixing the two used to stretch the analyzed span by ``step``.
+    if max_seconds and max_seconds > 0:
+        limit_src = int(max_seconds * src_fps)
+        limit_sampled = int(round(max_seconds * eff_fps))
+    else:
+        # Whole-video mode (max_seconds=0): keep the previous big-sentinel semantics.
+        limit_src = limit_sampled = total or 10 ** 9
+
+    # ---- ROI mask
+    mask_roi = None
+    if roi is not None:
+        x0, y0, x1, y1 = roi
+        ax0 = int(np.clip(round(min(x0, x1) * ww), 0, ww))
+        ax1 = int(np.clip(round(max(x0, x1) * ww), 0, ww))
+        ay0 = int(np.clip(round(min(y0, y1) * wh), 0, wh))
+        ay1 = int(np.clip(round(max(y0, y1) * wh), 0, wh))
+        if ax1 <= ax0 or ay1 <= ay0:
+            return empty, {}
+        mask_roi = np.zeros((wh, ww), bool)
+        mask_roi[ay0:ay1, ax0:ax1] = True
+
+    K = max(1, int(window))
+    WIN = 2 * K + 1
+    emit(0.02, tr("shuttle.detect_candidates"))
+
+    # ---- candidate scan: GPU (torch CUDA) when available, CPU reference otherwise.
+    # An auto-selected GPU failure must degrade silently: re-run the whole scan on CPU and
+    # record the reason on the signal instead of dropping the shuttle stage entirely.
+    scan_kw = dict(
+        video_path=str(video_path), ww=ww, wh=wh, step=step,
+        limit_src=limit_src, limit_sampled=limit_sampled,
+        K=K, WIN=WIN, thr=thr, mask_roi=mask_roi, total=total, emit=emit, cancel=cancel,
+    )
+    backend_used = _resolve_backend(backend)
+    backend_fallback = ""
+    if backend_used == "gpu":
+        try:
+            per_frame, top_frames, n_samp, n_read = _scan_candidates_gpu(**scan_kw)
+        except Exception as exc:
+            backend_fallback = f"{type(exc).__name__}: {exc}"
+            per_frame, top_frames, n_samp, n_read = _scan_candidates_cpu(**scan_kw)
+            backend_used = "cpu"
+    else:
+        per_frame, top_frames, n_samp, n_read = _scan_candidates_cpu(**scan_kw)
     emit(0.78, tr("shuttle.associate_tracks"))
 
     n_frames = n_samp
@@ -834,6 +1172,9 @@ def _run(
         presence=presence,
         candidate_count=cand_count,
         max_candidate_speed=max_speed_arr,
+        in_flight=build_in_flight(tracks, n_frames),
+        backend=backend_used,
+        backend_fallback=backend_fallback,
     )
     if not want_debug:
         return sig, {}
@@ -845,6 +1186,8 @@ def _run(
         "width": ww,
         "height": wh,
         "step": step,
+        "backend": backend_used,
+        "backend_fallback": backend_fallback,
     }
     return sig, dbg
 

@@ -215,6 +215,26 @@ class AnalysisParams(BaseModel):
     #: One swing can explain only one hit. This one-to-one constraint is the main reason the gate works
     #: (it removes the extra neighboring-court sounds that happen to coincide with our swing).
     pose_gate_one_to_one: bool = True
+    #: ---- Boundary refinement (local evidence tie-breaker) ----
+    #: Off by default: segmentation only moves a quiet-span boundary when a locally-calibrated
+    #: motion/hit/swing template clearly prefers a nearby valley (``boundary.py``). Disabled, old
+    #: projects and pose-unavailable videos produce byte-identical intervals to the current pipeline.
+    use_boundary_refine: bool = False
+    #: How far (seconds) a boundary is allowed to move from the quiet-span edge.
+    boundary_max_move: float = 3.0
+    #: Required score advantage of the best candidate over the current boundary.
+    boundary_score_margin: float = 0.12
+    #: ---- Fusion base weights (rally.fuse) ----
+    #: Multipliers of the five activity components BEFORE the per-signal discriminative-power /
+    #: audio-reliability factors. Defaults equal rally.DEFAULT_BASE_WEIGHTS; the annotation
+    #: optimizer can calibrate them offline, and resegment re-fuses the stored full-rate component
+    #: curves (no AI rerun) when any value differs from the default.
+    fuse_weight_players: float = 1.35
+    fuse_weight_motion: float = 1.0
+    fuse_weight_audio: float = 0.95
+    fuse_weight_shuttle: float = 0.9
+    fuse_weight_roi: float = 0.8
+
     #: Force-apply the gate even when the retention ratio falls outside the safe band. By default an
     #: out-of-band ratio makes the gate silently pass all hits through (protection against a broken pose
     #: signal); turning this on lets the user insist on filtering anyway.
@@ -305,6 +325,16 @@ class AnalysisParams(BaseModel):
     max_frames: int = 0
     #: Analysis frame rate
     sample_fps: float = 15.0
+
+    def fuse_weight_base(self) -> dict[str, float]:
+        """Component-key -> base weight (component keys are rally.fuse canonical names)."""
+        return {
+            "players": float(self.fuse_weight_players),
+            "motion": float(self.fuse_weight_motion),
+            "audio_hits": float(self.fuse_weight_audio),
+            "shuttle": float(self.fuse_weight_shuttle),
+            "roi": float(self.fuse_weight_roi),
+        }
 
     @field_validator("speech_phrases", mode="before")
     @classmethod

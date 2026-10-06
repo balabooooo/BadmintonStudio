@@ -23,6 +23,7 @@ torch; automatically falls back to CPU when there is no GPU.
 from __future__ import annotations
 
 import bisect
+import hashlib
 import math
 import os
 import threading
@@ -37,12 +38,15 @@ from .court_calib import point_in_poly
 
 # ------------------------------------------------------------------ constants
 
-#: Boxes below this confidence are ignored outright (for tracking)
-LOW_CONF = 0.15
+#: Boxes below this confidence are ignored outright (for tracking and for the visualization cache).
+#: 0.10 (not the historical 0.15): everything above it is stored and fed to ByteTrack, whose stage-two
+#: low-score association (`BT_LOW_THRESH`) then has 0.10~0.25 boxes available to rescue occluded tracks
+#: and to expose "detected but dropped" misses in the annotation overlay.
+LOW_CONF = 0.10
 
 # ---- ByteTrack (ultralytics built-in implementation) parameters ----
 #: Stage one only associates "high-score boxes"; boxes below it go to stage two, used to reconnect trajectories during occlusion.
-#: Works together with :data:`LOW_CONF`: detection keeps boxes with ≥0.15, so 0.15~0.25 precisely goes through stage two.
+#: Works together with :data:`LOW_CONF`: detection keeps boxes with ≥0.10, so 0.10~0.25 precisely goes through stage two.
 BT_HIGH_THRESH = 0.25
 #: Lower bound for stage-two "low-score boxes"; below it they do not participate in association at all.
 BT_LOW_THRESH = 0.10
@@ -137,6 +141,72 @@ class PlayerSignal:
     frame_boxes: list[list[tuple[int, float, float, float, float]]] = field(default_factory=list)
     #: Statistics for person-box size filtering (pre-filter box-height distribution, how many were dropped, reference scale), for UI parameter tuning
     size_stats: dict[str, Any] = field(default_factory=dict)
+    #: Cache tag of the persisted per-frame box npz (empty when caching failed/was skipped); not part of any derived signal
+    cache_tag: str = ""
+
+
+# ------------------------------------------------------------------ match format (singles / doubles)
+
+#: Stable result codes (stats only; the UI translates them at display time).
+MATCH_FORMAT_SINGLE = "single"
+MATCH_FORMAT_DOUBLES = "doubles"
+MATCH_FORMAT_UNKNOWN = "unknown"
+#: Fractions are computed over frames with at least one active player (detection gaps
+#: excluded); require enough such evidence before committing to a verdict.
+MATCH_MIN_COVERED_FRAC = 0.30
+MATCH_MIN_EVIDENCE_FRAMES = 300
+#: Doubles: four players present at least this often, OR at least three at least this often.
+MATCH_FRAC_GE4_DOUBLES = 0.34
+MATCH_FRAC_GE3_DOUBLES = 0.60
+#: Singles: three or more players essentially never present.
+MATCH_FRAC_GE3_MAX_SINGLE = 0.15
+
+
+def match_format_stats(active_count: np.ndarray | Sequence[float],
+                       fps: float = 0.0) -> dict[str, Any]:
+    """Guess singles vs doubles from the per-frame active-player count.
+
+    Returns a trace dict with the stable code ``single | doubles | unknown`` and the
+    evidence behind it. The verdict is deliberately conservative: detection gaps are
+    excluded from the denominator, and ambiguous footage stays ``unknown`` instead of
+    forcing a label. This is a **recommendation only** — callers must never silently
+    switch parameter presets based on it.
+
+    Threshold rationale (validated qualitatively against clip1-3): a side-court
+    doubles rally shows >=4 active players on roughly a third+ of the covered frames
+    and >=3 on a large majority; a singles rally shows >=3 only on transient ID-split
+    noise (<15%).
+    """
+    a = np.asarray(active_count, dtype=np.float32)
+    total = int(a.size)
+    present = a >= 1
+    n_present = int(present.sum())
+    present_frac = round(n_present / total, 4) if total else 0.0
+    frac_ge3 = round(float(np.count_nonzero(a >= 3) / n_present), 4) if n_present else 0.0
+    frac_ge4 = round(float(np.count_nonzero(a >= 4) / n_present), 4) if n_present else 0.0
+    fmt = MATCH_FORMAT_UNKNOWN
+    if total and n_present >= MATCH_MIN_EVIDENCE_FRAMES \
+            and present_frac >= MATCH_MIN_COVERED_FRAC:
+        if frac_ge4 >= MATCH_FRAC_GE4_DOUBLES or frac_ge3 >= MATCH_FRAC_GE3_DOUBLES:
+            fmt = MATCH_FORMAT_DOUBLES
+        elif frac_ge3 <= MATCH_FRAC_GE3_MAX_SINGLE:
+            fmt = MATCH_FORMAT_SINGLE
+    return {
+        "format": fmt,
+        "frac_ge3": frac_ge3,
+        "frac_ge4": frac_ge4,
+        "present_frac": present_frac,
+        "frames": total,
+        "present_frames": n_present,
+        "fps": round(float(fps), 3),
+        "thresholds": {
+            "min_covered_frac": MATCH_MIN_COVERED_FRAC,
+            "min_evidence_frames": MATCH_MIN_EVIDENCE_FRAMES,
+            "frac_ge4_doubles": MATCH_FRAC_GE4_DOUBLES,
+            "frac_ge3_doubles": MATCH_FRAC_GE3_DOUBLES,
+            "frac_ge3_max_single": MATCH_FRAC_GE3_MAX_SINGLE,
+        },
+    }
 
 
 # ------------------------------------------------------------------ small utilities
@@ -1371,7 +1441,8 @@ def analyze_players(
         raise RuntimeError(f"无法导入 ultralytics: {exc}") from exc
 
     model = YOLO(weights)
-    # Tracking needs looser boxes (to pass through brief occlusion), but anything below 0.15 is not trusted
+    # Tracking and the visualization cache need looser boxes (to pass through brief occlusion and to
+    # expose low-confidence misses); anything below LOW_CONF (0.10) is not trusted
     det_conf = float(min(conf, LOW_CONF))
 
     tracker = _ByteTracker(fps=eff_fps, aspect=aspect)
@@ -1454,6 +1525,10 @@ def analyze_players(
     # Raw detection boxes per sampled frame (normalized, including background people). Used to
     # adaptively estimate "roughly how big the players are in this match", see `_box_size_stats`.
     det_frames: list[list[tuple[float, float, float, float]]] = []
+    # Every trusted detection (box + confidence) per sampled frame, **before** the size filter —
+    # the exact set the tracker had to work with. Persisted into the v2 boxes npz so the annotation
+    # overlay can draw "detected but untracked" boxes as a miss-diagnosis layer.
+    raw_dets: list[list[tuple[tuple[float, float, float, float], float]]] = []
     # ---- size-filter statistics (counting **pre-filter** boxes, so the UI can depict "what was cut")
     #: Each entry [box height, box area, this frame's reference box height]
     size_samples: list[list[float]] = []
@@ -1508,7 +1583,9 @@ def analyze_players(
         if len(buf) >= batch_size:
             results = _predict(buf)
             for k, res in enumerate(results):
-                dets = _apply_size_filter(_dets_of(res))
+                dets_raw = _dets_of(res)
+                raw_dets.append(dets_raw)
+                dets = _apply_size_filter(dets_raw)
                 det_frames.append([b for b, _c in dets])
                 tracker.update(buf_idx[k], buf_idx[k] * step_dt, dets)
             buf.clear()
@@ -1519,7 +1596,9 @@ def analyze_players(
     if buf and not _cancelled():
         results = _predict(buf)
         for k, res in enumerate(results):
-            dets = _apply_size_filter(_dets_of(res))
+            dets_raw = _dets_of(res)
+            raw_dets.append(dets_raw)
+            dets = _apply_size_filter(dets_raw)
             det_frames.append([b for b, _c in dets])
             tracker.update(buf_idx[k], buf_idx[k] * step_dt, dets)
         buf.clear()
@@ -1553,6 +1632,8 @@ def analyze_players(
     crowd_sp: list[list[float]] = [[] for _ in range(n)]
     max_sp = np.zeros(n, dtype=np.float32)
     boxes_map: list[dict[int, tuple[int, float, float, float, float]]] = [dict() for _ in range(n)]
+    # Per-observation detection confidence, parallel to boxes_map rows (v2 cache column).
+    confs_map: list[dict[int, float]] = [dict() for _ in range(n)]
     active_set = set(active_ids)
 
     for tk in tracks:
@@ -1567,6 +1648,7 @@ def analyze_players(
                 active_sp[i].append(s)
                 b = tk.boxes[j]
                 boxes_map[i][tk.track_id] = (tk.track_id, float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                confs_map[i][tk.track_id] = float(tk.confidences[j])
 
     active_count = np.asarray([len(s) for s in active_present], dtype=np.float32)
     active_speed = np.asarray(
@@ -1576,11 +1658,30 @@ def analyze_players(
         [float(np.mean(v)) if v else 0.0 for v in crowd_sp], dtype=np.float32
     )
     frame_boxes = [list(m.values()) for m in boxes_map]
+    frame_confs = [list(m.values()) for m in confs_map]
 
     size_stats = _build_size_stats(
         sf, size_samples, size_dropped, size_frames,
         float((_box_size_stats(det_frames, aspect) or {}).get("ref", 0.0)) if det_frames else 0.0,
     )
+
+    # Persist the compact per-frame box cache for later visualization / pose rebuilds. A cancelled
+    # run covers only part of the video while the cache key describes the whole video, so skip it;
+    # any failure degrades silently (cache_tag stays empty) exactly like the other cache writes.
+    cache_tag = ""
+    if not _cancelled():
+        try:
+            cache_tag = boxes_cache_tag(
+                video_path, sample_fps=float(sample_fps), roi=roi, roi_poly=roi_poly,
+                viewpoint=viewpoint, size_filter=sf, model_name=model_name,
+                imgsz=imgsz, conf=conf, max_seconds=max_seconds,
+            )
+            if not save_boxes_cache(cache_tag, frame_boxes, float(sample_fps),
+                                    float(duration), active_ids,
+                                    frame_confs=frame_confs, raw_dets=raw_dets):
+                cache_tag = ""
+        except Exception:
+            cache_tag = ""
 
     _report(1.0, tr("players.done"))
     return PlayerSignal(
@@ -1594,7 +1695,254 @@ def analyze_players(
         active_player_ids=active_ids,
         frame_boxes=frame_boxes,
         size_stats=size_stats,
+        cache_tag=cache_tag,
     )
+
+
+# ------------------------------------------------------------------ per-frame box cache
+
+#: Cache format version. Bump when the npz layout changes; loaders treat an unknown version as a miss.
+#: v2 adds per-row detection ``conf`` (uint8 ×255) plus raw pre-size-filter detections
+#: (``raw_frame`` / ``raw_boxes`` / ``raw_conf``). The loader still accepts v1 files (no conf, no raw).
+BOXES_CACHE_VERSION = 2
+#: Normalized box coordinates are quantized to uint16 (resolution ~1.5e-5 of the frame, sub-pixel on a 960px proxy)
+_BOX_QUANT = 65535.0
+#: Confidence quantization for the uint8 conf columns (resolution ~0.004)
+_CONF_QUANT = 255.0
+
+
+def default_boxes_dir() -> Path | None:
+    """Directory of the compact per-frame box cache (``data/cache/boxes``)."""
+    try:
+        from ..config import CACHE_DIR  # type: ignore
+
+        return Path(CACHE_DIR) / "boxes"
+    except Exception:  # pragma: no cover - fallback for standalone runs
+        return _ROOT / "data" / "cache" / "boxes"
+
+
+def _size_filter_signature(sf: "SizeFilter") -> str:
+    return "sf=%s|%.5f|%.5f|%.5f|%.5f" % (
+        sf.mode, sf.min_height, sf.max_height, sf.min_area, sf.max_area)
+
+
+def boxes_cache_tag(
+    video_path: str,
+    sample_fps: float,
+    roi: tuple[float, float, float, float] | None = None,
+    roi_poly: list[list[float]] | None = None,
+    viewpoint: str = "unknown",
+    size_filter: "SizeFilter | dict | None" = None,
+    model_name: str = "yolo11n.pt",
+    imgsz: int = 640,
+    conf: float = 0.25,
+    max_seconds: float = 0.0,
+) -> str:
+    """Deterministic 16-hex fingerprint of a player-box analysis run.
+
+    Everything that can change the selected per-frame boxes must be part of the key: the video
+    file (path/size/mtime), sampling rate, court ROI / polygon, viewpoint (it changes selection and
+    geometric filtering), size filter, and detector weights/settings.
+    """
+    try:
+        vp = Path(video_path).resolve()
+        st = vp.stat()
+        stamp = f"{vp}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        stamp = str(video_path)
+    roi_s = "r=" + ",".join(f"{float(v):.5f}" for v in roi) if roi else "r="
+    poly_s = ""
+    if roi_poly:
+        poly_s = "p=" + ";".join(f"{float(p[0]):.5f},{float(p[1]):.5f}" for p in roi_poly)
+    parts = [
+        stamp,
+        f"fps={float(sample_fps):.4f}",
+        roi_s,
+        poly_s,
+        f"vp={viewpoint or 'unknown'}",
+        _size_filter_signature(size_filter_from(size_filter)),
+        f"m={model_name}",
+        f"img={int(imgsz)}",
+        f"conf={float(conf):.3f}",
+        # Detection floor: it changes which boxes exist at all (v1 caches were built at 0.15,
+        # v2 at LOW_CONF=0.10 with raw detections persisted), so it must split the key space.
+        f"low={LOW_CONF:.2f}",
+        f"lim={float(max_seconds):.1f}",
+    ]
+    return hashlib.sha1("|".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def boxes_cache_path(tag: str, cache_dir: str | Path | None = None) -> Path | None:
+    """Resolve ``boxes_<tag>.npz`` under the given (or default) cache directory."""
+    if not tag:
+        return None
+    d = Path(cache_dir) if cache_dir is not None else default_boxes_dir()
+    if d is None:
+        return None
+    return d / f"boxes_{tag}.npz"
+
+
+def save_boxes_cache(
+    tag: str,
+    frame_boxes: list[list[tuple[int, float, float, float, float]]],
+    fps: float,
+    duration: float,
+    active_ids: Sequence[int] = (),
+    cache_dir: str | Path | None = None,
+    frame_confs: list[list[float]] | None = None,
+    raw_dets: list[list[tuple[tuple[float, float, float, float], float]]] | None = None,
+) -> bool:
+    """Persist per-frame active-player boxes as a compact compressed npz (v2 layout).
+
+    Layout (flat rows, one row per ``(frame, track)`` observation):
+    ``frame`` int32, ``track`` int32, ``boxes`` uint16×4 (normalized 0~1 quantized),
+    ``conf`` uint8 (×255, v2; aligned with the ``frame``/``track`` rows).
+    Raw pre-size-filter detections (``raw_frame`` int32, ``raw_boxes`` uint16×4,
+    ``raw_conf`` uint8) capture every trusted detection for the overlay's
+    miss-diagnosis layer — they carry no track id (that is the point: untracked boxes).
+    Never raises: returns ``False`` and lets the caller degrade silently.
+    """
+    path = boxes_cache_path(tag, cache_dir)
+    if path is None:
+        return False
+    try:
+        n = int(len(frame_boxes))
+        frames: list[int] = []
+        tracks: list[int] = []
+        rows: list[list[float]] = []
+        confs: list[float] = []
+        for i, fr in enumerate(frame_boxes):
+            for k, item in enumerate(fr or ()):
+                if len(item) < 5:
+                    continue
+                frames.append(i)
+                tracks.append(int(item[0]))
+                rows.append([float(item[1]), float(item[2]), float(item[3]), float(item[4])])
+                c = 1.0
+                if frame_confs is not None and i < len(frame_confs) and k < len(frame_confs[i]):
+                    c = float(frame_confs[i][k])
+                confs.append(min(1.0, max(0.0, c)))
+        if rows:
+            quant = np.round(np.clip(np.asarray(rows, dtype=np.float64), 0.0, 1.0)
+                             * _BOX_QUANT).astype(np.uint16)
+            conf_arr = np.round(np.asarray(confs, dtype=np.float64) * _CONF_QUANT).astype(np.uint8)
+            frame_arr = np.asarray(frames, dtype=np.int32)
+            track_arr = np.asarray(tracks, dtype=np.int32)
+        else:
+            quant = np.zeros((0, 4), dtype=np.uint16)
+            conf_arr = np.zeros(0, dtype=np.uint8)
+            frame_arr = np.zeros(0, dtype=np.int32)
+            track_arr = np.zeros(0, dtype=np.int32)
+
+        raw_frame_arr = np.zeros(0, dtype=np.int32)
+        raw_quant = np.zeros((0, 4), dtype=np.uint16)
+        raw_conf_arr = np.zeros(0, dtype=np.uint8)
+        if raw_dets:
+            rf: list[int] = []
+            rr: list[list[float]] = []
+            rc: list[float] = []
+            for i, fr in enumerate(raw_dets):
+                for b, c in fr or ():
+                    rf.append(i)
+                    rr.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+                    rc.append(min(1.0, max(0.0, float(c))))
+            if rr:
+                raw_frame_arr = np.asarray(rf, dtype=np.int32)
+                raw_quant = np.round(np.clip(np.asarray(rr, dtype=np.float64), 0.0, 1.0)
+                                     * _BOX_QUANT).astype(np.uint16)
+                raw_conf_arr = np.round(np.asarray(rc, dtype=np.float64) * _CONF_QUANT).astype(np.uint8)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the .npz suffix: np.savez_compressed appends ".npz" itself when absent, which would
+        # leave the temp file under a different name than os_replace expects.
+        tmp = path.with_suffix(".tmp.npz")
+        np.savez_compressed(
+            tmp,
+            version=np.int64(BOXES_CACHE_VERSION),
+            fps=np.float64(fps),
+            duration=np.float64(duration),
+            n=np.int64(n),
+            active_ids=np.asarray(list(active_ids or []), dtype=np.int32),
+            frame=frame_arr,
+            track=track_arr,
+            boxes=quant,
+            conf=conf_arr,
+            raw_frame=raw_frame_arr,
+            raw_boxes=raw_quant,
+            raw_conf=raw_conf_arr,
+        )
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_boxes_cache(tag_or_path: str | Path, cache_dir: str | Path | None = None) -> dict | None:
+    """Load a box cache produced by :func:`save_boxes_cache` (v1 and v2 layouts).
+
+    Returns ``{"frame_boxes", "fps", "duration", "active_ids", "tag"}`` plus, for v2 files,
+    ``"frame_confs"`` (per-row detection confidence aligned with ``frame_boxes``) and
+    ``"raw_dets"`` (per sampled frame ``[(x1, y1, x2, y2, conf), ...]`` pre-size-filter
+    detections). v1 files load with ``frame_confs=None, raw_dets=None`` — the overlay then
+    simply has no conf to filter on and no diagnosis layer. ``None`` on any miss / unknown
+    version / corrupt file.
+    """
+    try:
+        p = Path(str(tag_or_path))
+        if not p.is_file():
+            p = boxes_cache_path(str(tag_or_path), cache_dir)  # type: ignore[arg-type]
+        if p is None or not p.is_file():
+            return None
+        z = np.load(p, allow_pickle=False)
+        if "version" not in z.files:
+            return None
+        version = int(z["version"])
+        if version not in (1, BOXES_CACHE_VERSION):
+            return None
+        n = int(z["n"])
+        frame_idx = z["frame"].astype(np.int64)
+        track = z["track"].astype(np.int64)
+        coords = z["boxes"].astype(np.float32) / _BOX_QUANT
+        has_conf = version >= 2 and "conf" in z.files
+        conf_col = (z["conf"].astype(np.float32) / _CONF_QUANT) if has_conf else None
+        frame_boxes: list[list[tuple[int, float, float, float, float]]] = [[] for _ in range(n)]
+        frame_confs: list[list[float]] | None = [[] for _ in range(n)] if has_conf else None
+        for row in range(frame_idx.shape[0]):
+            i = int(frame_idx[row])
+            if 0 <= i < n and coords.shape[1] == 4:
+                frame_boxes[i].append((
+                    int(track[row]),
+                    float(coords[row, 0]), float(coords[row, 1]),
+                    float(coords[row, 2]), float(coords[row, 3]),
+                ))
+                if frame_confs is not None and conf_col is not None:
+                    frame_confs[i].append(float(conf_col[row]))
+
+        raw_dets: list[list[tuple[float, float, float, float, float]]] | None = None
+        if version >= 2 and "raw_frame" in z.files and "raw_boxes" in z.files and "raw_conf" in z.files:
+            rf = z["raw_frame"].astype(np.int64)
+            rb = z["raw_boxes"].astype(np.float32) / _BOX_QUANT
+            rc = z["raw_conf"].astype(np.float32) / _CONF_QUANT
+            raw_dets = [[] for _ in range(n)]
+            for row in range(rf.shape[0]):
+                i = int(rf[row])
+                if 0 <= i < n and rb.shape[1] == 4:
+                    raw_dets[i].append((
+                        float(rb[row, 0]), float(rb[row, 1]),
+                        float(rb[row, 2]), float(rb[row, 3]),
+                        float(rc[row]),
+                    ))
+        return {
+            "frame_boxes": frame_boxes,
+            "frame_confs": frame_confs,
+            "raw_dets": raw_dets,
+            "fps": float(z["fps"]),
+            "duration": float(z["duration"]),
+            "active_ids": [int(v) for v in z["active_ids"].tolist()],
+            "tag": p.stem.replace("boxes_", "", 1),
+        }
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ box-size probing

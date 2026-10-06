@@ -35,6 +35,7 @@ dividing by body height makes it independent of how near or far the player is.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -44,6 +45,17 @@ import numpy as np
 from ..i18n import tr
 
 EPS = 1e-9
+
+#: Npz cache layout version. v1 stores only the derived swing/ok/overhead curves;
+#: v2 additionally stores the full 17-keypoint skeleton of every detected slot;
+#: v3 fixes the crop->frame keypoint mapping (v2 skeletons projected far off the player and its
+#: swing amplitudes were attenuated).
+POSE_CACHE_VERSION = 3
+#: Quantization of normalized keypoint coordinates / confidences for compact npz storage
+_KP_XY_QUANT = 65535.0
+_KP_CONF_QUANT = 255.0
+#: Number of COCO keypoints emitted by yolo-pose models
+KP_COUNT = 17
 
 #: COCO keypoint indices
 L_SHOULDER, R_SHOULDER = 5, 6
@@ -82,6 +94,19 @@ class PoseSignal:
 
 
 # ------------------------------------------------------------------ Cropping
+
+
+def _map_keypoints(kp_raw: np.ndarray, x0: float, y0: float,
+                   sx: float, sy: float) -> np.ndarray:
+    """Map 192px patch-space keypoints back to full-frame pixels.
+
+    The patch is ``cv2.resize(crop, (192, 192))`` (a stretch), so patch pixel p is frame
+    ``origin + p * crop_size / 192`` — MULTIPLY by the scale. (A previous version divided, which
+    projects the skeleton far outside the crop: keypoints must stay within the crop window.)
+    Separate x/y scales are required because the crop window may be non-square after frame-edge
+    clamping even though the patch is square.
+    """
+    return np.stack([x0 + kp_raw[:, 0] * sx, y0 + kp_raw[:, 1] * sy], axis=1)
 
 
 def _crop_spec(box: tuple[float, float, float, float], w: int, h: int,
@@ -161,6 +186,7 @@ def analyze_pose(
         cached = _load_cache(cache_path, n)
         if cached is not None:
             cached.trace["cached"] = True
+            cached.trace["cache_tag"] = cache_path.stem
             if on_progress:
                 on_progress(1.0, tr("pose.cached"))
             return cached
@@ -196,6 +222,14 @@ def analyze_pose(
     batch_patches: list[np.ndarray] = []
     batch_slots: list[tuple[int, int]] = []             # (frame index, which person in that frame)
     kp_store: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    # Full-skeleton records retained for visualization / boundary templates (one per detected
+    # slot, independent of whether the swing gates below accept the pose): quantized normalized
+    # coordinates, accumulated as Python lists then stacked once at save time.
+    kp_rec_frames: list[int] = []
+    kp_rec_fis: list[int] = []
+    kp_rec_tracks: list[int] = []
+    kp_rec_xy: list[np.ndarray] = []                    # uint16 (17, 2), normalized frame coords
+    kp_rec_conf: list[np.ndarray] = []                  # uint8 (17,)
 
     def _flush() -> None:
         if not batch_patches:
@@ -223,6 +257,7 @@ def analyze_pose(
     kept = 0
     total = int(n)
     misses = 0
+    w = h = 0                       # proxy frame size, set on the first decoded frame
     pos = np.full((n, 4), np.nan, dtype=np.float32)     # shoulder-midpoint x,y + both wrists x,y
     body = np.full(n, np.nan, dtype=np.float32)
     for i in range(n):
@@ -263,9 +298,14 @@ def analyze_pose(
             patch = cv2.resize(patch, (crop_size, crop_size), interpolation=interp)
             batch_patches.append(patch)
             batch_slots.append((i, fi))
-            # Record the crop-window geometry alongside the slot: keypoints must be mapped back to frame coordinates
+            # Record the crop-window geometry alongside the slot: keypoints must be mapped back to
+            # frame coordinates (per-axis scale — the clamped crop window need not be square).
             kp_store.setdefault(("spec", i, fi), (np.asarray([x0, y0], dtype=np.float32),
-                                                  np.asarray([(x1 - x0) / crop_size], dtype=np.float32)))
+                                                  np.asarray([(x1 - x0) / crop_size,
+                                                              (y1 - y0) / crop_size],
+                                                             dtype=np.float32)))
+            # Keep the player track id of this slot so cached skeletons stay associated with boxes
+            kp_store[("tid", i, fi)] = int(item[0])
             fi += 1
             if len(batch_patches) >= 32:
                 _flush()
@@ -286,8 +326,20 @@ def analyze_pose(
                 continue
             kp_raw, kc = kp_store[key]
             x0, y0 = float(spec[0][0]), float(spec[0][1])
-            scale = float(spec[1][0])
-            kp = np.stack([x0 + kp_raw[:, 0] / scale, y0 + kp_raw[:, 1] / scale], axis=1)
+            sx, sy = float(spec[1][0]), float(spec[1][1])
+            kp = _map_keypoints(kp_raw, x0, y0, sx, sy)
+            # Retain the full 17-keypoint skeleton (normalized frame coords) for every detected
+            # slot — including poses the swing computation below rejects (e.g. no wrist visible).
+            # Visualization must show what the model saw, not only what fed the gate.
+            if kp_raw.shape[0] >= KP_COUNT:
+                nxy = np.stack([kp[:, 0] / max(1, w), kp[:, 1] / max(1, h)], axis=1)
+                kp_rec_frames.append(i)
+                kp_rec_fis.append(fi)
+                kp_rec_tracks.append(int(kp_store.get(("tid", i, fi), -1)))
+                kp_rec_xy.append(np.round(np.clip(nxy[:KP_COUNT], 0.0, 1.0)
+                                          * _KP_XY_QUANT).astype(np.uint16))
+                kp_rec_conf.append(np.round(np.clip(kc[:KP_COUNT], 0.0, 1.0)
+                                            * _KP_CONF_QUANT).astype(np.uint8))
             sh = [kp[j] for j in (L_SHOULDER, R_SHOULDER) if kc[j] > KP_CONF]
             if len(sh) < 1:
                 continue
@@ -365,7 +417,17 @@ def analyze_pose(
                "crop_size": crop_size, "model": Path(weights).name},
     )
     if cache_path is not None:
-        _save_cache(cache_path, sig)
+        keypoints = None
+        if kp_rec_frames:
+            keypoints = {
+                "frame": np.asarray(kp_rec_frames, dtype=np.int32),
+                "fi": np.asarray(kp_rec_fis, dtype=np.uint8),
+                "track": np.asarray(kp_rec_tracks, dtype=np.int32),
+                "xy": np.stack(kp_rec_xy, axis=0),
+                "conf": np.stack(kp_rec_conf, axis=0),
+            }
+        _save_cache(cache_path, sig, keypoints)
+        sig.trace["cache_tag"] = cache_path.stem
     if on_progress:
         on_progress(1.0, tr("pose.analyzing"))
     return sig
@@ -623,6 +685,21 @@ def filter_hits(hits, mask: np.ndarray):
 # ------------------------------------------------------------------ Cache
 
 
+#: Must match players._BOX_QUANT: the box cache stores coords as uint16 on this grid, and the
+#: signature has to be identical for in-memory float boxes and boxes loaded back from that cache.
+_BOXES_SIG_QUANT = 65535.0
+
+
+def _quantize_box_coord(x: float) -> int:
+    """Clip + round one normalized box coordinate onto the uint16 cache grid."""
+    q = int(round(float(x) * _BOXES_SIG_QUANT))
+    if q < 0:
+        return 0
+    if q > int(_BOXES_SIG_QUANT):
+        return int(_BOXES_SIG_QUANT)
+    return q
+
+
 def _boxes_signature(frame_boxes: list) -> str:
     """Compute a cheap fingerprint of the per-frame player boxes to use as a cache key.
 
@@ -630,6 +707,10 @@ def _boxes_signature(frame_boxes: list) -> str:
     filter / camera setup changes the boxes while the video stays the same. Hashing only by video
     would hit a stale cache, causing users to see the hardest-to-debug problem of "changed parameters
     but the result did not change at all". Sampling is enough — take one frame every 37 frames.
+
+    Coordinates are hashed on the same uint16 grid as the compact box npz so that boxes reloaded
+    from the cache (a ~1.5e-5 dequantization away from the floats) produce the same key; otherwise
+    every cache-rebuild run would miss and rerun GPU pose estimation.
     """
     h = hashlib.sha1()
     n = len(frame_boxes)
@@ -637,9 +718,10 @@ def _boxes_signature(frame_boxes: list) -> str:
     for i in range(0, n, 37):
         for item in (frame_boxes[i] or ()):
             try:
-                h.update(("%d:%.4f,%.4f,%.4f,%.4f;" % (int(item[0]), float(item[1]),
-                                                       float(item[2]), float(item[3]),
-                                                       float(item[4]))).encode())
+                h.update(("%d:%d,%d,%d,%d;" % (
+                    int(item[0]),
+                    _quantize_box_coord(item[1]), _quantize_box_coord(item[2]),
+                    _quantize_box_coord(item[3]), _quantize_box_coord(item[4]))).encode())
             except (TypeError, ValueError, IndexError):
                 continue
     return h.hexdigest()[:10]
@@ -661,7 +743,22 @@ def _cache_path(cache_dir, video_path: str, fps: float, crop: int,
     return d / f"pose_{tag}.npz"
 
 
+def pose_cache_path(cache_dir, video_path: str, boxes_fps: float, frame_boxes: list,
+                    crop_size: int = 192, margin: float = 0.35, up_shift: float = 0.05,
+                    model_name: str = "yolo11n-pose.pt") -> Path:
+    """Public resolver for the pose npz of a given (video, boxes) pair."""
+    return _cache_path(cache_dir, video_path, boxes_fps, crop_size,
+                       margin, up_shift, model_name,
+                       boxes_sig=_boxes_signature(frame_boxes))
+
+
 def _load_cache(path: Path, n: int) -> PoseSignal | None:
+    """Load the derived swing curves from a v1/v2 npz; keypoints (v2) are left on disk.
+
+    Old caches without a ``version`` key keep working for segmentation: forcing a GPU rerun on
+    every upgraded install just to refresh visualization would be a bad trade. Skeleton access
+    goes through :func:`load_keypoints`, which treats a v1 file as a miss.
+    """
     if path is None or not path.exists():
         return None
     try:
@@ -680,14 +777,75 @@ def _load_cache(path: Path, n: int) -> PoseSignal | None:
         return None
 
 
-def _save_cache(path: Path, sig: PoseSignal) -> None:
+def _save_cache(path: Path, sig: PoseSignal, keypoints: dict | None = None) -> None:
+    """Write a v2 npz: derived curves plus, when available, every detected slot's skeleton.
+
+    Keypoint payload (``keypoints``): ``frame`` int32 (K,), ``fi`` uint8 (K,), ``track`` int32
+    (K,), ``xy`` uint16 (K,17,2) normalized, ``conf`` uint8 (K,17). Never raises.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, fps=sig.fps, duration=sig.duration,
-                            swing=sig.swing, ok=sig.ok, overhead=sig.overhead,
-                            coverage=sig.coverage, quiet=sig.quiet)
+        tmp = path.with_suffix(".tmp.npz")     # .npz suffix keeps savez from appending another one
+        payload: dict[str, Any] = {
+            "version": np.int64(POSE_CACHE_VERSION),
+            "fps": sig.fps, "duration": sig.duration,
+            "swing": sig.swing, "ok": sig.ok, "overhead": sig.overhead,
+            "coverage": sig.coverage, "quiet": sig.quiet,
+        }
+        if keypoints is not None:
+            payload["kp_frame"] = keypoints["frame"]
+            payload["kp_fi"] = keypoints["fi"]
+            payload["kp_track"] = keypoints["track"]
+            payload["kp_xy"] = keypoints["xy"]
+            payload["kp_conf"] = keypoints["conf"]
+        else:
+            # Still a v2 file, just with zero skeleton records
+            payload["kp_frame"] = np.zeros(0, dtype=np.int32)
+            payload["kp_fi"] = np.zeros(0, dtype=np.uint8)
+            payload["kp_track"] = np.zeros(0, dtype=np.int32)
+            payload["kp_xy"] = np.zeros((0, KP_COUNT, 2), dtype=np.uint16)
+            payload["kp_conf"] = np.zeros((0, KP_COUNT), dtype=np.uint8)
+        np.savez_compressed(tmp, **payload)
+        os.replace(tmp, path)
     except Exception:
         pass
+
+
+def load_keypoints(path: str | Path | None) -> dict | None:
+    """Load per-slot skeletons from a v2 pose npz.
+
+    Returns ``{"n", "fps", "duration", "frame", "fi", "track", "xy", "conf"}`` where ``xy`` is a
+    float32 (K,17,2) array in normalized frame coordinates and ``conf`` float32 (K,17); returns
+    ``None`` for a missing/corrupt/v1 file so callers degrade to "skeleton unavailable".
+    """
+    if path is None:
+        return None
+    try:
+        p = Path(str(path))
+        if not p.is_file():
+            return None
+        z = np.load(p, allow_pickle=False)
+        if "version" not in z.files or int(z["version"]) < POSE_CACHE_VERSION:
+            return None
+        needed = ("kp_frame", "kp_fi", "kp_track", "kp_xy", "kp_conf")
+        if any(k not in z.files for k in needed):
+            return None
+        xy = z["kp_xy"]
+        conf = z["kp_conf"]
+        if xy.ndim != 3 or xy.shape[1] != KP_COUNT or xy.shape[2] != 2:
+            return None
+        return {
+            "n": int(z["swing"].size),
+            "fps": float(z["fps"]),
+            "duration": float(z["duration"]),
+            "frame": z["kp_frame"].astype(np.int32),
+            "fi": z["kp_fi"].astype(np.int16),
+            "track": z["kp_track"].astype(np.int32),
+            "xy": (xy.astype(np.float32) / _KP_XY_QUANT),
+            "conf": (conf.astype(np.float32) / _KP_CONF_QUANT),
+        }
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ Environment
@@ -745,4 +903,6 @@ __all__ = [
     "gate_hits",
     "hit_swing_evidence",
     "swing_peaks",
+    "pose_cache_path",
+    "load_keypoints",
 ]

@@ -12,6 +12,7 @@ FRAG: list[tuple[str, str, str]] = [
     # ---------------------------------------------------------------- annotations
     ("annotation.no_analysis", "还没有分析结果，请先运行一次 AI 分析", "No analysis result yet. Run an AI analysis first."),
     ("annotation.no_labels", "还没有人工标注，请先标注几个回合再优化", "No manual annotations yet. Annotate a few rallies before optimizing."),
+    ("annotation.overlay_bad_window", "时间窗无效或过长（叠加层窗口最长 {max_window} 秒）", "Invalid or too-long time window (overlay window is at most {max_window} seconds)"),
     # ---------------------------------------------------------------- store
     ("store.invalid_id", "非法 id: {value!r}", "Invalid id: {value!r}"),
     ("project.untitled", "未命名工程", "Untitled project"),

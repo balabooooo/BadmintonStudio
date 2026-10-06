@@ -25,6 +25,18 @@ from .audio_hits import HitDetection, cluster_rallies
 
 EPS = 1e-9
 
+#: Stable component-key order (also used when packing / rebuilding full-rate curves).
+FUSE_COMPONENT_KEYS = ("players", "motion", "audio_hits", "shuttle", "roi")
+
+#: Default fusion base weights. These are the multipliers BEFORE the per-signal
+#: discriminative-power factor and the audio-reliability factor; ``AnalysisParams``
+#: can override them for annotation-calibrated weight tables. Keep the literals in
+#: ``AnalysisParams`` in sync (test_fuse_weight_defaults guards this).
+DEFAULT_BASE_WEIGHTS: dict[str, float] = {
+    "players": 1.35, "motion": 1.0, "audio_hits": 0.95,
+    "shuttle": 0.9, "roi": 0.8,
+}
+
 
 # ------------------------------------------------------------------ Utilities
 
@@ -206,8 +218,14 @@ def fuse(
     players: dict[str, np.ndarray] | None = None,
     shuttle: dict[str, np.ndarray] | None = None,
     roi_activity: np.ndarray | None = None,
+    weight_base: dict[str, float] | None = None,
 ) -> FusedSignal:
-    """Fuse the various baseline signals into a single activity curve."""
+    """Fuse the various baseline signals into a single activity curve.
+
+    ``weight_base`` overrides the multiplier constants in
+    :data:`DEFAULT_BASE_WEIGHTS` (used by the annotation-calibrated weight table);
+    per-signal discriminative power and audio reliability still scale the overrides.
+    """
     n = max(1, int(round(duration * fps)))
     comp: dict[str, np.ndarray] = {}
 
@@ -266,8 +284,18 @@ def fuse(
         sfps = float(shuttle.get("fps", fps))
         pres = resample(shuttle.get("presence", np.zeros(0)), sfps, fps, n)
         spd = resample(shuttle.get("max_candidate_speed", np.zeros(0)), sfps, fps, n)
-        comp["shuttle"] = (0.6 * robust_norm(smooth(pres, max(1, int(fps * 0.5)))) +
-                           0.4 * robust_norm(smooth(spd, max(1, int(fps * 0.5))))).astype(np.float32)
+        pres_n = robust_norm(smooth(pres, max(1, int(fps * 0.5))))
+        spd_n = robust_norm(smooth(spd, max(1, int(fps * 0.5))))
+        flight = shuttle.get("in_flight")
+        # Validated-track coverage (gap-bridged) is a cleaner "in play" signal than raw
+        # candidate presence; use it when a new analysis provided it, otherwise keep the
+        # legacy presence/speed blend exactly.
+        if flight is not None and getattr(flight, "size", 0) and float(np.max(flight)) > 0.0:
+            flt = resample(flight, sfps, fps, n)
+            flt_n = robust_norm(smooth(flt, max(1, int(fps * 0.5))))
+            comp["shuttle"] = (0.35 * pres_n + 0.25 * spd_n + 0.40 * flt_n).astype(np.float32)
+        else:
+            comp["shuttle"] = (0.6 * pres_n + 0.4 * spd_n).astype(np.float32)
     else:
         comp["shuttle"] = np.zeros(n, dtype=np.float32)
 
@@ -278,21 +306,55 @@ def fuse(
     else:
         comp["roi"] = np.zeros(n, dtype=np.float32)
 
+    return combine_components(
+        comp, fps=fps, duration=duration, audio_rel=audio_rel,
+        weight_base=weight_base)
+
+
+def _activity_thresholds(activity: np.ndarray) -> tuple[float, float]:
+    """Adaptive dual-threshold hysteresis bounds from the fused activity curve."""
+    med = float(np.median(activity))
+    hi = max(float(np.percentile(activity, 78)), med * 1.25)
+    lo = max(float(np.percentile(activity, 55)) * 0.92, med * 1.05)
+    return hi, lo
+
+
+def combine_components(comp: dict[str, np.ndarray], *, fps: float,
+                       duration: float, audio_rel: float = 0.0,
+                       weight_base: dict[str, float] | None = None
+                       ) -> FusedSignal:
+    """Weighted-combine already-built component curves into a FusedSignal.
+
+    Shared by :func:`fuse` and the offline "re-fuse stored components without an AI
+    rerun" path (resegment / the annotation optimizer).
+    """
+    n = max(1, int(round(duration * fps)))
+    # Ensure every canonical key exists (stored component dicts may miss zeros) and every
+    # curve has exactly n frames; resample defensively if a stored array drifted in length.
+    fixed: dict[str, np.ndarray] = {}
+    for k in FUSE_COMPONENT_KEYS:
+        v = np.asarray(comp.get(k, np.zeros(n, dtype=np.float32)), dtype=np.float32)
+        fixed[k] = v if v.size == n else resample(v, fps, fps, n)
+    comp = fixed
+    base = dict(DEFAULT_BASE_WEIGHTS)
+    if weight_base:
+        base.update({k: float(v) for k, v in weight_base.items()
+                     if k in DEFAULT_BASE_WEIGHTS})
+
     # --- Adaptive weights (audio is additionally multiplied by its reliability)
-    base = {"players": 1.35, "motion": 1.0, "audio_hits": 0.95, "shuttle": 0.9, "roi": 0.8}
     weights: dict[str, float] = {}
     for k, v in comp.items():
         if not np.any(v):
             weights[k] = 0.0
             continue
-        w = base.get(k, 0.5) * (0.35 + 0.65 * discriminative_power(v))
+        w = max(0.0, base.get(k, 0.5)) * (0.35 + 0.65 * discriminative_power(v))
         if k == "audio_hits":
             w *= audio_rel
         weights[k] = w
     total = sum(weights.values())
     if total < EPS:
         # When all signals are unavailable, degrade to "the whole clip is a candidate", to be fixed by later audio / manual edits
-        weights = {"audio_hits": 1.0}
+        weights = {k: (1.0 if k == "audio_hits" else 0.0) for k in comp}
         total = 1.0
         comp["audio_hits"] = np.ones(n, dtype=np.float32) * 0.5
 
@@ -301,15 +363,24 @@ def fuse(
         activity += (weights[k] / total) * v
     activity = smooth(activity, max(1, int(fps * 1.2)))
 
-    # --- Adaptive thresholds (dual-threshold hysteresis)
-    p_hi = float(np.percentile(activity, 78))
-    p_lo = float(np.percentile(activity, 55))
-    med = float(np.median(activity))
-    hi = max(p_hi, med * 1.25)
-    lo = max(p_lo * 0.92, med * 1.05)
+    hi, lo = _activity_thresholds(activity)
     return FusedSignal(fps=fps, duration=duration, activity=activity,
                        components=comp, weights=weights, threshold_hi=hi, threshold_lo=lo,
                        audio_reliability=audio_rel)
+
+
+def fuse_from_components(components: dict[str, np.ndarray], *, fps: float,
+                         duration: float, audio_rel: float = 1.0,
+                         weight_base: dict[str, float] | None = None
+                         ) -> FusedSignal:
+    """Re-fuse the activity curve from stored full-rate component arrays (no AI rerun).
+
+    Missing components are treated as zeros exactly like :func:`fuse` does when the
+    corresponding signal source was unavailable during analysis.
+    """
+    return combine_components(
+        components, fps=fps, duration=duration, audio_rel=audio_rel,
+        weight_base=weight_base)
 
 
 def _fps_of(sig: dict | None, key: str, default: float) -> float:

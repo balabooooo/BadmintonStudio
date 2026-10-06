@@ -227,6 +227,7 @@ class QuietSpan:
     end: int
     depth: float          # depth of the valley relative to the peaks on either side (0~1)
     floor: float          # absolute level of the valley floor
+    bottom: int = 0       # frame index of the actual minimum (snap target; span may be wider)
 
 
 def find_quiet_spans(
@@ -291,7 +292,7 @@ def find_quiet_spans(
         if b - a < max(1, int(0.25 * fps)):
             a = max(0, i - int(0.15 * fps))
             b = min(m.size - 1, i + int(0.15 * fps))
-        out.append(QuietSpan(start=a, end=b,
+        out.append(QuietSpan(start=a, end=b, bottom=int(i),
                              depth=float(np.clip(prom[k] / span, 0.0, 1.5)),
                              floor=float(m[i])))
     if max_quiet > 0:
