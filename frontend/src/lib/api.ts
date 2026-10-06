@@ -82,6 +82,8 @@ export const api = {
     req<Project>(`/api/projects/${pid}/duplicate`, { method: 'POST', body: '{}' }),
 
   // ---------------------------------------------------------------- 素材
+  /** Generate the built-in sample videos at runtime and return their absolute paths (the `small` flag exists for tests only). */
+  seedSamples: (small = false) => req<{ files: string[] }>('/api/samples/seed', { method: 'POST', body: JSON.stringify({ small }) }),
   addMedia: (pid: string, paths: string[]) =>
     req<{ project: Project; added: MediaInfo[]; failed: { path: string; error: string }[] }>(
       `/api/projects/${pid}/media`,
