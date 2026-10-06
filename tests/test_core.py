@@ -3039,6 +3039,49 @@ def test_samples_generation() -> None:
         check("二次调用直接复用", [f.name for f in again] == [f.name for f in files])
 
 
+def test_samples_endpoint() -> None:
+    """POST /api/samples/seed generates the two demo clips and returns their
+    absolute paths; a generation failure surfaces as HTTP 500 with the
+    underlying error message instead of being swallowed."""
+    print("\n示例素材端点")
+    try:
+        from fastapi.testclient import TestClient
+    except Exception as e:  # pragma: no cover - httpx absent
+        check("TestClient 可用（跳过）", True, str(e))
+        return
+    import tempfile
+    import bms.main as MAIN
+    from bms.main import app
+    with tempfile.TemporaryDirectory() as td:
+        old_data_dir = MAIN.DATA_DIR
+        MAIN.DATA_DIR = Path(td)  # keep test artifacts out of the real data dir
+        try:
+            with TestClient(app) as c:
+                # Host header required: the local-origin guard rejects TestClient's default host.
+                r = c.post("/api/samples/seed", json={"small": True},
+                           headers={"host": "127.0.0.1"})
+                check("seed 返回 200", r.status_code == 200, r.text[:200])
+                files = r.json().get("files", [])
+                check("返回两个文件路径", len(files) == 2)
+                check("路径为绝对路径且文件存在",
+                      all(Path(f).is_absolute() and Path(f).is_file() for f in files))
+                # A failure must reach the client as HTTP 500 + original message.
+                old_gen = MAIN.ensure_sample_files
+
+                def _boom(*a, **k):
+                    raise RuntimeError("boom")
+
+                MAIN.ensure_sample_files = _boom
+                try:
+                    r2 = c.post("/api/samples/seed", json={}, headers={"host": "127.0.0.1"})
+                    check("失败返回 500", r2.status_code == 500, r2.text[:200])
+                    check("500 带原始错误信息", r2.json().get("detail") == "boom", r2.text[:200])
+                finally:
+                    MAIN.ensure_sample_files = old_gen
+        finally:
+            MAIN.DATA_DIR = old_data_dir
+
+
 def main() -> int:
     test_player_pipeline_contract()
     test_shuttle_pipeline_contract()
@@ -3124,6 +3167,7 @@ def main() -> int:
     test_export_merge_passes_cancel()
     test_local_origin_guard()
     test_samples_generation()
+    test_samples_endpoint()
     print()
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：{FAILURES}")

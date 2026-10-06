@@ -41,6 +41,7 @@ from .core import exports as EXPORTS
 from .core.jobs import manager as JOBS
 from .core.models import AnalysisParams, ExportPreset, MediaInfo, Project, Rally, Timeline, Track, now_ms
 from .core.streaming import range_response
+from .samples import ensure_sample_files
 from .i18n import app_name, get_lang, parse_lang, set_lang, tr
 from .api.annotations import router as annotations_router
 from .api.presets import router as presets_router
@@ -1906,6 +1907,21 @@ def cache_clear(payload: dict = Body(default={})) -> dict:
                              "media": m.model_dump(mode="json")})
     logger.info("cache cleared: target={} freed={}B invalidated_media={}", target, freed, invalidated)
     return {"freed": freed}
+
+
+@app.post("/api/samples/seed")
+def samples_seed(payload: dict = Body(default={})) -> dict:
+    """Generate the guided-tour demo clips under ``<data_dir>/samples`` (blocking,
+    synchronous) and return their absolute paths; any failure surfaces as HTTP 500."""
+    try:
+        ffmpeg = ff.find_ffmpeg()
+        files = ensure_sample_files(DATA_DIR, ffmpeg, small=bool(payload.get("small", False)))
+    except Exception as e:  # noqa: BLE001
+        # Log: an HTTPException(500) would otherwise bypass the unhandled-error handler
+        # and leave no durable trace of the ffmpeg/encode failure.
+        logger.opt(exception=e).error("sample seeding failed")
+        raise HTTPException(500, str(e))
+    return {"files": [str(f) for f in files]}
 
 
 # ------------------------------------------------------------------ Static frontend
