@@ -13,6 +13,8 @@ vi.mock('../lib/api', () => ({
   api: {
     seedSamples: vi.fn(),
     addMedia: vi.fn(),
+    createProject: vi.fn(),
+    listProjects: vi.fn().mockResolvedValue([]),
     prepareMedia: vi.fn().mockResolvedValue({ job_id: 'j1' }),
   },
 }))
@@ -167,6 +169,7 @@ function makeProject(): Project {
 describe('tour overlay', () => {
   const mockedSeed = vi.mocked(api.seedSamples)
   const mockedAddMedia = vi.mocked(api.addMedia)
+  const mockedCreateProject = vi.mocked(api.createProject)
 
   /** Drop a fake anchor into the DOM so a step resolves without waiting. */
   function addAnchor(target: string): HTMLElement {
@@ -345,5 +348,116 @@ describe('tour overlay', () => {
       vi.advanceTimersByTime(120)
     })
     expect(screen.getByRole('button', { name: 'Next' })).toBeEnabled()
+  })
+
+  it('keyboard cannot bypass an unsatisfied waitFor gate', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    addAnchor('library-new-project')
+    render(<TourOverlay />)
+    act(() => {
+      useTourStore.getState().start('manual')
+    })
+    act(() => {
+      useTourStore.getState().goTo(2)
+    })
+    // Gate unsatisfied (no project): both ArrowRight and Enter are no-ops.
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    fireEvent.keyDown(window, { key: 'Enter' })
+    expect(useTourStore.getState().index).toBe(2)
+
+    // Once the gate is satisfied (the 100ms re-evaluation picks it up),
+    // ArrowRight advances again.
+    act(() => {
+      useStore.setState({ project: makeProject() })
+    })
+    act(() => {
+      vi.advanceTimersByTime(120)
+    })
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    expect(useTourStore.getState().index).toBe(3)
+  })
+
+  it('loadSamples with no project creates one first, then seeds and imports', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    const media = makeMedia('m2', 'sample')
+    const newProject = { ...makeProject(), id: 'p_new' }
+    mockedCreateProject.mockResolvedValueOnce(newProject)
+    mockedSeed.mockResolvedValueOnce({ files: ['D:/samples/rally.mp4'] })
+    mockedAddMedia.mockResolvedValueOnce({
+      project: { ...newProject, media: [media] },
+      added: [media],
+      failed: [],
+    })
+    // Store has no project (beforeEach baseline): the create-first branch runs.
+
+    render(<TourOverlay />)
+    act(() => {
+      useTourStore.getState().start('manual')
+    })
+    act(() => {
+      useTourStore.getState().goTo(3)
+    })
+    act(() => {
+      vi.advanceTimersByTime(4200)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load sample media' }))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // Strict call order: project creation -> seed -> import.
+    const [createOrder, seedOrder, addOrder] = [
+      mockedCreateProject,
+      mockedSeed,
+      mockedAddMedia,
+    ].map((m) => m.mock.invocationCallOrder[0])
+    expect(createOrder).toBeLessThan(seedOrder)
+    expect(seedOrder).toBeLessThan(addOrder)
+
+    expect(useStore.getState().project?.id).toBe('p_new')
+    expect(useStore.getState().currentMedia()).not.toBeNull()
+    expect(screen.getByText('Sample media loaded')).toBeInTheDocument()
+  })
+
+  it('loadSamples with a failed project creation does not double-toast', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    mockedCreateProject.mockRejectedValueOnce(new Error('backend down'))
+
+    render(<TourOverlay />)
+    act(() => {
+      useTourStore.getState().start('manual')
+    })
+    act(() => {
+      useTourStore.getState().goTo(3)
+    })
+    act(() => {
+      vi.advanceTimersByTime(4200)
+    })
+
+    const toastSpy = vi.fn()
+    const realToast = useStore.getState().toast
+    useStore.setState({ toast: toastSpy })
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Load sample media' }))
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      // The store's own createProject failure toast fires exactly once; the
+      // overlay must not stack a second "samples failed" toast on top.
+      expect(toastSpy).toHaveBeenCalledTimes(1)
+      expect(toastSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'error', title: tr('toast.createProjectFailed') }),
+      )
+      expect(mockedSeed).not.toHaveBeenCalled()
+      // Busy reset and the step remains skippable.
+      expect(screen.getByRole('button', { name: 'Load sample media' })).toBeEnabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Skip this step' }))
+      expect(useTourStore.getState().index).toBe(4)
+    } finally {
+      useStore.setState({ toast: realToast })
+    }
   })
 })

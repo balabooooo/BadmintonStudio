@@ -10,7 +10,8 @@
  *
  * The overlay never blocks pointer events: the dimming is purely visual, so
  * interactive steps can drive the real UI behind it. Keyboard: ←/→ step,
- * Enter next, Esc quit; Tab is trapped inside the bubble.
+ * Enter next (gated on interactive steps' waitFor like the Next button),
+ * Esc quit; Tab is trapped inside the bubble.
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -109,6 +110,9 @@ export default function TourOverlay() {
   const bubbleRef = useRef<HTMLDivElement | null>(null)
   const targetRef = useRef<HTMLElement | null>(null)
   const stepRef = useRef<TourStep | null>(null)
+  /** Mirror of ``satisfied`` so the window-level keydown handler (registered
+   * once per activation) can apply the same gate as the Next button. */
+  const satisfiedRef = useRef<boolean | null>(null)
   const narrowRef = useRef(narrow)
   const reducedRef = useRef(reduced)
   const loadedTimerRef = useRef<number | null>(null)
@@ -137,7 +141,9 @@ export default function TourOverlay() {
     targetRef.current = null
     setBusy(false)
     setLoaded(false)
-    setSatisfied(step.waitFor ? step.waitFor() : null)
+    const initial = step.waitFor ? step.waitFor() : null
+    satisfiedRef.current = initial
+    setSatisfied(initial)
 
     if (step.view !== useStore.getState().view) useStore.getState().setView(step.view)
 
@@ -201,7 +207,11 @@ export default function TourOverlay() {
   useEffect(() => {
     const step = stepRef.current
     if (!active || mode === 'polling' || !step?.waitFor) return
-    const check = () => setSatisfied(step.waitFor ? step.waitFor() : null)
+    const check = () => {
+      const v = step.waitFor ? step.waitFor() : null
+      satisfiedRef.current = v
+      setSatisfied(v)
+    }
     check()
     const timer = window.setInterval(check, POLL_INTERVAL)
     return () => window.clearInterval(timer)
@@ -255,36 +265,41 @@ export default function TourOverlay() {
   }, [active, mode])
 
   // Global keys while the tour is open. Enter is left to the focused bubble
-  // button (it would double-fire next otherwise).
+  // button (it would double-fire next otherwise). The next-path respects the
+  // same waitFor gate as the Next button, so the keyboard cannot bypass an
+  // unsatisfied interactive step.
   useEffect(() => {
     if (!active) return
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null
       const inBubble = !!target?.closest?.('[data-tour-bubble]')
+      const gated = stepRef.current?.kind === 'interactive' && satisfiedRef.current !== true
       if (e.key === 'Escape') {
         e.preventDefault()
         useTourStore.getState().skip()
       } else if (e.key === 'ArrowRight') {
         e.preventDefault()
-        useTourStore.getState().next()
+        if (!gated) useTourStore.getState().next()
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault()
         useTourStore.getState().prev()
       } else if (e.key === 'Enter' && !inBubble && !target?.closest?.('input, textarea, select')) {
-        useTourStore.getState().next()
+        if (!gated) useTourStore.getState().next()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [active])
 
-  // Viewport width class (bottom-docked bubble on narrow windows).
+  // Viewport width class (bottom-docked bubble on narrow windows). Kept
+  // attached for the overlay's whole lifetime (it is a root singleton) so
+  // `narrow` is also correct when a tour starts after the user resized while
+  // the overlay was inactive.
   useEffect(() => {
-    if (!active) return
     const onResize = () => setNarrow(window.innerWidth < NARROW_VIEWPORT)
     window.addEventListener('resize', onResize, { passive: true })
     return () => window.removeEventListener('resize', onResize)
-  }, [active])
+  }, [])
 
   // Move focus into the bubble whenever its content appears/changes.
   useEffect(() => {
@@ -318,7 +333,10 @@ export default function TourOverlay() {
     try {
       if (!useStore.getState().project) {
         const pid = await useStore.getState().createProject(tr('tour.samples.projectName'))
-        if (!pid) throw new Error('create project failed')
+        // createProject already toasts its own failure and returns null:
+        // don't stack a second toast — just give up (finally resets busy and
+        // the step stays skippable).
+        if (!pid) return
       }
       const { files } = await api.seedSamples()
       await useStore.getState().importMedia(files)
