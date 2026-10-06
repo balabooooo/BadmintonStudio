@@ -51,7 +51,7 @@ export const FRAG: [string, string, string][] = [
   ['tour.insp.tabs.title', '右侧检查器', 'Right inspector'],
   ['tour.library.action', '创建或打开一个工程继续', 'Create or open a project to continue'],
   ['tour.library.body', '在这里新建工程、打开工程、搜索项目', 'Create or open projects and search them here'],
-  ['tour.library.title', '素材库', 'Projects'],
+  ['tour.library.title', '工程库', 'Projects'],
   ['tour.nav.body', '左侧依次是：工程库、剪辑台、标注、导出、设置', 'From left to right: Projects, Studio, Annotate, Exports, Settings'],
   ['tour.nav.title', '全局导航', 'Global navigation'],
   ['tour.player.body', '试一试播放（空格键也可以）', 'Try playing (the space bar works too)'],
