@@ -12,7 +12,7 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - `backend/bms/` — Python package. `main.py` is one large FastAPI app holding all REST routes + WebSocket; `analysis/` is the AI pipeline; `api/` has the annotation + preset routers; `render/exporter.py` is the FFmpeg export path.
 - `frontend/` — React 19 + TS + Vite + Tailwind v4 + Zustand. Animation lib is `motion` (not `framer-motion`).
 - `desktop/app.py` — uvicorn thread + pywebview window (browser fallback).
-- `scripts/` — CLI diagnostics/analysis (`run_analysis.py`, `e2e_test.py`, `eval_segmentation.py`, `probe_video.py`, `fetch_speech_model.py`, `tune_clip25.py`, `eval_scoring_ab.py`, `transcribe_speech.py`, ...).
+- `scripts/` — CLI diagnostics/analysis (`run_analysis.py`, `e2e_test.py`, `eval_segmentation.py`, `eval_rallies.py`, `calibrate_boundary.py`, `calibrate_weights.py`, `backfill_components.py`, `probe_video.py`, `fetch_speech_model.py`, `tune_clip25.py`, `eval_scoring_ab.py`, `transcribe_speech.py`, ...).
 - `data/` — gitignored runtime state (project JSON, caches, exports, annotations, scene presets). `models/*.pt`, `models/*.onnx`, `models/faster-whisper-*/` and `tools/` are also gitignored; **no binaries are committed** (YOLO auto-downloads or is placed in `models/`, the whisper model is fetched by script or auto-downloaded, a bundled ffmpeg lives at `tools/ffmpeg/bin`).
 - `tests/test_core.py` — backend test suite (Python, plain functions, pytest-compatible). Scope is interface/silent-failure regressions, not algorithm accuracy.
 - `frontend/src/**/*.test.ts(x)` — frontend tests (vitest + @testing-library/react, jsdom). Setup at `frontend/src/test/setup.ts`. Run with `npm run test` / `npm run test:watch` inside `frontend/`. No CI, no pre-commit, no Python linter/formatter/typecheck config.
@@ -22,17 +22,24 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - `bms` is not installed as a package. Set `PYTHONPATH=backend` (scripts and `desktop/app.py` patch `sys.path` themselves).
   Example: `$env:PYTHONPATH="D:\Projects\BadmintonStudio\backend"; .\.venv\Scripts\python.exe -m uvicorn bms.main:app --port 8000`
 - Launchers set `PYTHONIOENCODING=utf-8`; keep it when running scripts manually (Chinese output).
-- Env overrides: `BMS_DATA_DIR`, `BMS_MODELS_DIR`, `BMS_TOOLS_DIR`, `BMS_FRONTEND_DIST`, `BMS_FFMPEG`/`BMS_FFPROBE`, `BMS_SPEECH_MODEL` (faster-whisper model dir / size / HF repo id); Vite API target is `BMS_API`.
+- Env overrides: `BMS_DATA_DIR`, `BMS_MODELS_DIR`, `BMS_TOOLS_DIR`, `BMS_FRONTEND_DIST`, `BMS_FFMPEG`/`BMS_FFPROBE`, `BMS_SPEECH_MODEL` (faster-whisper model dir / size / HF repo id), `BMS_SHUTTLE_BACKEND` (`auto`/`cpu`/`gpu` candidate-scan backend for optional shuttle tracking); Vite API target is `BMS_API`.
 
 ## Commands
 - Tests: `.\.venv\Scripts\python.exe tests\test_core.py` (plain pytest also works). Scope is interface/silent-failure regressions, not algorithm accuracy.
 - Single test: `.\.venv\Scripts\python.exe -m pytest tests\test_core.py -k <name>`. Tests are plain functions, run in order by the `main()` at the bottom of the file.
 - Offline full analysis: `.\.venv\Scripts\python.exe scripts\run_analysis.py "<video>"` (writes `data/cache/last_analysis.json`).
 - End-to-end API smoke (requires a running server): `.\.venv\Scripts\python.exe scripts\e2e_test.py "<video>"`.
+- Rally-segmentation tuning against clip1-3 annotations: `scripts\eval_rallies.py` (segmentation metrics, LOCO pairs), `scripts\calibrate_boundary.py` (boundary-refine grid), `scripts\calibrate_weights.py --analysis-dir data\cache\eval\backfill` (LOCO fusion-weight table; exits 2 until component curves exist), `scripts\backfill_components.py` (re-run analyses into `data/cache/eval/backfill/` to populate `component_*_full` without touching `data/projects`; `--use-shuttle` writes to `data/cache/eval/backfill_shuttle/` instead). Artifacts land in `data/cache/eval/`.
 - Speech model (optional, voice-command scoring): `.\.venv\Scripts\python.exe scripts\fetch_speech_model.py` (pre-fetches `models/faster-whisper-medium/`; otherwise auto-downloads on first use).
 - Frontend, inside `frontend/`: `npm run build` (`tsc -b && vite build` → `frontend/dist`), `npm run lint` (oxlint), `npm run dev` on port 5273, `npm run test` (vitest, single run) / `npm run test:watch` (vitest watch).
 - Frontend tests use jsdom; `setup.ts` stubs the APIs jsdom lacks (`IntersectionObserver`, `matchMedia`, `scrollIntoView`, `CSS.escape`). Mock the `api` module (`vi.mock('../lib/api', ...)`) to avoid network calls; drive components by setting Zustand store state directly (`useStore.setState(...)`).
 - The backend serves `frontend/dist`; frontend changes need `npm run build` before `start.cmd`/desktop picks them up (index.html is served `no-store` and the desktop URL carries a dist-mtime cache-bust, so a restart reloads the new bundle). Use `pwsh -File scripts/dev.ps1` for HMR (frontend 5273, backend 8000).
+
+## Repository hygiene
+- **Never commit or push temporary/throwaway work**: ad-hoc test code and one-off scripts (debug snippets, scratch experiments, quick probes) are strictly forbidden in the remote repository. This does **not** apply to the maintained test suites — `tests/test_core.py` and `frontend/src/**/*.test.ts(x)` are normal tracked code.
+- **Delete temporary test code/scripts right after use**; do not leave them in the working tree for later.
+- Modification plans, scratch notes, and other planning drafts are likewise local-only and must not be uploaded (keep them untracked, outside the repo, or in a gitignored location).
+- Before committing, check `git status` and stage files explicitly; avoid `git add -A`/`git add .` while untracked temporary files may exist.
 
 ## Gotchas
 - AI modules **degrade silently**: `pipeline.py` wraps player/shuttle/audio work in `try/except` and records failures in `stats.*_trace`, so a broken call looks like a successful analysis with bad output. When changing a public analysis signature (`analyze_players`, `_select_active_players`, `probe_boxes`, `run_analysis`), update every call site and `tests/test_core.py`.

@@ -251,6 +251,31 @@ It then selects the **actual match players** by "large box + fast movement + pre
 The output is per-frame "number of active players on court", "average speed" and "maximum speed" — the most
 reliable rally signal.
 
+The per-frame active-player count also yields a `stats.match_format` recommendation (single / doubles /
+unknown): over frames with at least one player present (detection gaps excluded), doubles is declared when
+≥4 players fill ≥34% of covered frames or ≥3 fill ≥60%, singles when ≥3-person frames stay ≤15%, and the
+band in between (or evidence under 300 frames / 30% coverage) stays `unknown`. It is a **recommendation
+only** — the scoring preset is never switched silently; the annotation page shows the verdict and its
+evidence. The three labeled clips are all singles footage, so the doubles thresholds remain unvalidated.
+
+**Detection floor and the visualization cache (`data/cache/boxes/boxes_<tag>.npz`)**: the inference floor is
+`LOW_CONF = 0.10` (historically 0.15). Everything at or above it is kept and fed to ByteTrack, whose
+stage-two association (`BT_LOW_THRESH = 0.10`) uses the 0.10–0.25 band to reconnect occluded tracks —
+`new_track_thresh = 0.25` keeps low-score boxes from ever starting tracks, so the lower floor only adds
+occlusion rescue, never noise tracks. The same detections are persisted in the compact **v2** npz layout:
+per-row `conf` (uint8 ×255) for the tracked active-player boxes, plus `raw_frame` / `raw_boxes` /
+`raw_conf` rows holding every pre-size-filter detection (no track id). The overlay endpoint serves these as
+per-box `conf` and per-frame `dets`, and the annotation page's overlay controls use them for the
+**detection-threshold filter** (slider + numeric input, default 0.15), the dashed-gray **all-detections
+diagnosis layer** (to tell "detection dropped it" from "tracking / player selection dropped it"), and the
+**lost-tolerance** ghost mode (a stale nearest frame drawn at 35% opacity with a LOST tag when tracking has
+a short gap). v1 caches (no conf / raw columns) keep loading — the overlay then shows everything
+unfiltered. The cache tag embeds `low=` so the 0.15-era and 0.10-era key spaces split naturally; rerunning
+`scripts/rebuild_visual_cache.py` re-detects and writes v2 files. Playhead-window refetching in the overlay
+is throttled (500 ms, immediate on leaving the window entirely) — an earlier 350 ms debounce was reset
+forever by the 250 ms playhead poll, which is why boxes and skeletons used to vanish for good a few
+seconds into playback.
+
 ### 4. Shuttle tracking (`shuttle.py`) — off by default, enable on demand
 
 Because the camera is static, **temporal median background modeling** is safe:
@@ -266,12 +291,28 @@ Because the camera is static, **temporal median background modeling** is safe:
   walking person only produces constant-velocity straight lines
 
 **Why it is off by default**: cost grows with "frames × pixels × time window", so a 30-minute 4K clip takes
-hours. When enabled you can set a **time budget** to cap the total cost; if it covers less than 60% of the
-timeline the signal is ignored (analyzing only part of the clip would skew the fusion weights).
+hours on CPU. When enabled you can set a **time budget** to cap the total cost; if it covers less than 60% of
+the timeline the signal is ignored (analyzing only part of the clip would skew the fusion weights).
+
+**GPU backend**: candidate scanning (temporal percentiles, morphology) runs on torch CUDA automatically when
+available (`auto`; override with `BMS_SHUTTLE_BACKEND=cpu|gpu`; a GPU error silently re-runs the scan on CPU
+and the reason is recorded in `stats.shuttle_trace.backend_fallback`). Measured on an RTX 3080 with a
+30-minute 960×540 clip: the shuttle stage drops from ~65 min to ~5 min (~13×), with byte-identical rally
+boundaries.
 
 Measured note: on a 960×540 proxy the shuttle is only 2–5 pixels and is not separable in brightness from
 distant white shoes, so at the default sensitivity it honestly returns "0 trajectories" instead of noise.
-This signal needs higher-resolution footage to be worthwhile (8–20 px, where whiteness separates again).
+Full trajectories need higher-resolution footage (8–20 px, where whiteness separates again). The **candidate
+speed component is not entirely wasted at 540p, though**: on the only clip measured (clip2, LOCO-pending,
+single-sample evidence) it raised rally F1@0.5 0.781 → 0.800 — fast white blobs during flight lift in-rally
+activity even when no parabola-validated track survives. It stays off by default until cross-clip LOCO
+confirms it.
+
+Besides the point-level `presence` curve, each validated track also fills an **`in_flight`** curve over its
+whole span, bridging the up-to-`max_gap` frames association loses inside one flight: presence flickers
+between adjacent detections, while `in_flight` stays continuously high while the shuttle is genuinely
+airborne. When present, the shuttle fusion component is a 0.35·presence + 0.25·speed + 0.40·in_flight blend;
+projects without the curve keep the legacy 0.6/0.4 blend byte-for-byte.
 
 ### 5. Fusion and segmentation (`rally.py` + `rally_vision.py`)
 
@@ -287,6 +328,17 @@ This signal needs higher-resolution footage to be worthwhile (8–20 px, where w
 7. `attribute_sides` assigns serves/receives to specific players: **the larger box is nearer the camera**,
    giving near/far; then see who is moving at the serve moment — the one who just swung is the server. When
    the two depths are close it conservatively stays `unknown`
+
+The five pre-weight component curves (players, motion, audio hits, shuttle, ROI) are stored at full frame
+rate (`component_*_full`) alongside the fused activity, so changing a component weight re-fuses the curve in
+milliseconds with **no AI rerun**. `AnalysisParams.fuse_weight_*` override the base multipliers
+(`DEFAULT_BASE_WEIGHTS` 1.35/1.0/0.95/0.9/0.8); with default weights, or on archives lacking the curves,
+resegment reuses the stored `activity_full` exactly. The annotation optimizer has a dedicated **weights
+stage** (coordinate-descent over ×{0.5, 0.75, 1.3, 1.7}, accepting only a blended-score gain with no
+IoU-F1 regression) for per-project tuning. LOCO calibration on clip1–3 (`scripts/calibrate_weights.py`)
+did **not** generalize: the one strong in-sample gain came from the only clip with usable audio, and
+players/motion moves regressed the held-out clip — so the shipped defaults stay as-is and weights are never
+written into older projects. The annotation page can visualize every component track ("Signal tracks").
 
 ### Why rally endpoints are "anchored to the last hit"
 
@@ -642,6 +694,12 @@ $py = ".\.venv\Scripts\python.exe"
 # Offline evaluation of segmentation against a manual annotation (no AI re-run)
 & $py scripts\eval_segmentation.py
 
+# clip1-3 LOCO segmentation metrics / boundary grid / fusion-weight table
+& $py scripts\eval_rallies.py
+& $py scripts\calibrate_boundary.py
+& $py scripts\backfill_components.py                # populate component_*_full under data\cache\eval\backfill
+& $py scripts\calibrate_weights.py --analysis-dir data\cache\eval\backfill
+
 # Pre-fetch the faster-whisper model used by voice-command scoring (optional; auto-downloads otherwise)
 & $py scripts\fetch_speech_model.py
 
@@ -740,9 +798,10 @@ and tracking dominating**.
 
 **Q: Why is "shuttle tracking" off by default?**
 
-Its cost grows with "duration × resolution" and can reach hours for 30 minutes of footage. Rally
-segmentation mainly relies on player motion and frame motion, so it works fine without it. Enable it in "AI
-analysis" when you need shuttle-speed data, and set a time budget.
+Its cost grows with "duration × resolution" and can reach hours on CPU for 30 minutes of footage (with a
+CUDA GPU the candidate scan auto-uses torch and the same job takes minutes). Rally segmentation mainly
+relies on player motion and frame motion, so it works fine without it. Enable it in "AI analysis" when you
+need shuttle-speed data, and set a time budget.
 
 **Q: Can I use it without an NVIDIA GPU?**
 
