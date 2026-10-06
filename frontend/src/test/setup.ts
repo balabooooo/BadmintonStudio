@@ -33,6 +33,15 @@ if (!window.IntersectionObserver) {
   window.IntersectionObserver = IO as unknown as typeof IntersectionObserver
 }
 
+if (!window.ResizeObserver) {
+  class RO {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  window.ResizeObserver = RO as unknown as typeof ResizeObserver
+}
+
 if (!window.CSS) {
   ;(window as any).CSS = { escape: (v: string) => v.replace(/["\\]/g, '\\$&') }
 }

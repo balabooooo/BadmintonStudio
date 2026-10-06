@@ -2,13 +2,16 @@ import type {
   AnalysisParams,
   AnalysisResult,
   AnnotationResponse,
+  AnnotationSignals,
   EnvInfo,
+  OverlayResponse,
   ExportItem,
   ExportPreset,
   JobInfo,
   MediaInfo,
   OptimizeResult,
   PlayerProbe,
+  QualityReport,
   Project,
   ProjectSummary,
   Rally,
@@ -208,6 +211,27 @@ export const api = {
     ),
   annotationCsvUrl: (pid: string, mid: string) =>
     `/api/projects/${pid}/media/${mid}/annotation/export.csv`,
+  /** 降采样多轨信号（标注页信号面板） */
+  getAnnotationSignals: (pid: string, mid: string) =>
+    req<AnnotationSignals>(`/api/projects/${pid}/media/${mid}/annotation/signals`),
+  /** 窗口化球员框 + 关键点骨架叠加数据（可传 AbortSignal 做防抖竞态取消） */
+  getAnnotationOverlay: (
+    pid: string,
+    mid: string,
+    t0: number,
+    t1: number,
+    signal?: AbortSignal,
+  ) =>
+    req<OverlayResponse>(
+      `/api/projects/${pid}/media/${mid}/annotation/overlay?t0=${t0.toFixed(2)}&t1=${t1.toFixed(2)}`,
+      signal ? { signal } : undefined,
+    ),
+  /** 标注质量审计（结构/边界证据告警 + 吸附建议，只建议不自动改写） */
+  getAnnotationQuality: (pid: string, mid: string, signal?: AbortSignal) =>
+    req<QualityReport>(
+      `/api/projects/${pid}/media/${mid}/annotation/quality`,
+      signal ? { signal } : undefined,
+    ),
 
   // ---------------------------------------------------------------- 回合
   patchRally: (pid: string, rid: string, patch: Partial<Rally>) =>

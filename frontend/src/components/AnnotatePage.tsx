@@ -12,23 +12,31 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Activity,
   AlertTriangle,
   Check,
+  Crosshair,
   Download,
   Info,
   Pause,
   PenLine,
   Play,
+  RefreshCw,
+  RotateCcw,
+  ShieldAlert,
   Sparkles,
   Trash2,
-  Wand2,
   X,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn, clamp } from '../lib/format'
-import { Badge, Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
+import { itemCounts, snapPatch, visibleWarnings, warningKey } from '../lib/annotationQuality'
+import { Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
 import { stepSpeedValue } from '../lib/playback'
 import MediaChip from './MediaChip'
+import OptimizePanel from './OptimizePanel'
+import PoseOverlay from './PoseOverlay'
+import SignalTracks from './SignalTracks'
 import { useStore } from '../store/useStore'
 import { useT } from '../i18n/useT'
 import type {
@@ -36,7 +44,9 @@ import type {
   AnnotationDraft,
   AnnotationRally,
   OptimizeResult,
-  SegmentMetric,
+  QualityItem,
+  QualityReport,
+  QualityWarning,
 } from '../lib/types'
 
 interface AnnRally extends AnnotationRally {
@@ -63,41 +73,6 @@ const fmtShort = (t: number) => {
   const m = Math.floor(t / 60)
   const s = t % 60
   return `${m}:${s.toFixed(1).padStart(4, '0')}`
-}
-
-/** 描边进度条（优化结果里的 F1 对比） */
-function MetricBar({ label, m, color }: { label: string; m: SegmentMetric; color: string }) {
-  return (
-    <div className="min-w-0 flex-1">
-      <div className="mb-1 flex items-baseline justify-between gap-2">
-        <span className="text-[11px] text-ink-300">{label}</span>
-        <span className="mono text-[11px]" style={{ color }}>
-          F1 {m.f1.toFixed(3)}
-        </span>
-      </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/8">
-        <div className="h-full rounded-full" style={{ width: `${clamp(m.f1, 0, 1) * 100}%`, background: color }} />
-      </div>
-      <div className="mono mt-1 flex gap-2 text-[10px] text-ink-500">
-        <span>P {m.precision.toFixed(2)}</span>
-        <span>R {m.recall.toFixed(2)}</span>
-        <span>n {m.n}</span>
-      </div>
-    </div>
-  )
-}
-
-const SEG_LABEL_KEYS: Record<string, string> = {
-  seg_prominence: 'annotate.seg.prominence',
-  seg_min_core: 'annotate.seg.minCore',
-  seg_min_rest: 'annotate.seg.minRest',
-  seg_min_quiet: 'annotate.seg.minQuiet',
-  min_rally_seconds: 'annotate.seg.minRally',
-  pose_gate_threshold: 'annotate.seg.poseGate',
-  pose_gate_window: 'annotate.seg.poseGateWindow',
-  pose_gate_one_to_one: 'annotate.seg.poseGateOneToOne',
-  pose_gate_force: 'annotate.seg.poseGateForce',
-  hit_sensitivity: 'annotate.seg.hitSensitivity',
 }
 
 export default function AnnotatePage() {
@@ -150,9 +125,20 @@ export default function AnnotatePage() {
   const [pending, setPending] = useState<{ start: number } | null>(null)
   const undoRef = useRef<{ rallies: Omit<AnnRally, 'id'>[]; hits: { t: number; ours: boolean }[] }[]>([])
 
-  // ---------- 优化
-  const [opt, setOpt] = useState<OptimizeResult | null>(null)
-  const [optimizing, setOptimizing] = useState(false)
+  // ---------- 优化（per-clip：结果按 mediaId 保存，面板永远只显示当前 clip 的结果；
+  // 切换素材不会把旧 clip 的标定误用到新 clip，切回来结果也还在）
+  const [optByMid, setOptByMid] = useState<Record<string, OptimizeResult>>({})
+  const [optimizingMid, setOptimizingMid] = useState<string | null>(null)
+  const [showTracks, setShowTracks] = useState(false)
+  /** 当前素材的优化结果 / 是否正在优化（面板与回调全部经由这两个派生值，天然 per-clip） */
+  const opt = mid ? optByMid[mid] ?? null : null
+  const optimizing = !!mid && optimizingMid === mid
+
+  // ---------- 标注质量审计（P2-d：只建议，不自动改写）
+  const [quality, setQuality] = useState<QualityReport | null>(null)
+  const [qualityLoading, setQualityLoading] = useState(false)
+  const [qOpenIdx, setQOpenIdx] = useState<number | null>(null)
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(new Set())
 
   // ---------- 场景预设
   const [presetOpen, setPresetOpen] = useState(false)
@@ -188,6 +174,20 @@ export default function AnnotatePage() {
   // against a media that has not loaded yet (rapid A -> B -> C switches).
   const loadedMidRef = useRef<string | null>(null)
 
+  /* ------------------------------------------------- 标注质量审计（P2-d） */
+  const loadQuality = useCallback(async (silent = false) => {
+    if (!pid || !mid) return
+    setQualityLoading(true)
+    try {
+      setQuality(await api.getAnnotationQuality(pid, mid))
+    } catch {
+      // Auxiliary audit; a failed refresh keeps whatever report is on screen.
+      if (!silent) toast({ kind: 'warn', title: tr('annotate.qualityFailed') })
+    } finally {
+      setQualityLoading(false)
+    }
+  }, [pid, mid, toast, tr])
+
   /* ---------------------------------------------------------------- 加载 */
   const reload = useCallback(async () => {
     if (!pid || !mid) return
@@ -221,10 +221,14 @@ export default function AnnotatePage() {
       setSaveState(info.rallies?.length ? tr('annotate.loadedRallies', { n: info.rallies.length }) : tr('annotate.newAnnotation'))
       undoRef.current = []
       loadedMidRef.current = mid
+      setQuality(null)
+      setQOpenIdx(null)
+      setDismissed(new Set())
+      void loadQuality(true)
     } catch (e) {
       toast({ kind: 'error', title: tr('annotate.loadFailed'), detail: String(e) })
     }
-  }, [pid, mid, media?.duration, media?.fps, toast, tr])
+  }, [pid, mid, media?.duration, media?.fps, toast, tr, loadQuality])
 
   useEffect(() => {
     void reload()
@@ -246,11 +250,13 @@ export default function AnnotatePage() {
       // 保存期间又编辑过就不要清 dirty：否则编辑会被这次「旧」保存的返回误标成已保存。
       if (seq === editSeq.current) setDirty(false)
       setSaveState(tr('annotate.savedCount', { n: res.count }))
+      // Labels moved: refresh the quality audit so snap suggestions stay in sync.
+      if (quality) void loadQuality(true)
     } catch (e) {
       setSaveState(tr('annotate.saveFailed'))
       toast({ kind: 'error', title: tr('annotate.saveFailed'), detail: String(e) })
     }
-  }, [pid, mid, focus, note, toast, tr])
+  }, [pid, mid, focus, note, toast, tr, quality, loadQuality])
 
   const markDirty = useCallback(() => {
     editSeq.current += 1
@@ -726,8 +732,17 @@ export default function AnnotatePage() {
     }
     const [f0, f1] = focus
     if (f1 > f0) {
-      ctx.fillStyle = 'rgba(56,189,248,.08)'
+      ctx.fillStyle = 'rgba(56,189,248,.10)'
       ctx.fillRect(X(f0), 0, X(f1) - X(f0), h)
+      // Eval-window edges make the optimization/audit span readable at a glance.
+      ctx.strokeStyle = 'rgba(56,189,248,.75)'
+      ctx.lineWidth = 1
+      for (const fe of [f0, f1]) {
+        ctx.beginPath()
+        ctx.moveTo(X(fe) + 0.5, 0)
+        ctx.lineTo(X(fe) + 0.5, h)
+        ctx.stroke()
+      }
     }
     ctx.fillStyle = '#4b5563'
     ctx.globalAlpha = 0.55
@@ -852,12 +867,13 @@ export default function AnnotatePage() {
       toast({ kind: 'warn', title: tr('annotate.needAnnotations') })
       return
     }
-    setOptimizing(true)
+    setOptimizingMid(mid)
     try {
       // 先把当前标注落盘，优化读的是磁盘上的标注
       await doSave()
       const res = await api.optimizeSegmentation(pid, mid, { params })
-      setOpt(res)
+      // 写回发起时那个 clip 的槽位：即使优化期间已切走素材，结果也归属原 clip
+      setOptByMid((prev) => ({ ...prev, [mid]: res }))
       if (!res.best) toast({ kind: 'warn', title: tr('annotate.noUsableParams') })
       else
         toast({
@@ -868,7 +884,8 @@ export default function AnnotatePage() {
     } catch (e) {
       toast({ kind: 'error', title: tr('annotate.optimizeFailed'), detail: String((e as Error)?.message || e) })
     } finally {
-      setOptimizing(false)
+      // 只清自己的 loading：期间若已在别的 clip 上发起新优化，不要误关它的按钮
+      setOptimizingMid((cur) => (cur === mid ? null : cur))
     }
   }, [doSave, mid, pid, params, toast, tr])
 
@@ -966,6 +983,79 @@ export default function AnnotatePage() {
     seek(r.start, true)
   }
 
+  /* ----------------------------------------------------- 质量审计交互（P2-d） */
+  // Backend items are indexed by the sorted annotation order, which `ann` keeps.
+  const qByIndex = useMemo(() => {
+    const m = new Map<number, QualityItem>()
+    for (const it of quality?.items ?? []) m.set(it.index, it)
+    return m
+  }, [quality])
+
+  const qualityTotals = useMemo(() => {
+    let warn = 0
+    let info = 0
+    for (const it of quality?.items ?? []) {
+      const c = itemCounts(it, dismissed)
+      warn += c.warn
+      info += c.info
+    }
+    return { warn, info }
+  }, [quality, dismissed])
+
+  const acceptSnap = (r: AnnRally, qi: QualityItem, w: QualityWarning) => {
+    const patch = snapPatch(r, w)
+    if (!patch) return
+    pushUndo()
+    setAnn((prev) =>
+      prev
+        .map((x) => (x.id === r.id ? { ...x, ...patch } : x))
+        .sort((a, b) => a.start - b.start),
+    )
+    setDismissed((prev) => new Set(prev).add(warningKey(qi.index, w)))
+    setQOpenIdx(null)
+    markDirty()
+  }
+
+  const ignoreWarning = (qi: QualityItem, w: QualityWarning) => {
+    setDismissed((prev) => new Set(prev).add(warningKey(qi.index, w)))
+  }
+
+  const warningText = (w: QualityWarning): string => {
+    const side = w.side
+      ? tr(w.side === 'start' ? 'annotate.lq.sideStart' : 'annotate.lq.sideEnd')
+      : ''
+    switch (w.code) {
+      case 'duration_outlier':
+        return tr('annotate.lq.duration_outlier', { z: (w.z ?? 0).toFixed(1) })
+      case 'boundary_off_quiet':
+        return tr('annotate.lq.boundary_off_quiet', { side, d: (w.distance ?? 0).toFixed(2) })
+      case 'boundary_no_hit':
+        return tr('annotate.lq.boundary_no_hit', { side, d: (w.nearest_hit ?? w.distance ?? 0).toFixed(2) })
+      case 'evidence_contradiction':
+        return tr('annotate.lq.evidence_contradiction', { side })
+      default:
+        return tr(`annotate.lq.${w.code}`)
+    }
+  }
+
+  /* --------------------------------------------------------- 评估窗（P2-d） */
+  const focusIsFull = focus[0] <= 0 && focus[1] >= (duration || 0) - 1e-6
+
+  const tightenFocus = () => {
+    if (!ann.length) return
+    const a = Math.min(...ann.map((r) => r.start))
+    const b = Math.max(...ann.map((r) => r.end))
+    setFocus([Math.max(0, a), Math.min(duration || b, b)])
+    setViewCenter((a + b) / 2)
+    markDirty()
+    toast({ kind: 'success', title: tr('annotate.focusTightened', { n: ann.length }) })
+  }
+
+  const resetFocus = () => {
+    setFocus([0, duration || 0])
+    markDirty()
+  }
+
   /* ---------------------------------------------------------------- 渲染 */
   if (!project || !media) {
     return (
@@ -977,6 +1067,8 @@ export default function AnnotatePage() {
 
   const rows = tab === 'auto' ? auto.map((a) => ({ start: a.start, end: a.end, key: `a${a.index}`, meta: tr('annotate.autoMeta', { shots: a.shots, score: a.score }), id: undefined as number | undefined })) : ann.map((r) => ({ start: r.start, end: r.end, key: `r${r.id}`, meta: r.source === 'auto' ? tr('annotate.sourceAuto') : tr('annotate.sourceManual'), id: r.id }))
   const canOptimize = ann.length > 0
+  const mf = mediaId ? project?.analyses?.[mediaId]?.stats?.match_format : null
+  const matchFormatCode = mf?.format && mf.format !== 'unknown' ? String(mf.format) : null
 
   return (
     <div className="flex h-full flex-col">
@@ -1008,9 +1100,12 @@ export default function AnnotatePage() {
           <div className="relative bg-black">
             <video
               ref={videoRef}
+              // key=mid：切换素材时重挂 video（干净加载新片 + 淡入过渡）。PoseOverlay 是
+              // 它的兄弟节点不受影响——叠加开关与图层状态跨素材保留。
+              key={mid}
               // 加代理路径做缓存键：重新生成代理后 URL 变化，浏览器才会取到新视频。
               src={`${api.proxyUrl(pid, mid)}?v=${encodeURIComponent(media.proxy_path ?? '')}`}
-              className="mx-auto max-h-[44vh] w-full bg-black"
+              className="clip-fade-in mx-auto max-h-[44vh] w-full bg-black"
               preload="auto"
               playsInline
               onClick={togglePlay}
@@ -1035,6 +1130,7 @@ export default function AnnotatePage() {
             <div className="mono absolute top-2 left-3 rounded-md bg-black/55 px-2 py-0.5 text-[12px]">
               <b className="text-court-300">{fmt(time)}</b> / {fmt(duration)}
             </div>
+            <PoseOverlay videoRef={videoRef} pid={pid} mid={mid} />
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5 border-b border-white/7 px-3 py-2">
@@ -1098,14 +1194,51 @@ export default function AnnotatePage() {
           <div className="px-3 pt-2">
             <canvas ref={overviewRef} className="block cursor-crosshair rounded-lg border border-white/8" onPointerDown={overviewPointer} />
           </div>
+          {showTracks && pid && mediaId && (
+            <SignalTracks
+              projectId={pid}
+              mediaId={mediaId}
+              time={time}
+              duration={duration}
+              focus={focus}
+              onSeek={(t) => seek(t, true, false)}
+            />
+          )}
 
           <div className="px-3 py-1 text-[10.5px] text-ink-500">
             <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#4b5563]" /> {tr('annotate.legendAuto')}</span>
             <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#22c55e]" /> {tr('annotate.legendMine')}</span>
             <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#facc15]" /> {tr('annotate.legendSelected')}</span>
             <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-2.5 w-2.5 rounded-sm bg-[#fb923c]" /> {tr('annotate.legendMarking')}</span>
-            <span className="float-right">
-              <button className="mr-1 rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 1.4, 2, Math.max(4, duration)))}>{tr('annotate.zoomOut')}</button>
+            <span className="mr-3 inline-flex items-center gap-1"><i className="inline-block h-[10px] w-2.5 rounded-sm border border-sky-400/70 bg-sky-400/20" /> {tr('annotate.evalWindow')}</span>
+            <span className="float-right inline-flex items-center gap-1">
+              <Tooltip content={tr('annotate.signalsToggle')}>
+                <button
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded border px-1.5',
+                    showTracks ? 'border-sky-400/60 text-sky-300' : 'border-white/10 hover:border-sky-400/60')}
+                  onClick={() => setShowTracks((v) => !v)}
+                >
+                  <Activity size={11} />
+                </button>
+              </Tooltip>
+              <Tooltip content={tr('annotate.tightenFocus')}>
+                <button
+                  className="inline-flex items-center gap-1 rounded border border-white/10 px-1.5 hover:border-sky-400/60 disabled:opacity-40"
+                  disabled={!ann.length}
+                  onClick={tightenFocus}
+                >
+                  <Crosshair size={11} />
+                </button>
+              </Tooltip>
+              {!focusIsFull && (
+                <Tooltip content={tr('annotate.resetFocus')}>
+                  <button className="inline-flex items-center gap-1 rounded border border-white/10 px-1.5 hover:border-sky-400/60" onClick={resetFocus}>
+                    <RotateCcw size={11} />
+                  </button>
+                </Tooltip>
+              )}
+              <button className="ml-1 rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 1.4, 2, Math.max(4, duration)))}>{tr('annotate.zoomOut')}</button>
               <button className="rounded border border-white/10 px-1.5 hover:border-court-500/60" onClick={() => setViewSpan((s) => clamp(s * 0.7, 2, Math.max(4, duration)))}>{tr('annotate.zoomIn')}</button>
             </span>
           </div>
@@ -1120,6 +1253,31 @@ export default function AnnotatePage() {
                 ))}
               </div>
               <div className="absolute inset-x-0 top-5 bottom-0">
+                {focus[1] > focus[0] && (
+                  <>
+                    {/* Dim everything outside the eval window (focus span). */}
+                    <div
+                      className="pointer-events-none absolute top-0 bottom-0 z-10 bg-ink-950/55"
+                      style={{ left: 0, width: Math.max(0, clamp(t2x(focus[0]), 0, geom.W)) }}
+                    />
+                    <div
+                      className="pointer-events-none absolute top-0 bottom-0 z-10 bg-ink-950/55"
+                      style={{ left: Math.min(Math.max(t2x(focus[1]), 0), geom.W), right: 0 }}
+                    />
+                    {[focus[0], focus[1]].map((fe, k) => {
+                      const x = t2x(fe)
+                      if (x < 0 || x > geom.W) return null
+                      return (
+                        <div
+                          key={k}
+                          title={tr('annotate.evalWindow')}
+                          className="pointer-events-none absolute top-0 bottom-0 z-10 w-px bg-sky-400/70"
+                          style={{ left: x }}
+                        />
+                      )
+                    })}
+                  </>
+                )}
                 {auto.map((r, i) => {
                   const x1 = t2x(r.start)
                   const x2 = t2x(r.end)
@@ -1217,7 +1375,8 @@ export default function AnnotatePage() {
           </div>
         </section>
 
-        <aside className="flex w-[360px] shrink-0 flex-col border-l border-white/7 bg-ink-950/35">
+        {/* key=mid：切换素材时右栏内容淡入过渡（回合列表 + 优化面板跟随当前 clip） */}
+        <aside key={mid} className="clip-fade-in flex w-[360px] shrink-0 flex-col border-l border-white/7 bg-ink-950/35">
           <div className="flex gap-1 border-b border-white/7 p-2">
             {([['auto', tr('annotate.tabAuto', { n: auto.length })], ['ann', tr('annotate.tabMine', { n: ann.length })]] as const).map(([id, label]) => (
               <button
@@ -1230,137 +1389,149 @@ export default function AnnotatePage() {
             ))}
           </div>
 
+          {tab === 'ann' && (
+            <button
+              onClick={() => void loadQuality(false)}
+              disabled={qualityLoading || !ann.length}
+              className="flex w-full items-center gap-2 border-b border-white/7 px-3 py-1.5 text-left text-[11px] text-ink-400 hover:bg-white/5 disabled:opacity-60"
+              title={tr('annotate.qualityHint')}
+            >
+              {qualityLoading ? (
+                <RefreshCw size={12} className="shrink-0 animate-spin text-court-300" />
+              ) : (
+                <ShieldAlert size={12} className={cn('shrink-0', qualityTotals.warn > 0 ? 'text-amber-glow' : 'text-court-300')} />
+              )}
+              <span className="shrink-0">{tr('annotate.qualityAudit')}</span>
+              {quality ? (
+                qualityTotals.warn + qualityTotals.info > 0 ? (
+                  <span className="truncate text-ink-500">
+                    {tr('annotate.qualityCounts', { warn: qualityTotals.warn, info: qualityTotals.info })}
+                  </span>
+                ) : (
+                  <span className="truncate text-court-300/80">{tr('annotate.qualityEmpty')}</span>
+                )
+              ) : (
+                <span className="truncate text-ink-600">{tr('annotate.qualityHint')}</span>
+              )}
+            </button>
+          )}
+
           <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
             {rows.length === 0 ? (
               <div className="p-6 text-center text-[12px] text-ink-500">
                 {tab === 'auto' ? tr('annotate.emptyAuto') : tr('annotate.emptyMine')}
               </div>
             ) : (
-              rows.map((r, i) => (
-                <div
-                  key={r.key}
-                  onClick={() => jumpToList(r)}
-                  className={cn('flex cursor-pointer items-center gap-2 border-b border-white/5 px-3 py-1.5 text-[12px] hover:bg-white/5', r.id != null && r.id === sel && 'bg-court-500/12')}
-                >
-                  <span className="w-5 shrink-0 text-[10.5px] text-ink-500">{i + 1}</span>
-                  <span className="mono flex-1 truncate">{r.start.toFixed(2)} → {r.end.toFixed(2)} <span className="text-ink-500">({(r.end - r.start).toFixed(2)}s)</span></span>
-                  <span className="shrink-0 text-[10.5px] text-ink-500">{r.meta}</span>
-                  {r.id != null && (
-                    <button
-                      aria-label={tr('annotate.deleteSelected')}
-                      title={tr('annotate.deleteSelected')}
-                      className="shrink-0 text-ink-600 hover:text-rose-hot"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        pushUndo()
-                        setAnn((prev) => prev.filter((x) => x.id !== r.id))
-                        if (sel === r.id) setSel(null)
-                        markDirty()
-                      }}
+              rows.map((r, i) => {
+                const qi = r.id != null ? qByIndex.get(i) : undefined
+                const qc = qi ? itemCounts(qi, dismissed) : null
+                const qOpen = qi != null && qOpenIdx === i
+                const qVisible = qi && qc && qc.warn + qc.info > 0 ? visibleWarnings(qi, dismissed) : []
+                const rally = r.id != null ? ann.find((a) => a.id === r.id) : undefined
+                return (
+                  <div
+                    key={r.key}
+                    className={cn(
+                      'border-b border-white/5',
+                      r.id != null && r.id === sel && 'bg-court-500/12',
+                      qOpen && 'bg-white/[0.04]',
+                    )}
+                  >
+                    <div
+                      onClick={() => jumpToList(r)}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-white/5"
                     >
-                      <X size={12} />
-                    </button>
-                  )}
-                </div>
-              ))
+                      <span className="w-5 shrink-0 text-[10.5px] text-ink-500">{i + 1}</span>
+                      <span className="mono flex-1 truncate">{r.start.toFixed(2)} → {r.end.toFixed(2)} <span className="text-ink-500">({(r.end - r.start).toFixed(2)}s)</span></span>
+                      <span className="shrink-0 text-[10.5px] text-ink-500">{r.meta}</span>
+                      {qi && qc && qc.warn + qc.info > 0 && (
+                        <button
+                          title={tr('annotate.qualityAudit')}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            jumpToList(r)
+                            setQOpenIdx(qOpen ? null : i)
+                          }}
+                          className={cn(
+                            'inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-[10px]',
+                            qc.warn > 0 ? 'text-amber-glow hover:bg-amber-glow/10' : 'text-ink-500 hover:bg-white/10',
+                          )}
+                        >
+                          <ShieldAlert size={11} />
+                          {qc.warn > 0 ? qc.warn : qc.info}
+                        </button>
+                      )}
+                      {r.id != null && (
+                        <button
+                          aria-label={tr('annotate.deleteSelected')}
+                          title={tr('annotate.deleteSelected')}
+                          className="shrink-0 text-ink-600 hover:text-rose-hot"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            pushUndo()
+                            setAnn((prev) => prev.filter((x) => x.id !== r.id))
+                            if (sel === r.id) setSel(null)
+                            if (qOpenIdx === i) setQOpenIdx(null)
+                            markDirty()
+                          }}
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
+                    {qOpen && rally && qVisible.length > 0 && (
+                      <div className="space-y-1 px-3 pb-2 pl-9 pr-2">
+                        {qVisible.map((w) => (
+                          <div key={warningKey(qi!.index, w)} className="flex items-start gap-1.5 text-[10.5px]">
+                            <AlertTriangle
+                              size={10}
+                              className={cn('mt-[2px] shrink-0', w.severity === 'warn' ? 'text-amber-glow' : 'text-ink-500')}
+                            />
+                            <span className="flex-1 text-ink-300">{warningText(w)}</span>
+                            <div className="flex shrink-0 gap-1">
+                              {w.snap_t != null && w.side && snapPatch(rally, w) && (
+                                <button
+                                  className="rounded border border-court-500/40 px-1 py-[1px] text-court-200 hover:bg-court-500/15"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    acceptSnap(rally, qi!, w)
+                                  }}
+                                >
+                                  {tr('annotate.lq.acceptSnap', { t: w.snap_t!.toFixed(2) })}
+                                </button>
+                              )}
+                              <button
+                                className="rounded border border-white/10 px-1 py-[1px] text-ink-500 hover:bg-white/10"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  ignoreWarning(qi!, w)
+                                }}
+                              >
+                                {tr('annotate.lq.ignore')}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        <div className="text-[10px] text-ink-600">{tr('annotate.qualityHint')}</div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })
             )}
           </div>
 
-          {/* 参数优化 */}
-          <div className="border-t border-white/7 p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <Wand2 size={13} className="text-court-300" />
-              <span className="text-[12px] font-semibold text-white">{tr('annotate.optimizeTitle')}</span>
-              <div className="flex-1" />
-              <Button size="sm" variant="ghost" onClick={openPresetDialog} title={tr('annotate.savePresetTooltip')}>
-                {tr('annotate.saveAsPreset')}
-              </Button>
-              <Button size="sm" variant="primary" loading={optimizing} disabled={!canOptimize} onClick={() => void runOptimize()}>
-                {tr('annotate.optimize')}
-              </Button>
-            </div>
-            {!opt ? (
-              <div className="text-[11px] leading-relaxed text-ink-500">
-                {tr('annotate.optimizeDesc')}
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <div className="flex gap-3">
-                  <MetricBar label={tr('annotate.baseline')} m={opt.baseline} color="#8b96ad" />
-                  {opt.best && <MetricBar label={tr('annotate.best')} m={opt.best} color="#38e0a2" />}
-                </div>
-                <div className="text-[10.5px] text-ink-500">
-                  {tr('annotate.optStats', { gt: opt.gt_count, tried: opt.tried, iou: opt.iou_threshold })}
-                </div>
-                {(opt.best?.hit || opt.baseline?.hit) && (
-                  <div className="rounded-lg border border-white/8 bg-white/[0.02] p-2 text-[10.5px] text-ink-300">
-                    <div className="mb-0.5 text-ink-500">{tr('annotate.hitMetricsTitle')}</div>
-                    <div className="mono flex flex-wrap gap-x-3 gap-y-0.5">
-                      <span>
-                        {tr('annotate.hitBaseline')} P {(opt.baseline.hit?.precision ?? 0).toFixed(2)} · R{' '}
-                        {(opt.baseline.hit?.recall ?? 0).toFixed(2)} · F1 {(opt.baseline.hit?.f1 ?? 0).toFixed(3)}
-                      </span>
-                      {opt.best?.hit && (
-                        <span className="text-court-200">
-                          {tr('annotate.hitBest')} P {opt.best.hit.precision.toFixed(2)} · R{' '}
-                          {opt.best.hit.recall.toFixed(2)} · F1 {opt.best.hit.f1.toFixed(3)}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                )}
-                {opt.stages && (
-                  <div className="flex flex-wrap gap-1.5 text-[10px]">
-                    {(['segment', 'gate', 'sensitivity'] as const).map((st) => {
-                      const s = opt.stages?.[st]
-                      if (!s) return null
-                      return (
-                        <span key={st} className="rounded border border-white/10 px-1.5 py-[1px] text-ink-400">
-                          {tr(`annotate.stage.${st}`)} · F1 {(s.best?.f1 ?? 0).toFixed(3)}
-                          {s.best?.hit ? ` · hitF1 ${s.best.hit.f1.toFixed(3)}` : ''}
-                        </span>
-                      )
-                    })}
-                  </div>
-                )}
-                {opt.best && (
-                  <div className="rounded-lg border border-court-500/25 bg-court-500/[0.06] p-2">
-                    <div className="mb-1 flex items-center gap-2">
-                      <span className="text-[11px] text-court-200">{tr('annotate.suggested')}</span>
-                      <div className="flex-1" />
-                      <Button size="sm" variant="primary" onClick={() => void applyBest()}>{tr('annotate.applyResegment')}</Button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
-                      {Object.entries(opt.best.params).map(([k, v]) => (
-                        <div key={k} className="mono flex justify-between text-[10.5px] text-ink-300">
-                          <span className="truncate text-ink-500">{tr(SEG_LABEL_KEYS[k] || k)}</span>
-                          <span>{v}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <div className="max-h-[180px] overflow-y-auto rounded-lg border border-white/8">
-                  {opt.results.slice(0, 20).map((m, i) => (
-                    <button
-                      key={i}
-                      onClick={() => applyParam(m.params)}
-                      className="flex w-full items-center gap-2 border-b border-white/5 px-2 py-1 text-left text-[11px] last:border-b-0 hover:bg-white/6"
-                    >
-                      <Badge color={i === 0 ? '#38e0a2' : undefined}>F1 {m.f1.toFixed(3)}</Badge>
-                      <span className="mono flex-1 truncate text-ink-500">
-                        {Object.entries(m.params).map(([k, v]) => `${tr(SEG_LABEL_KEYS[k] || k)}=${v}`).join(' · ')}
-                      </span>
-                      <span className="text-ink-500">n{m.n}</span>
-                    </button>
-                  ))}
-                </div>
-                <div className="text-[10.5px] leading-relaxed text-ink-500">
-                  {tr('annotate.resegmentHint')}
-                </div>
-              </div>
-            )}
-          </div>
+          {/* 参数优化（per-clip：面板内容绑定当前激活素材，切换 clip 自动跟随） */}
+          <OptimizePanel
+            opt={opt}
+            optimizing={optimizing}
+            canOptimize={canOptimize}
+            matchFormat={matchFormatCode}
+            onRun={() => void runOptimize()}
+            onApplyBest={() => void applyBest()}
+            onApplyParam={(patch) => void applyParam(patch)}
+            onOpenPreset={openPresetDialog}
+          />
         </aside>
       </div>
 

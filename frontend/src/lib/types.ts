@@ -148,6 +148,12 @@ export interface AnalysisParams {
   seg_min_core: number
   max_frames: number
   sample_fps: number
+  /** Fusion component base weights (annotation optimizer stage E); defaults match the backend. */
+  fuse_weight_players: number
+  fuse_weight_motion: number
+  fuse_weight_audio: number
+  fuse_weight_shuttle: number
+  fuse_weight_roi: number
 }
 
 /* ------------------------------------------------------------------ 人工标注 */
@@ -194,6 +200,77 @@ export interface AnnotationResponse {
   hit_times_raw: number[]
 }
 
+/** 叠加层：某一帧的一个球员框（归一化坐标） */
+export interface OverlayBox {
+  track: number
+  xyxy: [number, number, number, number]
+  /** 检测置信度（v2 可视化缓存才有；v1 缺失时不做阈值过滤，全部显示） */
+  conf?: number
+}
+
+/** 叠加层：某一帧的一条原始检测框（未跟踪、无 track id，灰色虚线诊断层；v2 缓存才有） */
+export interface OverlayDet {
+  xyxy: [number, number, number, number]
+  conf: number
+}
+
+/** 叠加层：某一帧一个人的 COCO 17 关键点，[x, y, conf]，xy 已归一化 */
+export interface OverlaySkeleton {
+  track: number
+  kp: [number, number, number][]
+}
+
+/** 叠加层：单帧数据（仅包含有框或有关键点的帧） */
+export interface OverlayFrame {
+  t: number
+  boxes: OverlayBox[]
+  skeletons: OverlaySkeleton[]
+  /** 该帧的全部原始检测（v2 缓存；尺寸过滤前、跟踪器实际看到的全集） */
+  dets?: OverlayDet[]
+}
+
+/** GET annotation/overlay 响应 */
+export interface OverlayResponse {
+  t0: number
+  t1: number
+  fps: number
+  duration: number
+  boxes_available: boolean
+  skeletons_available: boolean
+  frames: OverlayFrame[]
+}
+
+/** GET annotation/signals 响应（降采样多轨信号） */
+export interface AnnotationSignals {
+  duration: number
+  fps: number
+  activity: number[]
+  threshold_hi: number
+  threshold_lo: number
+  weights: Record<string, number>
+  components: Record<string, number[]>
+  /** 羽毛球「在飞」覆盖曲线（仅开启 use_shuttle 的新分析有） */
+  shuttle_in_flight?: number[]
+  motion: number[]
+  motion_fps: number
+  player_motion: number[]
+  active_count: number[]
+  player_coverage: number[]
+  player_fps: number
+  pose: {
+    available: boolean
+    swing: number[]
+    ok: number[]
+    overhead: number[]
+    fps: number
+    coverage: number
+  }
+  hit_times: number[]
+  hit_times_raw: number[]
+  has_boxes_cache: boolean
+  has_pose_cache: boolean
+}
+
 /** 击球归属门控的判定指标 */
 export interface HitMetric {
   tp: number
@@ -215,8 +292,50 @@ export interface SegmentMetric {
   recall: number
   f1: number
   params: Record<string, number>
+  /** ±1.0s 边界带 F1（起/止均值，P2 混合目标） */
+  boundary_band_f1?: number
+  /** 0.7 IoU F1 + 0.3 边界带 F1 的组合分 */
+  score?: number
   /** 有击球级标注时，该组参数下的击球归属指标 */
   hit?: HitMetric
+}
+
+/** 单条标注的一个质量告警（code 为稳定 ASCII 码，UI 翻译） */
+export interface QualityWarning {
+  code: 'overlap' | 'too_close' | 'duration_outlier' | 'boundary_off_quiet' |
+    'boundary_no_hit' | 'evidence_contradiction' | string
+  severity: 'warn' | 'info'
+  side?: 'start' | 'end'
+  /** 与最近参照（quiet 谷/击球/相邻标注）的距离，秒 */
+  distance?: number
+  /** 建议吸附时刻（只建议，不自动改写），秒 */
+  snap_t?: number
+  snap_kind?: 'quiet' | string
+  snap_distance?: number
+  /** 最近击球距离，秒 */
+  nearest_hit?: number
+  /** duration_outlier：时长与稳健 z */
+  duration?: number
+  z?: number
+  /** evidence_contradiction：内外活动度对比（归一化） */
+  contrast?: number
+}
+
+/** GET annotation/quality 响应里的一条标注审计结果 */
+export interface QualityItem {
+  index: number
+  start: number
+  end: number
+  severity: 'ok' | 'info' | 'warn'
+  warnings: QualityWarning[]
+}
+
+/** GET annotation/quality 响应 */
+export interface QualityReport {
+  count: number
+  severity_counts: { warn: number; info: number }
+  items: QualityItem[]
+  focus: [number, number] | null
 }
 
 /** 分阶段搜索中单个阶段的结果 */
@@ -224,6 +343,9 @@ export interface OptimizeStage {
   search_fields: string[]
   tried: number
   best: SegmentMetric | null
+  /** weights 阶段：实际接受的权重移动步数 */
+  accepted_moves?: number
+  factors?: number[]
 }
 
 export interface OptimizeResult {
@@ -235,10 +357,12 @@ export interface OptimizeResult {
   results: SegmentMetric[]
   tried: number
   search_fields: string[]
-  /** 分阶段搜索：segment / gate / sensitivity */
+  /** 分阶段搜索：segment / gate / sensitivity / padding */
   stages?: Record<string, OptimizeStage>
   hit_label_count?: number
-  suggest: Record<string, number>
+  suggest: Record<string, unknown>
+  /** 优化目标：边界带宽（秒）与权重 */
+  objective?: { band: number; band_weight: number }
 }
 
 /** 场地标定与机位识别结果 */

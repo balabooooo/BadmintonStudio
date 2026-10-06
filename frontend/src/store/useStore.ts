@@ -264,6 +264,11 @@ export const DEFAULT_PARAMS: AnalysisParams = {
   seg_min_core: 1.0,
   max_frames: 0,
   sample_fps: 12,
+  fuse_weight_players: 1.35,
+  fuse_weight_motion: 1.0,
+  fuse_weight_audio: 0.95,
+  fuse_weight_shuttle: 0.9,
+  fuse_weight_roi: 0.8,
 }
 
 let toastSeq = 0

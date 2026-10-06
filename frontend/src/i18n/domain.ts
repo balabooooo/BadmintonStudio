@@ -34,3 +34,9 @@ export function viewpointLabel(viewpoint: string): string {
   if (!viewpoint) return ''
   return trOr(`viewpoint.${viewpoint}`, viewpoint)
 }
+
+/** stats.match_format.format 稳定码 (single/doubles/unknown) -> 显示名；未知值原样返回。 */
+export function matchFormatLabel(code: string): string {
+  if (!code) return ''
+  return trOr(`matchFormat.${code}`, code)
+}
