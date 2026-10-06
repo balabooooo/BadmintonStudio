@@ -9,9 +9,11 @@
  * centered card, so the tour can never dead-end.
  *
  * The overlay never blocks pointer events: the dimming is purely visual, so
- * interactive steps can drive the real UI behind it. Keyboard: ←/→ step,
- * Enter next (gated on interactive steps' waitFor like the Next button),
- * Esc quit; Tab is trapped inside the bubble.
+ * interactive steps can drive the real UI behind it. Keyboard: ←/→ step
+ * (inert while typing in editable fields), Enter next (gated on interactive
+ * steps' waitFor like the Next button), Esc quit — but only when no Modal is
+ * open: an open Modal consumes Esc to close just itself and the tour keeps
+ * running. Tab is trapped inside the bubble.
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -273,17 +275,30 @@ export default function TourOverlay() {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null
       const inBubble = !!target?.closest?.('[data-tour-bubble]')
+      // Typing into any editable control (e.g. naming a project in the
+      // library step): ←/→ must keep moving the caret, so they cannot
+      // navigate the tour either.
+      const inEditable = !!target?.closest?.('input, textarea, select')
       const gated = stepRef.current?.kind === 'interactive' && satisfiedRef.current !== true
       if (e.key === 'Escape') {
+        // Subtlest rule in this file: every Modal also closes itself on a
+        // window-level Escape, and both handlers fire on the same keypress.
+        // While a modal is on screen (the dialog walkthrough steps live
+        // inside one), Esc must close just that dialog and the tour must
+        // keep running — so this handler backs off entirely and the Modal's
+        // own listener wins; the dialog-close step's waitFor(dialogClosed)
+        // gate then opens as designed. Only a bare Esc (no modal in the
+        // DOM) skips the whole tour.
+        if (document.querySelector('[data-modal]')) return
         e.preventDefault()
         useTourStore.getState().skip()
-      } else if (e.key === 'ArrowRight') {
+      } else if (e.key === 'ArrowRight' && !inEditable) {
         e.preventDefault()
         if (!gated) useTourStore.getState().next()
-      } else if (e.key === 'ArrowLeft') {
+      } else if (e.key === 'ArrowLeft' && !inEditable) {
         e.preventDefault()
         useTourStore.getState().prev()
-      } else if (e.key === 'Enter' && !inBubble && !target?.closest?.('input, textarea, select')) {
+      } else if (e.key === 'Enter' && !inBubble && !inEditable) {
         if (!gated) useTourStore.getState().next()
       }
     }

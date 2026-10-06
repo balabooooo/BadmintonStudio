@@ -505,6 +505,9 @@ export function Modal({
     <AnimatePresence>
       {open && (
         <motion.div
+          // Stable marker for "a modal is on screen" while `open`: the tour's
+          // Esc handler defers to the Modal's own Escape close when it exists.
+          data-modal=""
           className="fixed inset-0 z-50 flex items-center justify-center p-6"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}

@@ -126,6 +126,19 @@ describe('tour store', () => {
   })
 })
 
+describe('tour steps', () => {
+  it('buildSteps invariants: unique ids, centered ⇔ no target, interactive ⇒ waitFor', () => {
+    const steps = buildSteps()
+    const ids = steps.map((s) => s.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const step of steps) {
+      if (step.kind === 'centered') expect(step.target).toBeUndefined()
+      else expect(step.target).toBeDefined()
+      if (step.kind === 'interactive') expect(typeof step.waitFor).toBe('function')
+    }
+  })
+})
+
 /* ------------------------------------------------------------------ overlay */
 
 function makeMedia(id: string, name: string): MediaInfo {
@@ -189,6 +202,7 @@ describe('tour overlay', () => {
   afterEach(() => {
     vi.useRealTimers()
     document.querySelectorAll('[data-tour]').forEach((n) => n.remove())
+    document.querySelectorAll('[data-modal]').forEach((n) => n.remove())
   })
 
   it('registers the step count on mount and renders the welcome card with dialog semantics', () => {
@@ -375,6 +389,81 @@ describe('tour overlay', () => {
     })
     fireEvent.keyDown(window, { key: 'ArrowRight' })
     expect(useTourStore.getState().index).toBe(3)
+  })
+
+  it('Escape with a modal open closes only the dialog: the tour stays on its step', () => {
+    addAnchor('nav-rail')
+    render(<TourOverlay />)
+    act(() => {
+      useTourStore.getState().start('manual')
+    })
+    act(() => {
+      useTourStore.getState().goTo(1)
+    })
+    expect(screen.getByText('Global navigation')).toBeInTheDocument()
+
+    // Simulate an open Modal (ui.tsx stamps `data-modal` on its root while
+    // open): Esc must close just that dialog, so the tour handler backs off
+    // and the tour keeps running.
+    const modal = document.createElement('div')
+    modal.setAttribute('data-modal', '')
+    document.body.appendChild(modal)
+    try {
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(useTourStore.getState().active).toBe(true)
+      expect(useTourStore.getState().index).toBe(1)
+
+      // Without a modal on screen the same keypress skips the whole tour
+      // (the pre-existing behavior).
+      modal.remove()
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(useTourStore.getState().active).toBe(false)
+      expect(loadTourPrefs()).toEqual({ seen: true, completed: false })
+    } finally {
+      modal.remove()
+    }
+  })
+
+  it('arrow keys do not navigate while the event target is an editable input', () => {
+    addAnchor('nav-rail')
+    render(<TourOverlay />)
+    act(() => {
+      useTourStore.getState().start('manual')
+    })
+    act(() => {
+      useTourStore.getState().goTo(1)
+    })
+    expect(screen.getByText('Global navigation')).toBeInTheDocument()
+
+    // Typing a project name (library step): ←/→ move the caret, so the tour
+    // must neither navigate nor preventDefault the event.
+    const input = document.createElement('input')
+    document.body.appendChild(input)
+    try {
+      const right = new KeyboardEvent('keydown', {
+        key: 'ArrowRight',
+        bubbles: true,
+        cancelable: true,
+      })
+      input.dispatchEvent(right)
+      expect(right.defaultPrevented).toBe(false)
+      expect(useTourStore.getState().index).toBe(1)
+
+      const left = new KeyboardEvent('keydown', {
+        key: 'ArrowLeft',
+        bubbles: true,
+        cancelable: true,
+      })
+      input.dispatchEvent(left)
+      expect(left.defaultPrevented).toBe(false)
+      expect(useTourStore.getState().index).toBe(1)
+
+      // Control: outside editable targets ArrowLeft still navigates back.
+      fireEvent.keyDown(window, { key: 'ArrowLeft' })
+      expect(useTourStore.getState().index).toBe(0)
+    } finally {
+      input.remove()
+    }
   })
 
   it('loadSamples with no project creates one first, then seeds and imports', async () => {
