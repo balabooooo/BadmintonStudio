@@ -55,3 +55,8 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - **Never hardcode user-facing Chinese/English**: always go through `tr()` / `tr(...)`. Comments and docstrings stay English.
 - **Stable codes, translated at display**: rally tags are canonical ASCII codes (`scoring.TAG_*`, e.g. `many_shots`), not localized strings. `scoring.migrate_tags()` maps legacy Chinese tags on project load. Export preset `id`s, job `stage`/`status`/`kind`, and viewpoint codes are likewise stable; only their display names are translated. `speech_phrases` tags are user data and pass through untranslated.
 - `tests/test_core.py::test_i18n_catalogs` asserts backend zh/en key-set parity, interpolation/fallback, and the tag-code behavior. Keep catalog key sets equal. The frontend equivalent is `frontend/src/i18n/catalog.test.ts`, which asserts fragment tuple structure, non-empty translations, and zh/en key-set parity across all `fragments/*.ts`.
+
+## Guide Mode (功能说明模式)
+功能说明模式维护规范：所有新增或修改的功能模块必须同步更新说明模式的guide文档，确保用户引导内容与实际功能保持一致。更新时需包含功能描述、操作方式及视觉标识变更。
+Guide step definitions live in `frontend/src/tour/steps.ts`; new controls need a
+`data-tour` anchor plus a matching step with bilingual copy in `i18n/catalog/fragments/tour.ts`.
