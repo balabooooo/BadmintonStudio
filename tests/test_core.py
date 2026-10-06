@@ -42,6 +42,22 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
+def _find_ffmpeg() -> str:
+    """Resolve ffmpeg the same way the app does, for the sample-synthesis test.
+
+    Falls back to the in-project tools path (without checking existence) so a
+    missing ffmpeg cannot break the whole suite at import time.
+    """
+    try:
+        from bms.core.ffmpeg import find_ffmpeg
+        return find_ffmpeg()
+    except FileNotFoundError:
+        return str(ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe")
+
+
+FFMPEG = _find_ffmpeg()
+
+
 # ------------------------------------------------------------------ Interface consistency
 
 
@@ -3003,6 +3019,26 @@ def test_local_origin_guard() -> None:
     )
 
 
+def test_samples_generation() -> None:
+    """Sample synthesis must raise on a broken ffmpeg path, produce two non-empty
+    files, and reuse them on the second call (idempotent)."""
+    print("\n示例素材合成")
+    import tempfile
+    from bms import samples as SM
+    with tempfile.TemporaryDirectory() as td:
+        # bad ffmpeg path must raise, not silently return files
+        try:
+            SM.ensure_sample_files(Path(td) / "bad", "definitely-not-ffmpeg", small=True)
+            check("bad ffmpeg raises", False)
+        except Exception:
+            check("bad ffmpeg raises", True)
+        files = SM.ensure_sample_files(Path(td), FFMPEG, small=True)
+        check("生成两个示例", len(files) == 2)
+        check("示例非空", all(f.exists() and f.stat().st_size > 0 for f in files))
+        again = SM.ensure_sample_files(Path(td), FFMPEG, small=True)
+        check("二次调用直接复用", [f.name for f in again] == [f.name for f in files])
+
+
 def main() -> int:
     test_player_pipeline_contract()
     test_shuttle_pipeline_contract()
@@ -3087,6 +3123,7 @@ def main() -> int:
     test_cache_clear_unknown_target()
     test_export_merge_passes_cancel()
     test_local_origin_guard()
+    test_samples_generation()
     print()
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：{FAILURES}")
