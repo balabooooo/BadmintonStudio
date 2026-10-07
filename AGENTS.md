@@ -35,6 +35,15 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - Frontend tests use jsdom; `setup.ts` stubs the APIs jsdom lacks (`IntersectionObserver`, `matchMedia`, `scrollIntoView`, `CSS.escape`). Mock the `api` module (`vi.mock('../lib/api', ...)`) to avoid network calls; drive components by setting Zustand store state directly (`useStore.setState(...)`).
 - The backend serves `frontend/dist`; frontend changes need `npm run build` before `start.cmd`/desktop picks them up (index.html is served `no-store` and the desktop URL carries a dist-mtime cache-bust, so a restart reloads the new bundle). Use `pwsh -File scripts/dev.ps1` for HMR (frontend 5273, backend 8000).
 
+## Testing requirements (mandatory gate)
+- **When developing new features or modifying existing functionality, developers must add corresponding test cases. Test cases are not required if they already exist for the specific functionality being changed.**
+- **No code change is complete until the maintained test suites pass locally.** There is no CI/pre-commit enforcement, so the gate is manual and binding on every change (bugfix, feature, refactor, config):
+  - Backend: `$env:PYTHONPATH='D:\Projects\BadmintonStudio\backend'; $env:PYTHONIOENCODING='utf-8'; .\.venv\Scripts\python.exe tests\test_core.py`
+  - Frontend (inside `frontend/`): `npm run test`, `npm run lint`, and `npm run build` (`tsc -b` must be clean).
+- **New behavior ships with tests**: new public functions, store actions, API contracts, or user-visible components get unit/component coverage in the same change; bug fixes add a regression test that fails without the fix.
+- When changing a public analysis signature, cache format, or stable codes (stage/kind/tag/viewpoint), update `tests/test_core.py` (including `test_i18n_catalogs`) and the relevant frontend tests (`catalog.test.ts` enforces zh/en key parity) in the same change.
+- Run the relevant subset while iterating, but run all three full commands above before handing work back; paste or state the passing results as evidence.
+
 ## Repository hygiene
 - **Never commit or push temporary/throwaway work**: ad-hoc test code and one-off scripts (debug snippets, scratch experiments, quick probes) are strictly forbidden in the remote repository. This does **not** apply to the maintained test suites — `tests/test_core.py` and `frontend/src/**/*.test.ts(x)` are normal tracked code.
 - **Delete temporary test code/scripts right after use**; do not leave them in the working tree for later.
@@ -49,14 +58,17 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 
 ## Bilingual UI (i18n)
 - **Frontend** (`frontend/src/i18n/`): `useT()` returns `tr(key, params?)` for components; `t()` from `i18n/index.ts` is the non-reactive global (store actions, non-React helpers). Language is a Zustand `lang` field persisted to `localStorage['bms.lang']`, toggled in `SettingsPage`; default `zh`.
-  - Catalog: `i18n/catalog/zh.ts` + `en.ts` hold the base keys; large component namespaces live in `i18n/catalog/fragments/*.ts` as `[key, 中文, English]` tuples merged by `fragments/index.ts`. **Add new strings to the fragments (or base catalogs) with BOTH languages.**
+  - Catalog: `i18n/catalog/zh.ts` + `en.ts` hold the base keys; large component namespaces live in `i18n/catalog/fragments/*.ts` as `[key, Chinese, English]` tuples merged by `fragments/index.ts`. **Add new strings to the fragments (or base catalogs) with BOTH languages.**
   - Domain helpers `i18n/domain.ts`: `jobStageLabel` / `jobKindLabel` / `tagLabel` / `viewpointLabel` translate stable backend codes.
-- **Backend** (`backend/bms/i18n.py`): user-facing strings use message keys + `tr(key, **params)`. Catalogs: `locales/zh.py` + `en.py` (base) merged with `locales/fragments/*.py` (`(key, 中文, English)` tuples). Language comes from `X-BMS-Lang` (then `Accept-Language`) for HTTP, `?lang=` for `/ws`; jobs capture the submitting request's language in `JobManager.submit` and install it in the worker thread so `tr()` works deep inside `analysis/`.
+- **Backend** (`backend/bms/i18n.py`): user-facing strings use message keys + `tr(key, **params)`. Catalogs: `locales/zh.py` + `en.py` (base) merged with `locales/fragments/*.py` (`(key, Chinese, English)` tuples). Language comes from `X-BMS-Lang` (then `Accept-Language`) for HTTP, `?lang=` for `/ws`; jobs capture the submitting request's language in `JobManager.submit` and install it in the worker thread so `tr()` works deep inside `analysis/`.
 - **Never hardcode user-facing Chinese/English**: always go through `tr()` / `tr(...)`. Comments and docstrings stay English.
 - **Stable codes, translated at display**: rally tags are canonical ASCII codes (`scoring.TAG_*`, e.g. `many_shots`), not localized strings. `scoring.migrate_tags()` maps legacy Chinese tags on project load. Export preset `id`s, job `stage`/`status`/`kind`, and viewpoint codes are likewise stable; only their display names are translated. `speech_phrases` tags are user data and pass through untranslated.
 - `tests/test_core.py::test_i18n_catalogs` asserts backend zh/en key-set parity, interpolation/fallback, and the tag-code behavior. Keep catalog key sets equal. The frontend equivalent is `frontend/src/i18n/catalog.test.ts`, which asserts fragment tuple structure, non-empty translations, and zh/en key-set parity across all `fragments/*.ts`.
 
-## Guide Mode (功能说明模式)
-功能说明模式维护规范：所有新增或修改的功能模块必须同步更新说明模式的guide文档，确保用户引导内容与实际功能保持一致。更新时需包含功能描述、操作方式及视觉标识变更。
+## Guide Mode (interactive feature walkthrough)
+Guide Mode maintenance rule: whenever a feature module is added or modified, the Guide Mode
+documentation must be updated in lockstep so that the user-facing guidance stays consistent with
+the actual functionality. Each update must cover the feature description, how to operate it, and
+any changes to its visual identifiers.
 Guide step definitions live in `frontend/src/tour/steps.ts`; new controls need a
 `data-tour` anchor plus a matching step with bilingual copy in `i18n/catalog/fragments/tour.ts`.
