@@ -93,9 +93,26 @@ export default function ExportDialog({ open, onClose }: { open: boolean; onClose
 
   // 与后端 `_safe_name` 同口径，用来推断本次会写出哪个文件名。
   const safeName = (s: string) => s.replace(/[<>:"/\\|?*]/g, '_').trim().slice(0, 120) || 'export'
-  const targetName = `${safeName(name || tr('exportdlg.finalName'))}${mode === 'separate' ? '_01' : ''}.mp4`
-  // 只覆盖同目录下的旧导出；这里至少能发现「本应用之前导出过的同名文件」。
-  const overwrite = existingNames.some((n) => n.toLowerCase() === targetName.toLowerCase())
+  const baseName = safeName(name || tr('exportdlg.finalName'))
+  const targetName = `${baseName}${mode === 'separate' ? '_01' : ''}.mp4`
+  // 与后端 `_unique_export_path` 同口径：目标名已存在时基名追加 _1、_2…（分轨模式再接 _01 段号），
+  // 不会覆盖旧导出。这里对照的是本应用登记过的导出名，至少能提前发现最常见的同名冲突。
+  const taken = (n: string) => existingNames.some((x) => x.toLowerCase() === n.toLowerCase())
+  const conflict = taken(targetName)
+  const nextName = (() => {
+    for (let k = 1; k < 1000; k++) {
+      const cand = mode === 'separate' ? `${baseName}_${k}_01.mp4` : `${baseName}_${k}.mp4`
+      if (!taken(cand)) return cand
+    }
+    return targetName
+  })()
+  // 后端同名冲突时自动顺延命名；merge 完成区只显示目录，这里推断实际文件名并在变化时明确提示。
+  const finalName = resultPaths.length === 1 ? (resultPaths[0].split(/[\\/]/).pop() || '') : ''
+  const finalStem = finalName.replace(/\.mp4$/i, '')
+  const renamed =
+    mode === 'merge' &&
+    finalStem.toLowerCase().startsWith(baseName.toLowerCase()) &&
+    /^_\d+$/.test(finalStem.slice(baseName.length))
 
   const copyPath = async () => {
     const p = resultPaths[0]
@@ -273,6 +290,12 @@ export default function ExportDialog({ open, onClose }: { open: boolean; onClose
               <code className="mono mt-1 block max-h-[90px] overflow-y-auto break-all rounded-md bg-black/35 px-2 py-1.5 text-[10.5px] text-ink-200">
                 {String(job?.result?.dir || outputDir || resultPaths[0])}
               </code>
+              {renamed && finalName && (
+                <div className="mt-1 flex items-start gap-1.5 text-[10.5px] text-amber-glow">
+                  <AlertTriangle size={11} className="mt-[1px] shrink-0" />
+                  <span>{tr('exportdlg.renamedNotice', { file: targetName, next: finalName })}</span>
+                </div>
+              )}
               {resultPaths.length > 1 && (
                 <div className="mt-1 max-h-[80px] space-y-0.5 overflow-y-auto text-[10px] text-ink-500">
                   {resultPaths.map((p) => (
@@ -415,11 +438,15 @@ export default function ExportDialog({ open, onClose }: { open: boolean; onClose
         <div
           className={cn(
             'mt-1 flex items-start gap-1.5 text-[10.5px] leading-relaxed',
-            overwrite ? 'text-amber-glow' : 'text-ink-500',
+            conflict ? 'text-amber-glow' : 'text-ink-500',
           )}
         >
-          {overwrite && <AlertTriangle size={11} className="mt-[1px] shrink-0" />}
-          <span>{overwrite ? tr('exportdlg.overwriteWarn', { file: targetName }) : tr('exportdlg.overwriteHint')}</span>
+          {conflict && <AlertTriangle size={11} className="mt-[1px] shrink-0" />}
+          <span>
+            {conflict
+              ? tr('exportdlg.overwriteWarn', { file: targetName, next: nextName })
+              : tr('exportdlg.overwriteHint', { example: `${baseName}_1.mp4` })}
+          </span>
         </div>
       </div>
 

@@ -1801,7 +1801,7 @@ def export(pid: str, payload: dict = Body(...)) -> dict:
     separate = mode == "separate"
     name = str(payload.get("name") or f"{proj.name}_{int(time.time())}")
     out_dir = _resolve_output_dir(payload.get("output_dir"))
-    out = out_dir / f"{_safe_name(name)}.mp4"
+    out = _unique_export_path(out_dir / f"{_safe_name(name)}.mp4", separate=separate)
     timeline = proj.timeline
     if not any(t.clips for t in timeline.tracks):
         raise HTTPException(400, tr("export.empty_timeline"))
@@ -1848,6 +1848,31 @@ def _safe_name(s: str) -> str:
     for ch in '<>:"/\\|?*':
         s = s.replace(ch, "_")
     return s.strip()[:120] or "export"
+
+
+def _export_target_taken(out: Path, separate: bool) -> bool:
+    """Whether this export would land on an existing file.
+
+    Separate mode never writes ``out`` itself: it writes ``<stem>_01<ext>``… next to it, so the
+    collision probe must look at the first segment file instead.
+    """
+    probe = out.with_name(f"{out.stem}_01{out.suffix}") if separate else out
+    return probe.exists()
+
+
+def _unique_export_path(out: Path, separate: bool = False) -> Path:
+    """Resolve export-name conflicts by appending ``_1``, ``_2``… to the stem.
+
+    Re-exporting the same project must never overwrite a previous export: the first free name
+    wins, so ``project.mp4`` → ``project_1.mp4`` → ``project_2.mp4``. The logic is driven by the
+    existing name's suffix, so it keeps working for any output extension/format.
+    """
+    if not _export_target_taken(out, separate):
+        return out
+    k = 1
+    while _export_target_taken(out.with_name(f"{out.stem}_{k}{out.suffix}"), separate):
+        k += 1
+    return out.with_name(f"{out.stem}_{k}{out.suffix}")
 
 
 @app.get("/api/exports")

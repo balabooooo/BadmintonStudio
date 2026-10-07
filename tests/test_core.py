@@ -2564,6 +2564,46 @@ def test_exports_registry() -> None:
         check("相对路径被拒", True)
 
 
+def test_export_unique_path() -> None:
+    """Export name conflicts must bump a monotonic _1/_2 suffix instead of overwriting (merge + separate)."""
+    print("\n导出同名自动顺延")
+    import tempfile
+
+    from bms.main import _unique_export_path
+
+    tmp = Path(tempfile.mkdtemp(prefix="bms_uniq_"))
+    out = tmp / "project.mp4"
+
+    check("无冲突保持原名", _unique_export_path(out) == out)
+    check("无冲突（分轨）保持原名", _unique_export_path(out, separate=True) == out)
+
+    # merge: project.mp4 -> project_1.mp4 -> project_2.mp4
+    out.write_bytes(b"x")
+    check("冲突追加 _1", _unique_export_path(out).name == "project_1.mp4")
+    (tmp / "project_1.mp4").write_bytes(b"x")
+    check("_1 也占用则顺延 _2", _unique_export_path(out).name == "project_2.mp4")
+    (tmp / "project_2.mp4").write_bytes(b"x")
+    check("连续占用单调递增", _unique_export_path(out).name == "project_3.mp4")
+
+    # The suffix only appears on a real conflict: a freed base name is reused
+    out.unlink()
+    check("原名空出后复用原名", _unique_export_path(out) == out)
+
+    # separate really writes <stem>_01.mp4, so the probe must look at the first segment file
+    (tmp / "demo_01.mp4").write_bytes(b"x")
+    demo = tmp / "demo.mp4"
+    check("分轨探测 _01 冲突", _unique_export_path(demo, separate=True).name == "demo_1.mp4")
+    (tmp / "demo_1_01.mp4").write_bytes(b"x")
+    check("分轨顺延到 demo_2", _unique_export_path(demo, separate=True).name == "demo_2.mp4")
+    check("分轨基名未被占用时不动", _unique_export_path(tmp / "other.mp4", separate=True) == tmp / "other.mp4")
+
+    # The suffix logic is suffix-agnostic, so it holds for any supported output format/extension
+    (tmp / "clip.mov").write_bytes(b"x")
+    check("其他扩展名同样顺延", _unique_export_path(tmp / "clip.mov").name == "clip_1.mov")
+    (tmp / "v2.cut.mp4").write_bytes(b"x")
+    check("多点文件名只在末尾加后缀", _unique_export_path(tmp / "v2.cut.mp4").name == "v2.cut_1.mp4")
+
+
 def test_speech_phrase_sanitize() -> None:
     """Voice command sanitizing: at most 2, each <=3 characters, strip whitespace and dedupe; the params layer must enforce the same rules."""
     print("\n语音口令：清洗")
@@ -3861,6 +3901,7 @@ def main() -> int:
     test_speech_refine_windows_and_merge()
     test_speech_bonus_and_scoring()
     test_exports_registry()
+    test_export_unique_path()
     test_i18n_catalogs()
     test_proxy_source_fallback()
     test_clear_derived_paths_on_cache_clear()
