@@ -78,6 +78,8 @@ const baseEn: Record<string, string> = {
   'kind.analyze': 'AI analysis',
   'kind.prepare': 'Preparing media',
   'kind.export': 'Export',
+  'kind.optimize': 'Optimizing segmentation',
+  'kind.cache_clear': 'Cache cleanup',
 
   // Backend stage codes -> display names
   'stage.prepare': 'Preparing',
@@ -94,6 +96,12 @@ const baseEn: Record<string, string> = {
   'stage.segment': 'Segmenting rallies',
   'stage.score': 'Scoring',
   'stage.export': 'Exporting',
+  'stage.optimize_prepare': 'Preparing labels',
+  'stage.cache_clear': 'Clearing',
+  'stage.gate': 'Checking pose gate',
+  'stage.sensitivity': 'Searching hit sensitivity',
+  'stage.padding': 'Searching rally padding',
+  'stage.weights': 'Searching fusion weights',
   'stage.done': 'Done',
   'stage.error': 'Error',
   'stage.cancelled': 'Cancelled',
@@ -128,7 +136,7 @@ const baseEn: Record<string, string> = {
   'settings.ffprobeHint':
     'ffprobe is missing, so metadata is being parsed with ffmpeg. For faster and more accurate parsing, place an ffmpeg build that includes ffprobe.exe under tools/ffmpeg/bin, or set the BMS_FFPROBE environment variable.',
   'settings.disk': 'Disk usage',
-  'settings.clearCache': 'Clear all caches',
+  'settings.clearCache': 'Choose items to clear…',
   'settings.clearCacheTitle': 'Clear caches?',
   'settings.clearCacheDesc':
     'Proxy videos, thumbnails and extracted audio tracks will be deleted. They will be regenerated on the next analysis; original media is unaffected.',
@@ -145,6 +153,15 @@ const baseEn: Record<string, string> = {
   'settings.dirData': 'Data dir',
   'settings.dirCache': 'Cache dir',
   'settings.dirModels': 'Models dir',
+  'settings.debugLogs': 'Debug logs',
+  'settings.debugLogsDesc': 'When reporting an issue, please attach both the frontend and backend logs.',
+  'settings.exportFrontendLogs': 'Export frontend logs',
+  'settings.clearFrontendLogs': 'Clear log buffer',
+  'settings.frontendLogsHint': 'The frontend keeps the latest {max} operation logs in memory ({count} currently); export them as a text file and attach them to your issue report.',
+  'settings.backendLogsHint': 'Backend debug logs (DEBUG level, daily rotation, retained 7 days) live at:',
+  'settings.debugLogsExported': 'Exported frontend logs ({count} entries)',
+  'settings.debugLogsEmpty': 'No frontend logs to export',
+  'settings.debugLogsCleared': 'Frontend log buffer cleared',
 
   // ---------------------------------------------------------------- Scoring presets
   'weight.dim.intensity': 'Intensity',
@@ -229,6 +246,7 @@ const baseEn: Record<string, string> = {
   'toast.rescorePerMedia': 'Restored per-media scoring',
   'toast.resegmentFailed': 'Resegmentation failed',
   'toast.analysisRunningBlocked': 'Analysis is running for this media; resegment after it finishes',
+  'toast.optimizeRunningBlocked': 'Segmentation is locked while parameters are being optimized for this media',
   'toast.rebuildHitsOk': 'Hit sequence rebuilt; cross-court suppression is now adjustable',
   'toast.rebuildHitsNoPose': 'Hit sequence rebuilt, but no full-rate pose was found; cross-court suppression is unavailable',
   'toast.rebuildHitsFailed': 'Failed to rebuild the hit sequence',
@@ -296,7 +314,10 @@ const baseEn: Record<string, string> = {
   'library.duplicateFailed': 'Failed to duplicate project',
   'library.delete': 'Delete project',
   'library.deleteTitle': 'Delete project “{name}”?',
-  'library.deleteDesc': 'The project file is moved to a backup file alongside it; the media itself is not deleted.',
+  'library.deleteDesc':
+    'The project file is moved to a backup file alongside it. Uploaded source videos and annotation files used only by this project (not referenced by any other project) are deleted too; other media is untouched.',
+  'library.purgeDetail':
+    'Reclaimed source videos and annotations not referenced by other projects: {size} ({uploads} video(s), {annos} annotation(s))',
   'library.deleted': 'Project deleted',
   'library.deleteFailed': 'Failed to delete project',
   'library.modalTitle': 'New project',
@@ -444,6 +465,7 @@ const baseEn: Record<string, string> = {
   'rally.audioOff': 'Hit sounds are off; segmentation is currently vision-only.',
   'rally.applyResegment': 'Apply segmentation',
   'rally.finerTooltip': 'Resegment with only a finer split granularity; other params unchanged',
+  'rally.optimizeLocked': 'Rally segmentation is locked while parameters are being optimized',
   'rally.finer': 'Finer split',
   'rally.splitSummary':
     '{n} rallies, averaging {avg}s. If a rally actually contains several exchanges, raise the granularity and apply.',

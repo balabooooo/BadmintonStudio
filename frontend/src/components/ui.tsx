@@ -210,8 +210,9 @@ export function Progress({
         <motion.div
           className="h-full rounded-full"
           style={{ background: `linear-gradient(90deg, ${color}, color-mix(in oklab, ${color} 60%, white))` }}
+          initial={false}
           animate={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }}
-          transition={{ duration: 0.35, ease: 'easeOut' }}
+          transition={{ duration: 0.12, ease: 'easeOut' }}
         />
       )}
     </div>

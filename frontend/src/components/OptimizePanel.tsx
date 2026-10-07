@@ -6,10 +6,10 @@
  * clip 的优化结果（切换 clip 时由父组件切换绑定，不在这里自行取数）。
  */
 
-import { Info, Wand2 } from 'lucide-react'
+import { Info, Wand2, X } from 'lucide-react'
 import { Badge, Button } from './ui'
 import { useT } from '../i18n/useT'
-import { matchFormatLabel } from '../i18n/domain'
+import { jobStageLabel, matchFormatLabel } from '../i18n/domain'
 import { clamp } from '../lib/format'
 import type { OptimizeResult, SegmentMetric } from '../lib/types'
 
@@ -59,10 +59,15 @@ interface OptimizePanelProps {
   /** 当前素材的优化结果（per-clip，由父组件按 mediaId 取） */
   opt: OptimizeResult | null
   optimizing: boolean
+  /** 0~1 live progress (valid while optimizing) */
+  progress: number
+  /** Stable backend stage code, translated via jobStageLabel */
+  stage: string
   canOptimize: boolean
   /** 赛制稳定码（single/doubles），未知时 null 不显示徽标 */
   matchFormat: string | null
   onRun: () => void
+  onCancel: () => void
   onApplyBest: () => void
   onApplyParam: (patch: Record<string, number>) => void
   onOpenPreset: () => void
@@ -71,27 +76,53 @@ interface OptimizePanelProps {
 export default function OptimizePanel({
   opt,
   optimizing,
+  progress,
+  stage,
   canOptimize,
   matchFormat,
   onRun,
+  onCancel,
   onApplyBest,
   onApplyParam,
   onOpenPreset,
 }: OptimizePanelProps) {
   const tr = useT()
+  const pct = Math.round(clamp(progress, 0, 1) * 100)
   return (
     <div className="border-t border-white/7 p-3">
       <div className="mb-2 flex items-center gap-2">
         <Wand2 size={13} className="text-court-300" />
         <span className="text-[12px] font-semibold text-white">{tr('annotate.optimizeTitle')}</span>
         <div className="flex-1" />
-        <Button size="sm" variant="ghost" onClick={onOpenPreset} title={tr('annotate.savePresetTooltip')}>
+        <Button size="sm" variant="ghost" onClick={onOpenPreset} disabled={optimizing}
+          title={tr('annotate.savePresetTooltip')}>
           {tr('annotate.saveAsPreset')}
         </Button>
-        <Button size="sm" variant="primary" loading={optimizing} disabled={!canOptimize} onClick={onRun}>
-          {tr('annotate.optimize')}
-        </Button>
+        {optimizing ? (
+          <Button size="sm" variant="outline" onClick={onCancel}>
+            <X size={12} />
+            {tr('common.cancel')}
+          </Button>
+        ) : (
+          <Button size="sm" variant="primary" disabled={!canOptimize} onClick={onRun}>
+            {tr('annotate.optimize')}
+          </Button>
+        )}
       </div>
+      {optimizing && (
+        <div className="mb-2 rounded-lg border border-court-500/25 bg-court-500/[0.05] px-2.5 py-2">
+          <div className="mb-1 flex items-baseline justify-between gap-2 text-[10.5px]">
+            <span className="text-court-200">{stage ? jobStageLabel(stage) : tr('annotate.optimizeRunning')}</span>
+            <span className="mono text-court-200">{pct}%</span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+            <div
+              className="h-full rounded-full bg-court-400 transition-[width] duration-200"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        </div>
+      )}
       {matchFormat && matchFormat !== 'unknown' && (
         <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-white/8 bg-white/[0.02] px-2 py-1 text-[10.5px] text-ink-300">
           <Info size={11} className="shrink-0 text-court-300" />
@@ -153,7 +184,9 @@ export default function OptimizePanel({
               <div className="mb-1 flex items-center gap-2">
                 <span className="text-[11px] text-court-200">{tr('annotate.suggested')}</span>
                 <div className="flex-1" />
-                <Button size="sm" variant="primary" onClick={onApplyBest}>{tr('annotate.applyResegment')}</Button>
+                <Button size="sm" variant="primary" disabled={optimizing} onClick={onApplyBest}>
+                  {tr('annotate.applyResegment')}
+                </Button>
               </div>
               <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
                 {Object.entries(opt.best.params).map(([k, v]) => (
@@ -169,8 +202,9 @@ export default function OptimizePanel({
             {opt.results.slice(0, 20).map((m, i) => (
               <button
                 key={i}
+                disabled={optimizing}
                 onClick={() => onApplyParam(m.params)}
-                className="flex w-full items-center gap-2 border-b border-white/5 px-2 py-1 text-left text-[11px] last:border-b-0 hover:bg-white/6"
+                className="flex w-full items-center gap-2 border-b border-white/5 px-2 py-1 text-left text-[11px] last:border-b-0 hover:bg-white/6 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Badge color={i === 0 ? '#38e0a2' : undefined}>F1 {m.f1.toFixed(3)}</Badge>
                 <span className="mono flex-1 truncate text-ink-500">

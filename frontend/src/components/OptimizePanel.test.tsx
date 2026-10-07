@@ -35,9 +35,12 @@ function renderPanel(over: Partial<Parameters<typeof OptimizePanel>[0]> = {}) {
   const props = {
     opt: result,
     optimizing: false,
+    progress: 0,
+    stage: '',
     canOptimize: true,
     matchFormat: null,
     onRun: vi.fn(),
+    onCancel: vi.fn(),
     onApplyBest: vi.fn(),
     onApplyParam: vi.fn(),
     onOpenPreset: vi.fn(),
@@ -90,14 +93,33 @@ describe('OptimizePanel', () => {
       <OptimizePanel
         opt={result}
         optimizing={false}
+        progress={0}
+        stage=""
         canOptimize
         matchFormat={null}
         onRun={vi.fn()}
+        onCancel={vi.fn()}
         onApplyBest={vi.fn()}
         onApplyParam={vi.fn()}
         onOpenPreset={vi.fn()}
       />,
     )
     expect(screen.queryByText(/match format/i)).toBeNull()
+  })
+
+  it('shows live percentage + stage while optimizing and locks apply actions', () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    const { props } = renderPanel({ optimizing: true, progress: 0.426, stage: 'sensitivity' })
+    expect(screen.getByText('43%')).toBeInTheDocument()
+    expect(screen.getByText(/searching hit sensitivity/i)).toBeInTheDocument()
+    // The run button is replaced by a cancel button while the job is active.
+    fireEvent.click(screen.getByRole('button', { name: /cancel/i }))
+    expect(props.onCancel).toHaveBeenCalledTimes(1)
+    // Applying params must be impossible mid-run: best button and result rows are disabled.
+    expect(screen.getByRole('button', { name: /apply and re-segment/i })).toBeDisabled()
+    const rowButton = screen.getAllByRole('button').find((b) => b.textContent?.includes('F1 0.620'))
+    expect(rowButton).toBeDefined()
+    expect(rowButton).toBeDisabled()
+    expect(props.onApplyParam).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useStore, consumeMediaPick } from './useStore'
+import { api } from '../lib/api'
 
 // Mock the api module so store actions never hit the network.
 vi.mock('../lib/api', () => ({
@@ -7,6 +8,9 @@ vi.mock('../lib/api', () => ({
     prepareMedia: vi.fn().mockResolvedValue(undefined),
     rescore: vi.fn().mockResolvedValue(undefined),
     removeMedia: vi.fn().mockResolvedValue({ project: { media: [], analyses: {} }, removed: 1 }),
+    resegment: vi.fn().mockResolvedValue({}),
+    rebuildHits: vi.fn().mockResolvedValue({}),
+    autoCut: vi.fn().mockResolvedValue({}),
   },
 }))
 
@@ -76,5 +80,60 @@ describe('media picker store actions', () => {
 
   it('consumeMediaPick returns null when no callback was registered', () => {
     expect(consumeMediaPick()).toBeNull()
+  })
+})
+
+describe('optimize job locks segmentation actions', () => {
+  const optJob = (status: 'queued' | 'running' | 'done', mediaId = 'm1') => ({
+    id: `job_${status}`,
+    kind: 'optimize' as const,
+    title: 'optimize',
+    media_id: mediaId,
+    status,
+    progress: status === 'done' ? 1 : 0.3,
+    stage: 'optimize_segment',
+  })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useStore.setState({
+      mediaId: 'm1',
+      project: { id: 'p1' } as never,
+      jobs: {},
+      toasts: [],
+      busy: {},
+    })
+  })
+
+  it('mediaIsOptimizing reflects queued/running optimize jobs bound to the media', () => {
+    expect(useStore.getState().mediaIsOptimizing('m1')).toBe(false)
+    useStore.setState({ jobs: { a: optJob('running') } as never })
+    expect(useStore.getState().mediaIsOptimizing('m1')).toBe(true)
+    expect(useStore.getState().mediaIsOptimizing('m_other')).toBe(false)
+    useStore.setState({ jobs: { a: optJob('queued') } as never })
+    expect(useStore.getState().mediaIsOptimizing('m1')).toBe(true)
+    useStore.setState({ jobs: { a: optJob('done') } as never })
+    expect(useStore.getState().mediaIsOptimizing('m1')).toBe(false)
+  })
+
+  it.each([
+    ['resegment', (s: ReturnType<typeof useStore.getState>) => s.resegment()],
+    ['rebuildHits', (s: ReturnType<typeof useStore.getState>) => s.rebuildHits()],
+    ['autoCut', (s: ReturnType<typeof useStore.getState>) => s.autoCut()],
+  ])('%s is blocked with a warning toast while optimize runs', async (_name, action) => {
+    useStore.setState({ jobs: { a: optJob('running') } as never })
+    await action(useStore.getState())
+    expect(api.resegment).not.toHaveBeenCalled()
+    expect(api.rebuildHits).not.toHaveBeenCalled()
+    expect(api.autoCut).not.toHaveBeenCalled()
+    const toasts = useStore.getState().toasts
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0].kind).toBe('warn')
+  })
+
+  it('resegment proceeds once the optimize job is no longer active', async () => {
+    useStore.setState({ jobs: { a: optJob('done') } as never })
+    await useStore.getState().resegment()
+    expect(api.resegment).toHaveBeenCalledTimes(1)
   })
 })

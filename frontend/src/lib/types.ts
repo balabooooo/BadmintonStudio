@@ -206,6 +206,8 @@ export interface OverlayBox {
   xyxy: [number, number, number, number]
   /** 检测置信度（v2 可视化缓存才有；v1 缺失时不做阈值过滤，全部显示） */
   conf?: number
+  /** v3 caches: box was linearly interpolated across a short occlusion gap rather than detected (drawn dimmed) */
+  interp?: boolean
 }
 
 /** 叠加层：某一帧的一条原始检测框（未跟踪、无 track id，灰色虚线诊断层；v2 缓存才有） */
@@ -629,6 +631,8 @@ export interface EnvInfo {
   cache_dir: string
   /** 默认导出目录（data/exports），自定义导出时的初始值 */
   export_dir: string
+  /** Directory holding the rotating backend debug logs (bms_debug_YYYY-MM-DD.log). */
+  logs_dir?: string
 }
 
 /** 导出记录条目（来自后端登记表，路径可能在任意自定义目录） */

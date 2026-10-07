@@ -306,6 +306,8 @@ export default function RallyPanel() {
   const rescore = useStore((s) => s.rescore)
   const rescoreAll = useStore((s) => s.rescoreAll)
   const busy = useStore((s) => s.busy)
+  // Segmentation-mutating controls are locked while an optimize job runs for this media.
+  const optimizing = useStore((s) => s.mediaIsOptimizing(s.mediaId))
   const selectRally = useStore((s) => s.selectRally)
   const selectedRallyId = useStore((s) => s.selectedRallyId)
   const bulk = useStore((s) => s.bulkRallies)
@@ -466,6 +468,7 @@ export default function RallyPanel() {
           </div>
           <Tooltip content={tr('rally.filterTooltip')}>
             <Button
+              data-tour="rally-filter"
               variant={showFilter ? 'outline' : 'ghost'}
               size="icon"
               onClick={() => setShowFilter((v) => !v)}
@@ -530,6 +533,15 @@ export default function RallyPanel() {
             </span>
           </Tooltip>
           <span className="flex-1" />
+          {analysis?.stats?.mock && (
+            <span
+              data-tour-mock-badge
+              className="inline-flex items-center gap-1 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-[1px] text-[10px] font-medium text-amber-300"
+            >
+              <span aria-hidden="true">🧪</span>
+              {tr('tour.mock.badge')}
+            </span>
+          )}
           <Tooltip content={tr('rally.scoreBy')} width={220}>
             <span className="cursor-help rounded-md bg-court-500/15 px-1.5 py-[1px] text-[10.5px] text-court-300">
               {tr(activePreset?.labelKey ?? 'weight.balanced.label')}
@@ -686,7 +698,7 @@ export default function RallyPanel() {
       </div>
 
       {/* 底部：成片动作 + 批量操作，主 CTA 始终可见 */}
-      <div className="shrink-0 border-t border-white/7 px-3 py-2">
+      <div data-tour="rally-film-bar" className="shrink-0 border-t border-white/7 px-3 py-2">
         {/* 筛选 ≠ 成片：把这条链路直接摊开，
             否则很容易以为「筛出来的就是成片了，为什么还要点加入」。 */}
         <div className="flex items-start gap-2 rounded-xl border border-flux-400/20 bg-flux-400/[0.05] px-2.5 py-2">
@@ -705,14 +717,14 @@ export default function RallyPanel() {
         <div className="mt-2 flex gap-2">
           <Tooltip
             width={300}
-            content={tr('rally.rebuildTooltip', { n: visible.length })}
+            content={optimizing ? tr('rally.optimizeLocked') : tr('rally.rebuildTooltip', { n: visible.length })}
           >
             <Button
               variant="primary"
               size="sm"
               className="flex-1"
               onClick={() => autoCut({ mode: 'replace' })}
-              disabled={!visible.length}
+              disabled={!visible.length || optimizing}
             >
               <Sparkles size={12} />
               {tr('rally.rebuildButton', { n: visible.length })}
@@ -720,9 +732,11 @@ export default function RallyPanel() {
           </Tooltip>
           <Tooltip
             width={290}
-            content={tr('rally.appendTooltip')}
+            content={optimizing ? tr('rally.optimizeLocked') : tr('rally.appendTooltip')}
           >
-            <Button variant="outline" size="sm" onClick={() => autoCut({ mode: 'append' })} disabled={!visible.length}>
+            <Button variant="outline" size="sm"
+              onClick={() => autoCut({ mode: 'append' })}
+              disabled={!visible.length || optimizing}>
               <Plus size={12} />
             </Button>
           </Tooltip>
@@ -946,12 +960,18 @@ export default function RallyPanel() {
                     <span className="text-ink-500">{tr('rally.splitInstant')}</span>
                   </div>
                   <div className="space-y-2.5">
+                    {optimizing && (
+                      <div className="rounded-md border border-amber-glow/25 bg-amber-glow/10 px-2 py-1 text-[10px] leading-relaxed text-amber-glow">
+                        {tr('rally.optimizeLocked')}
+                      </div>
+                    )}
                     <Slider
                       label={tr('rally.splitGranularity')}
                       value={params.split_sensitivity}
                       min={0}
                       max={1}
                       step={0.05}
+                      disabled={busy.resegment || optimizing}
                       onChange={(v) => setParams({ split_sensitivity: v })}
                       format={(v) => (v < 0.3 ? tr('rally.granCoarse') : v > 0.7 ? tr('rally.granFine') : tr('rally.granMedium'))}
                       hint={tr('rally.granHint')}
@@ -962,6 +982,7 @@ export default function RallyPanel() {
                       min={0.5}
                       max={8}
                       step={0.1}
+                      disabled={busy.resegment || optimizing}
                       onChange={(v) => setParams({ gap_seconds: v })}
                       format={(v) => `${v.toFixed(1)}s`}
                       hint={tr('rally.gapHint')}
@@ -972,6 +993,7 @@ export default function RallyPanel() {
                       min={0.5}
                       max={12}
                       step={0.5}
+                      disabled={busy.resegment || optimizing}
                       onChange={(v) => setParams({ min_rally_seconds: v })}
                       format={(v) => `${v}s`}
                       hint={tr('rally.minRallyHint')}
@@ -987,6 +1009,7 @@ export default function RallyPanel() {
                       {/* 击球声总开关：关闭后走纯视觉切分（球员运动 + 画面运动），秒级重切可做 A/B */}
                       <Toggle
                         checked={params.use_audio}
+                        disabled={optimizing}
                         onChange={(v) => applyGate({ use_audio: v })}
                         label={tr('rally.audioToggle')}
                         hint={tr('rally.audioToggleHint')}
@@ -999,6 +1022,7 @@ export default function RallyPanel() {
                             min={0}
                             max={1}
                             step={0.05}
+                            disabled={busy.resegment || optimizing}
                             onChange={(v) => applyGate({ pose_gate_threshold: gateStrengthToThreshold(v) })}
                             format={(v) =>
                               v < 0.34
@@ -1011,6 +1035,7 @@ export default function RallyPanel() {
                           />
                           <Toggle
                             checked={params.pose_gate_force}
+                            disabled={optimizing}
                             onChange={(v) => applyGate({ pose_gate_force: v })}
                             label={tr('rally.gateForce')}
                             hint={tr('rally.gateForceHint')}
@@ -1038,6 +1063,7 @@ export default function RallyPanel() {
                                 variant="outline"
                                 size="sm"
                                 loading={busy.resegment}
+                                disabled={optimizing}
                                 onClick={() => rebuildHits()}
                               >
                                 {tr('rally.gateRebuild')}
@@ -1058,15 +1084,17 @@ export default function RallyPanel() {
                         size="sm"
                         className="flex-1"
                         loading={busy.resegment}
+                        disabled={optimizing}
                         onClick={() => resegment()}
                       >
                         {tr('rally.applyResegment')}
                       </Button>
-                      <Tooltip content={tr('rally.finerTooltip')}>
+                      <Tooltip content={optimizing ? tr('rally.optimizeLocked') : tr('rally.finerTooltip')}>
                         <Button
                           variant="outline"
                           size="sm"
                           loading={busy.resegment}
+                          disabled={optimizing}
                           onClick={() => resegment({ split_sensitivity: Math.min(1, params.split_sensitivity + 0.2) })}
                         >
                           {tr('rally.finer')}

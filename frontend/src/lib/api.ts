@@ -9,7 +9,6 @@ import type {
   ExportPreset,
   JobInfo,
   MediaInfo,
-  OptimizeResult,
   PlayerProbe,
   QualityReport,
   Project,
@@ -19,6 +18,9 @@ import type {
   Timeline,
 } from './types'
 import { getLang } from '../i18n'
+import { createLogger } from './logger'
+
+const log = createLogger('api')
 
 const BASE = ''
 
@@ -38,6 +40,8 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs = 60_000): Pro
   const ctrl = new AbortController()
   let timer: number | undefined
   if (timeoutMs > 0) timer = window.setTimeout(() => ctrl.abort(), timeoutMs)
+  const started = performance.now()
+  const method = (init?.method || 'GET').toUpperCase()
   try {
     const res = await fetch(BASE + path, {
       ...init,
@@ -52,15 +56,26 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs = 60_000): Pro
       } catch {
         /* ignore */
       }
+      log.debug(`${method} ${path} -> ${res.status} in ${Math.round(performance.now() - started)}ms`)
       throw new ApiError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
     }
     if (res.status === 204) return undefined as T
     try {
-      return (await res.json()) as T
+      const data = (await res.json()) as T
+      log.debug(`${method} ${path} -> 200 in ${Math.round(performance.now() - started)}ms`)
+      return data
     } catch {
       // 2xx 但响应体不是 JSON（例如被代理拦截）时抛结构化错误，别让 SyntaxError 冒出去
+      log.warn(`${method} ${path} -> non-JSON response after ${Math.round(performance.now() - started)}ms`)
       throw new ApiError(res.status, 'Invalid JSON response')
     }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      log.debug(`${method} ${path} aborted after ${Math.round(performance.now() - started)}ms`)
+    } else if (!(err instanceof ApiError)) {
+      log.error(`${method} ${path} failed`, String((err as Error)?.message || err))
+    }
+    throw err
   } finally {
     if (timer !== undefined) window.clearTimeout(timer)
   }
@@ -77,7 +92,8 @@ export const api = {
   getProject: (pid: string) => req<Project>(`/api/projects/${pid}`),
   patchProject: (pid: string, patch: Record<string, unknown>) =>
     req<Project>(`/api/projects/${pid}`, { method: 'PATCH', body: JSON.stringify(patch) }),
-  deleteProject: (pid: string) => req<{ ok: boolean }>(`/api/projects/${pid}`, { method: 'DELETE' }),
+  deleteProject: (pid: string) =>
+    req<{ ok: boolean; purged: ProjectPurgeResult | null }>(`/api/projects/${pid}`, { method: 'DELETE' }),
   duplicateProject: (pid: string) =>
     req<Project>(`/api/projects/${pid}/duplicate`, { method: 'POST', body: '{}' }),
 
@@ -206,7 +222,7 @@ export const api = {
     mid: string,
     body: { params?: Partial<AnalysisParams> } = {},
   ) =>
-    req<OptimizeResult>(
+    req<{ job_id: string }>(
       `/api/projects/${pid}/media/${mid}/annotation/optimize`,
       { method: 'POST', body: JSON.stringify(body) },
       0,
@@ -325,6 +341,31 @@ export const api = {
 
   cacheStats: () =>
     req<{ cache: number; proxies: number; thumbs: number; exports: number }>('/api/cache/stats'),
-  clearCache: (target: string) =>
-    req<{ freed: number }>('/api/cache/clear', { method: 'POST', body: JSON.stringify({ target }) }),
+
+  /** One row of the selective cache-clear dialog (registry order, size and risk level). */
+  cacheTargets: () => req<CacheTargetStat[]>('/api/cache/targets'),
+  /** Clear the selected targets as a background job; danger targets (models) require confirmModels. */
+  clearCacheTargets: (targets: string[], confirmModels: boolean) =>
+    req<{ job_id: string }>('/api/cache/clear', {
+      method: 'POST',
+      body: JSON.stringify({ targets, confirm: { models: confirmModels } }),
+    }),
+}
+
+/** Per-target occupancy returned by GET /api/cache/targets. */
+export interface CacheTargetStat {
+  id: string
+  /** safe: auto-rebuilt derivative; normal: regenerable work product; danger: explicit re-confirm */
+  level: 'safe' | 'normal' | 'danger'
+  default: boolean
+  files: number
+  bytes: number
+}
+
+/** Orphan-asset cleanup report returned by DELETE /api/projects/{id}. */
+export interface ProjectPurgeResult {
+  freed: number
+  uploads_removed: number
+  annotations_removed: number
+  failed: string[]
 }

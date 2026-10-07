@@ -77,6 +77,8 @@ const baseZh = {
   'kind.analyze': 'AI 分析',
   'kind.prepare': '准备素材',
   'kind.export': '导出',
+  'kind.optimize': '优化切分参数',
+  'kind.cache_clear': '清理缓存',
 
   // 后端 stage 稳定码 -> 显示名
   'stage.prepare': '准备中',
@@ -93,6 +95,12 @@ const baseZh = {
   'stage.segment': '切分回合',
   'stage.score': '评分',
   'stage.export': '导出',
+  'stage.optimize_prepare': '准备标定数据',
+  'stage.cache_clear': '清理中',
+  'stage.gate': '校验姿态门控',
+  'stage.sensitivity': '搜索击球灵敏度',
+  'stage.padding': '搜索回合前后留白',
+  'stage.weights': '搜索融合权重',
   'stage.done': '完成',
   'stage.error': '出错',
   'stage.cancelled': '已取消',
@@ -126,7 +134,7 @@ const baseZh = {
   'settings.ffprobeHint':
     '没有 ffprobe，正用 ffmpeg 解析元数据。想更快更准，可把带 ffprobe.exe 的 ffmpeg 放到 tools/ffmpeg/bin，或设置环境变量 BMS_FFPROBE。',
   'settings.disk': '磁盘占用',
-  'settings.clearCache': '清理全部缓存',
+  'settings.clearCache': '选择清理项…',
   'settings.clearCacheTitle': '清理缓存？',
   'settings.clearCacheDesc': '代理视频、缩略图和提取的音轨会被删除。下次分析会重新生成，不影响原始素材。',
   'settings.cacheFreed': '已释放 {size}',
@@ -142,6 +150,15 @@ const baseZh = {
   'settings.dirData': '数据目录',
   'settings.dirCache': '缓存目录',
   'settings.dirModels': '模型目录',
+  'settings.debugLogs': '调试日志',
+  'settings.debugLogsDesc': '排查问题时请同时提供前端与后端日志。',
+  'settings.exportFrontendLogs': '导出前端日志',
+  'settings.clearFrontendLogs': '清空日志缓冲',
+  'settings.frontendLogsHint': '前端在内存中保留最近 {max} 条操作日志（当前 {count} 条），可导出为文本文件随问题反馈一并提交。',
+  'settings.backendLogsHint': '后端调试日志（DEBUG 级，按天滚动、保留 7 天）位于：',
+  'settings.debugLogsExported': '已导出前端日志（{count} 条）',
+  'settings.debugLogsEmpty': '当前没有可导出的前端日志',
+  'settings.debugLogsCleared': '已清空前端日志缓冲',
 
   // ---------------------------------------------------------------- 评分口径
   'weight.dim.intensity': '强度',
@@ -226,6 +243,7 @@ const baseZh = {
   'toast.rescorePerMedia': '已恢复当前素材的逐素材评分',
   'toast.resegmentFailed': '重新切分失败',
   'toast.analysisRunningBlocked': '该素材正在分析中，等分析结束再重切分',
+  'toast.optimizeRunningBlocked': '该素材正在优化切分参数，回合分割功能已暂时锁定',
   'toast.rebuildHitsOk': '已重建击球序列，可调整邻场抑制',
   'toast.rebuildHitsNoPose': '已重建击球序列，但未找到满帧率姿态，邻场抑制暂不可用',
   'toast.rebuildHitsFailed': '重建击球序列失败',
@@ -287,7 +305,10 @@ const baseZh = {
   'library.duplicateFailed': '复制工程失败',
   'library.delete': '删除工程',
   'library.deleteTitle': '删除工程「{name}」？',
-  'library.deleteDesc': '工程文件会被移到同目录的备份文件，素材本身不会被删除。',
+  'library.deleteDesc':
+    '工程文件会移到同目录的备份文件；仅属于本工程的上传源视频和标注文件（未被其他工程引用）会一并删除，其他素材不受影响。',
+  'library.purgeDetail':
+    '已回收未被其他工程引用的源视频与标注，释放 {size}（源视频 {uploads} 个、标注 {annos} 个）',
   'library.deleted': '工程已删除',
   'library.deleteFailed': '删除工程失败',
   'library.modalTitle': '新建工程',
@@ -427,6 +448,7 @@ const baseZh = {
   'rally.audioOff': '击球声已关闭，当前为纯视觉切分。',
   'rally.applyResegment': '应用切分参数',
   'rally.finerTooltip': '只把「切分粒度」调细一档后重新切分，其余参数保持',
+  'rally.optimizeLocked': '切分参数正在优化中，回合分割功能暂时锁定',
   'rally.finer': '切分更细',
   'rally.splitSummary':
     '当前共 {n} 个回合，平均 {avg} 秒。如果发现某个回合里其实有好几段交锋，把「切分粒度」调细再点应用。',

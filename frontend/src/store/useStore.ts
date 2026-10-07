@@ -2,10 +2,14 @@
 
 import { create } from 'zustand'
 import { api } from '../lib/api'
+import type { ProjectPurgeResult } from '../lib/api'
+import { createLogger } from '../lib/logger'
 import { timecode } from '../lib/format'
 import { ws } from '../lib/ws'
 import { compactTrackClips, filmClipAt, filmTimeOfSource, nearestCoveredFilmTime, orderedClips } from '../lib/timeline'
 import { applyDocumentLang, getLang, setLang as setRuntimeLang, t as tr, type Lang } from '../i18n'
+import { runMockAnalysis } from '../tour/mockAnalysis'
+import { useTourStore } from '../tour/tourStore'
 import type {
   AnalysisParams,
   AnalysisResult,
@@ -13,6 +17,7 @@ import type {
   EnvInfo,
   JobInfo,
   MediaInfo,
+  OptimizeResult,
   Project,
   ProjectSummary,
   Rally,
@@ -288,6 +293,9 @@ const pendingTimelines = new Map<string, Timeline>()
 /** 打开工程的请求序号：快速连点 A、B 时，让先返回的旧响应作废。 */
 let openProjectSeq = 0
 
+const viewLog = createLogger('view')
+const jobLog = createLogger('job')
+
 /** 正在申请 preview 任务的素材：api 调用到 WS 任务事件到达之间用它去重，避免重复提交。 */
 const preparingMedia = new Set<string>()
 
@@ -405,10 +413,14 @@ interface State {
   /** 场地标定窗口是否打开（预览的角标和「AI 分析」里的按钮都会打开它） */
   courtEditorOpen: boolean
 
-  // ---------------- 任务 / 通知
+  // ---------------- jobs / toasts
   jobs: Record<string, JobInfo>
+  /** Finished optimize-job reports keyed by mediaId (re-hydrated from /api/jobs on reload) */
+  optimizeResults: Record<string, OptimizeResult>
   toasts: Toast[]
   busy: Record<string, boolean>
+  /** True while an optimize job for the media is queued/running (disables segmentation controls) */
+  mediaIsOptimizing: (mid?: string | null) => boolean
 
   // ---------------- 撤销
   history: Timeline[]
@@ -425,7 +437,7 @@ interface State {
   createProject: (name: string) => Promise<string | null>
   openProject: (id: string) => Promise<void>
   renameProject: (name: string) => Promise<void>
-  deleteProject: (id: string) => Promise<void>
+  deleteProject: (id: string) => Promise<{ purged: ProjectPurgeResult | null } | null>
   closeProject: () => void
   importMedia: (paths: string[]) => Promise<void>
   importFiles: (files: File[]) => Promise<void>
@@ -681,11 +693,24 @@ export const useStore = create<State>((set, get) => ({
   courtEditorOpen: false,
 
   jobs: {},
+  optimizeResults: {},
   toasts: [],
   busy: {},
   history: [],
   future: [],
   presets: [],
+
+  mediaIsOptimizing(mid) {
+    const target = mid ?? get().mediaId
+    if (!target) return false
+    for (const j of Object.values(get().jobs)) {
+      if (j.kind === 'optimize' && j.media_id === target
+        && (j.status === 'queued' || j.status === 'running')) {
+        return true
+      }
+    }
+    return false
+  },
 
   // ================================================================= 会话
   async bootstrap() {
@@ -705,11 +730,16 @@ export const useStore = create<State>((set, get) => ({
       api.listJobs()
         .then((list) => set((s) => {
           const jobs = { ...s.jobs }
+          const optimizeResults = { ...s.optimizeResults }
           for (const j of list) {
             const cur = jobs[j.id]
             if (!cur || (j.updated_at ?? 0) >= (cur.updated_at ?? 0)) jobs[j.id] = j
+            // Re-hydrate finished optimize reports after a reload/reconnect.
+            if (j.kind === 'optimize' && j.status === 'done' && j.media_id && j.result) {
+              optimizeResults[j.media_id] = j.result as OptimizeResult
+            }
           }
-          return { jobs }
+          return { jobs, optimizeResults }
         }))
         .catch(() => undefined)
     }
@@ -722,8 +752,35 @@ export const useStore = create<State>((set, get) => ({
         // 首次连接或断线重连：把断线期间错过的任务状态补回来
         syncJobs()
       } else if (m.type === 'job') {
+        jobLog.debug('ws job event', {
+          id: m.job.id, kind: m.job.kind, status: m.job.status,
+          progress: Math.round((m.job.progress ?? 0) * 100), stage: m.job.stage, media_id: m.job.media_id,
+        })
         set((s) => ({ jobs: { ...s.jobs, [m.job.id]: m.job } }))
         const j = m.job
+        // Finished optimize jobs keep their report (backend RESULT_KEEP_KINDS); park it by
+        // mediaId so the annotation panel renders results without local state.
+        if (j.kind === 'optimize' && j.status === 'done' && j.media_id && j.result) {
+          const report = j.result as OptimizeResult
+          jobLog.debug('optimize result stored', { media: j.media_id, tried: report.tried })
+          set((s) => ({ optimizeResults: { ...s.optimizeResults, [j.media_id as string]: report } }))
+          if (report.best) {
+            get().toast({
+              kind: 'success',
+              title: tr('annotate.bestF1', { f1: report.best.f1.toFixed(3), baseline: report.baseline.f1.toFixed(3) }),
+              detail: tr('annotate.triedDetail', { n: report.tried }),
+            })
+          } else {
+            get().toast({ kind: 'warn', title: tr('annotate.noUsableParams') })
+          }
+        }
+        if (j.kind === 'optimize' && (j.status === 'error' || j.status === 'cancelled')) {
+          get().toast({
+            kind: j.status === 'error' ? 'error' : 'info',
+            title: j.status === 'error' ? tr('annotate.optimizeFailed') : tr('annotate.optimizeCancelled'),
+            detail: j.error ?? undefined,
+          })
+        }
         // 任务到终态时清掉 busy 标记，否则 busy 会随着任务数无限增长
         if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
           set((s) => {
@@ -791,7 +848,11 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  setView: (v) => set({ view: v }),
+  setView: (v) => {
+    const prev = get().view
+    if (prev !== v) viewLog.debug('view switch', { from: prev, to: v, mediaId: get().mediaId })
+    set({ view: v })
+  },
 
   setLang(l) {
     if (l === get().lang) return
@@ -886,11 +947,13 @@ export const useStore = create<State>((set, get) => ({
 
   async deleteProject(id) {
     try {
-      await api.deleteProject(id)
+      const res = await api.deleteProject(id)
       if (get().project?.id === id) set({ project: null, mediaId: null, view: 'library' })
       get().refreshProjects()
+      return { purged: res.purged }
     } catch (e) {
       get().toast({ kind: 'error', title: tr('toast.bulkDeleteFailed'), detail: String(e) })
+      return null
     }
   },
 
@@ -1156,6 +1219,9 @@ export const useStore = create<State>((set, get) => ({
     const p = get().project
     const mid = get().mediaId
     if (!p || !mid) return
+    // Guided tour: the real GPU pipeline must never run; the tour presents a
+    // flagged mock result instead (see tour/mockAnalysis.ts).
+    if (useTourStore.getState().active) return runMockAnalysis([mid])
     try {
       const poly = get().currentCourtPoly()
       const { job_id } = await api.analyze(p.id, {
@@ -1181,6 +1247,7 @@ export const useStore = create<State>((set, get) => ({
       get().toast({ kind: 'warn', title: tr('toast.noAnalyzableMedia') })
       return
     }
+    if (useTourStore.getState().active) return runMockAnalysis(ids)
     try {
       const { job_ids } = await api.analyzeBatch(p.id, {
         media_ids: ids,
@@ -1330,6 +1397,12 @@ export const useStore = create<State>((set, get) => ({
       get().toast({ kind: 'warn', title: tr('toast.analysisRunningBlocked') })
       return
     }
+    // Segmentation is locked while an optimize job runs (backend would 409; fail early here).
+    if (get().mediaIsOptimizing(mid)) {
+      jobLog.debug('resegment blocked: optimize running', { mid })
+      get().toast({ kind: 'warn', title: tr('toast.optimizeRunningBlocked') })
+      return
+    }
     const params = { ...get().params, ...(patch ?? {}) }
     if (patch) set({ params })
     set((s) => ({ busy: { ...s.busy, resegment: true } }))
@@ -1356,6 +1429,11 @@ export const useStore = create<State>((set, get) => ({
     if (!p || !mid) return
     if (mediaIsAnalyzing(mid)) {
       get().toast({ kind: 'warn', title: tr('toast.analysisRunningBlocked') })
+      return
+    }
+    if (get().mediaIsOptimizing(mid)) {
+      jobLog.debug('rebuildHits blocked: optimize running', { mid })
+      get().toast({ kind: 'warn', title: tr('toast.optimizeRunningBlocked') })
       return
     }
     const params = { ...get().params, ...(patch ?? {}) }
@@ -1556,6 +1634,13 @@ export const useStore = create<State>((set, get) => ({
   async autoCut(opts) {
     const p = get().project
     if (!p) return
+    // Optimization locks the segmentation workflow; the auto-cut controls are disabled while it
+    // runs, but guard the action too (shortcuts / queued calls).
+    if (get().mediaIsOptimizing(get().mediaId)) {
+      jobLog.debug('autoCut blocked: optimize running', { mid: get().mediaId })
+      get().toast({ kind: 'warn', title: tr('toast.optimizeRunningBlocked') })
+      return
+    }
     const ids = get()
       .visibleRallies()
       .map((r) => r.id)
