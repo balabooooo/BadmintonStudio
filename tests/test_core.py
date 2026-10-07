@@ -311,6 +311,80 @@ def test_size_filter_selects_end_to_end() -> None:
     check("尺寸上限能把大轨迹筛掉（阈值真的生效）", 1 not in ids2, str(ids2))
 
 
+def test_analyze_players_smoke_empty_detections() -> None:
+    """``analyze_players`` must run end-to-end with a stub YOLO that detects nothing.
+
+    Regression: the sampling debug log referenced ``duration`` before that local was assigned,
+    so *every* call raised UnboundLocalError — swallowed by the pipeline's try/except into a
+    silent "player detection degraded" (bad output that looks like a successful analysis).
+    This smoke test reaches past the log line and the whole assembly path with zero detections.
+    """
+    print("\nanalyze_players 空检测冒烟（回归）")
+    try:
+        import cv2
+        import tempfile
+    except ImportError:  # pragma: no cover
+        check("opencv 可用（跳过冒烟用例）", False)
+        return
+    try:
+        import ultralytics
+    except Exception as exc:  # Dependency is optional: degrade silently when missing, so skip here
+        print(f"  skip  未安装 ultralytics（{type(exc).__name__}: {exc}）")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="bms_players_smoke_") as tmp:
+        vid = Path(tmp) / "clip.avi"
+        w, h = 160, 96
+        vw = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (w, h))
+        if not vw.isOpened():  # pragma: no cover
+            print("  skip 本机 OpenCV 不能写 MJPG 视频，跳过冒烟用例")
+            return
+        for _ in range(12):
+            vw.write(np.zeros((h, w, 3), dtype=np.uint8))
+        vw.release()
+
+        from types import SimpleNamespace
+
+        class _StubYOLO:
+            def __init__(self, *_a: object, **_k: object) -> None:
+                pass
+
+            def predict(self, frames: list, **_k: object) -> list:
+                return [SimpleNamespace(boxes=None) for _ in frames]
+
+        saved_yolo = getattr(ultralytics, "YOLO", None)
+        ultralytics.YOLO = _StubYOLO
+        try:
+            sig = PL.analyze_players(str(vid), sample_fps=5.0, device="cpu",
+                                     model_name="nonexistent-stub.pt")
+            check("空检测桩下完整跑通", isinstance(sig, PL.PlayerSignal))
+            check("时间轴 fps/时长与采样一致", sig.fps == 5.0 and sig.duration > 0.0,
+                  f"fps={sig.fps} duration={sig.duration}")
+            check("无检测时无活跃球员且有帧行", sig.active_player_ids == []
+                  and len(sig.frame_boxes) >= 1)
+        except Exception as exc:
+            check("空检测桩下完整跑通", False, f"{type(exc).__name__}: {exc}")
+        finally:
+            if saved_yolo is None:
+                try:
+                    del ultralytics.YOLO
+                except AttributeError:
+                    pass
+            else:
+                ultralytics.YOLO = saved_yolo
+            # The run persists an (empty) boxes npz into the project cache; clean it up.
+            try:
+                tag = PL.boxes_cache_tag(
+                    str(vid), sample_fps=5.0, viewpoint="unknown",
+                    size_filter=PL.size_filter_from(None), model_name="nonexistent-stub.pt",
+                )
+                p = PL.boxes_cache_path(tag)
+                if p is not None and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+
 # ------------------------------------------------------------------ Court polygon
 
 
@@ -2936,6 +3010,286 @@ def test_cache_clear_unknown_target() -> None:
         check("未知目标被拒", e.status_code == 400)
 
 
+def _cc_layout(data: Path, models: Path) -> None:
+    """Create a representative cache/data layout for cache-management tests."""
+    # Derived, auto-rebuildable caches
+    for d, name in (("proxies", "a.mp4"), ("thumbs", "a.jpg"), ("audio", "a.wav"), ("frames", "f0001.png")):
+        p = data / "cache" / d
+        p.mkdir(parents=True, exist_ok=True)
+        (p / name).write_bytes(b"x" * 10)
+    # AI intermediate caches + eval artifacts (nested dirs must be walked)
+    for d in ("boxes", "pose", "calib"):
+        p = data / "cache" / d
+        p.mkdir(parents=True, exist_ok=True)
+        (p / f"{d}.npz").write_bytes(b"x" * 10)
+    ev = data / "cache" / "eval" / "backfill"
+    ev.mkdir(parents=True, exist_ok=True)
+    (ev / "r.json").write_bytes(b"x" * 10)
+    (data / "cache" / "scoring_ab.json").write_bytes(b"x" * 10)
+    # Offline analysis dump at the cache root (run_analysis.py writes last_analysis.json).
+    (data / "cache" / "last_analysis.json").write_bytes(b"x" * 10)
+    # Logs: old rotated files plus today's active sinks
+    logs = data / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "bms_2000-01-01.log").write_bytes(b"x" * 10)
+    (logs / "bms_2000-01-02.old.log").write_bytes(b"x" * 10)
+    import datetime
+    today = datetime.date.today().isoformat()
+    (logs / f"bms_{today}.log").write_bytes(b"x" * 10)
+    (logs / f"bms_debug_{today}.log").write_bytes(b"x" * 10)
+    # WebView profile: whitelisted cache dirs vs. protected profile data
+    wv = data / "webview" / "EBWebView"
+    (wv / "Default" / "Cache").mkdir(parents=True, exist_ok=True)
+    (wv / "Default" / "Cache" / "data_0").write_bytes(b"x" * 10)
+    (wv / "Default" / "GPUCache").mkdir(parents=True, exist_ok=True)
+    (wv / "Default" / "GPUCache" / "data_0").write_bytes(b"x" * 10)
+    (wv / "Crashpad").mkdir(parents=True, exist_ok=True)
+    (wv / "Crashpad" / "dump").write_bytes(b"x" * 10)
+    (wv / "Default" / "Network").mkdir(parents=True, exist_ok=True)
+    (wv / "Default" / "Network" / "Cookies").write_bytes(b"keep")
+    # Models: loose weights + a fetched model directory
+    (models / "yolo11n.pt").write_bytes(b"x" * 10)
+    (models / "vosk-model-small-cn-0.22").mkdir(parents=True, exist_ok=True)
+    (models / "vosk-model-small-cn-0.22" / "am").mkdir(parents=True, exist_ok=True)
+    (models / "vosk-model-small-cn-0.22" / "am" / "final.mdl").write_bytes(b"x" * 10)
+    # User data that must never appear as a cache target
+    (data / "uploads").mkdir(parents=True, exist_ok=True)
+    (data / "uploads" / "src.mp4").write_bytes(b"user")
+    (data / "annotations").mkdir(parents=True, exist_ok=True)
+    (data / "annotations" / "clip.anno.json").write_bytes(b"user")
+    (data / "projects").mkdir(parents=True, exist_ok=True)
+    (data / "projects" / "p_x.json").write_bytes(b"user")
+
+
+def test_cachemgmt_scan_reports_targets() -> None:
+    """scan_targets lists every registered target with file counts/sizes and risk metadata."""
+    print("\n缓存目标扫描")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_scan_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+
+    stats = {s["id"]: s for s in CM.scan_targets(data_dir=data, models_dir=models)}
+    check("包含九类目标", set(stats) == {"proxies", "thumbs", "audio", "frames", "ai",
+                                         "eval", "logs", "webview", "models"})
+    check("代理视频大小正确", stats["proxies"]["bytes"] == 10 and stats["proxies"]["files"] == 1)
+    check("AI 目标聚合三个目录", stats["ai"]["files"] == 3 and stats["ai"]["bytes"] == 30)
+    check("eval 聚合调试 JSON", stats["eval"]["files"] == 3 and stats["eval"]["bytes"] == 30)
+    check("日志计数含历史文件", stats["logs"]["files"] == 4 and stats["logs"]["bytes"] == 40)
+    check("WebView 只数白名单目录", stats["webview"]["files"] == 3 and stats["webview"]["bytes"] == 30)
+    check("模型统计含目录内文件", stats["models"]["files"] == 2 and stats["models"]["bytes"] == 20)
+    check("模型标记为危险", stats["models"]["level"] == "danger" and stats["models"]["default"] is False)
+    check("安全项默认勾选", all(stats[k]["default"] for k in ("proxies", "thumbs", "audio", "frames")))
+    check("不存在的目录零占用", CM.scan_targets(data_dir=Path(tempfile.mkdtemp()),
+                                                models_dir=Path(tempfile.mkdtemp()))[0]["bytes"] == 0)
+
+
+def test_cachemgmt_clear_selected_only_keeps_dirs() -> None:
+    """Clearing deletes files of the selected targets only, preserves directory structure and other targets."""
+    print("\n按选择清理缓存")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_clear_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+
+    progress: list[tuple[int, int, str]] = []
+    res = CM.clear_targets(["proxies", "ai"], data_dir=data, models_dir=models,
+                           on_progress=lambda d, t, tid: progress.append((d, t, tid)))
+    check("释放大小正确", res["freed"] == 40)
+    items = {i["id"]: i for i in res["items"]}
+    check("逐项统计删除数", items["proxies"]["removed"] == 1 and items["ai"]["removed"] == 3)
+    check("目录结构保留", (data / "cache" / "proxies").is_dir() and (data / "cache" / "pose").is_dir())
+    check("仅删除选中项", not (data / "cache" / "proxies" / "a.mp4").exists()
+          and not (data / "cache" / "pose" / "pose.npz").exists())
+    check("未选项保留", (data / "cache" / "audio" / "a.wav").exists()
+          and (data / "uploads" / "src.mp4").exists()
+          and (models / "yolo11n.pt").exists())
+    check("进度回调覆盖全部文件", progress and progress[-1][0] == progress[-1][1] == 4)
+
+
+def test_cachemgmt_models_require_confirm() -> None:
+    """The danger-level models target needs an explicit confirmation flag; unknown ids are rejected."""
+    print("\n模型清理二次确认")
+    import tempfile
+
+    import pytest
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_model_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+
+    with pytest.raises(ValueError):
+        CM.clear_targets(["models"], data_dir=data, models_dir=models)
+    check("未确认时模型保留", (models / "yolo11n.pt").exists())
+    with pytest.raises(ValueError):
+        CM.clear_targets(["nope"], data_dir=data, models_dir=models)
+    res = CM.clear_targets(["models"], data_dir=data, models_dir=models, confirms={"models": True})
+    check("确认后删除权重与模型目录", not (models / "yolo11n.pt").exists()
+          and not (models / "vosk-model-small-cn-0.22").exists())
+    check("模型清理返回释放量", res["freed"] == 20)
+
+
+def test_cachemgmt_logs_keeps_today() -> None:
+    """Log cleanup removes rotated history but never touches the current day's active sinks."""
+    print("\n日志清理保留当天文件")
+    import datetime
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_logs_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+    today = datetime.date.today().isoformat()
+
+    CM.clear_targets(["logs"], data_dir=data, models_dir=models)
+    check("历史日志已删除", not (data / "logs" / "bms_2000-01-01.log").exists()
+          and not (data / "logs" / "bms_2000-01-02.old.log").exists())
+    check("当天日志保留", (data / "logs" / f"bms_{today}.log").exists()
+          and (data / "logs" / f"bms_debug_{today}.log").exists())
+
+
+def test_cachemgmt_retries_and_isolates_failures() -> None:
+    """A locked file is retried then reported; one failure never aborts the remaining deletions."""
+    print("\n清理失败重试与隔离")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_fail_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+    # proxies/a.mp4 fails twice (retry path), frames/f0001.png fails forever (lock/permission).
+    attempts: dict[str, int] = {}
+    import pathlib
+
+    orig_unlink = pathlib.Path.unlink
+
+    def flaky_unlink(self, *a, **k):
+        attempts[self.name] = attempts.get(self.name, 0) + 1
+        if self.name == "a.mp4" and attempts[self.name] <= 2:
+            raise PermissionError("locked")
+        if self.name == "f0001.png":
+            raise PermissionError("locked forever")
+        return orig_unlink(self, *a, **k)
+
+    pathlib.Path.unlink = flaky_unlink
+    try:
+        res = CM.clear_targets(["proxies", "frames"], data_dir=data, models_dir=models)
+    finally:
+        pathlib.Path.unlink = orig_unlink
+    items = {i["id"]: i for i in res["items"]}
+    check("瞬时锁失败重试后删除", (not (data / "cache" / "proxies" / "a.mp4").exists())
+          and attempts["a.mp4"] == 3)
+    check("持续失败被记录", items["frames"]["removed"] == 0 and len(items["frames"]["failed"]) == 1)
+    check("整体释放量只算成功项", res["freed"] == 10)
+    check("失败文件仍在", (data / "cache" / "frames" / "f0001.png").exists())
+
+
+def test_cachemgmt_timeout_stops_cleanly() -> None:
+    """A zero deadline skips remaining files and reports the timed-out targets instead of running unbounded."""
+    print("\n清理超时控制")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_time_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+
+    res = CM.clear_targets(["proxies", "audio", "thumbs"], data_dir=data, models_dir=models, deadline_s=0.0)
+    check("超时返回未完成目标", set(res["timed_out"]) == {"proxies", "audio", "thumbs"})
+    check("超时文件保留在磁盘", (data / "cache" / "proxies" / "a.mp4").exists())
+
+
+def test_cachemgmt_cancel_stops_cleanly() -> None:
+    """Cancellation stops further deletions without raising."""
+    print("\n清理取消")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_cancel_"))
+    models = Path(tempfile.mkdtemp(prefix="bms_cc_models_"))
+    _cc_layout(data, models)
+
+    res = CM.clear_targets(["proxies", "audio"], data_dir=data, models_dir=models,
+                           is_cancelled=lambda: True)
+    check("取消后不删除文件", res["freed"] == 0 and (data / "cache" / "proxies" / "a.mp4").exists())
+    check("取消标记为超时目标", set(res["timed_out"]) == {"proxies", "audio"})
+
+
+def test_cachemgmt_clear_endpoint_validates_danger_target() -> None:
+    """The HTTP endpoint rejects unknown lists and missing danger confirmation before scheduling anything."""
+    print("\n清缓存接口危险项校验")
+    from fastapi import HTTPException
+
+    from bms.main import cache_clear
+
+    for payload in ({"targets": ["bogus"]}, {"targets": ["models"]}):
+        try:
+            cache_clear(payload)
+            check(f"被拒: {payload}", False)
+        except HTTPException as e:
+            check(f"被拒: {payload}", e.status_code == 400)
+
+
+def test_purge_orphan_assets_on_project_delete() -> None:
+    """Deleting a project removes only unreferenced uploads/annotations; external files are never touched."""
+    print("\n删工程级联孤儿回收")
+    import tempfile
+
+    from bms.core import cachemgmt as CM
+    from bms.core.models import MediaInfo
+
+    data = Path(tempfile.mkdtemp(prefix="bms_cc_purge_"))
+    uploads = data / "uploads"
+    annos = data / "annotations"
+    uploads.mkdir(parents=True)
+    annos.mkdir(parents=True)
+    external = Path(tempfile.mkdtemp(prefix="bms_cc_ext_")) / "disk.mp4"
+    external.write_bytes(b"ext")
+
+    shared = uploads / "shared.mp4"
+    only_a = uploads / "only_a.mp4"
+    shared.write_bytes(b"x" * 10)
+    only_a.write_bytes(b"x" * 5)
+
+    def anno_path(m: MediaInfo) -> Path:
+        return annos / f"{Path(m.path).stem}_{m.id}_960x540.anno.json"
+
+    a1 = MediaInfo(id="m_a1", path=str(shared), name="shared", has_audio=False, width=1, height=1, duration=1.0)
+    a2 = MediaInfo(id="m_a2", path=str(only_a), name="only_a", has_audio=False, width=1, height=1, duration=1.0)
+    a3 = MediaInfo(id="m_a3", path=str(external), name="disk", has_audio=False, width=1, height=1, duration=1.0)
+    b1 = MediaInfo(id="m_b1", path=str(shared), name="shared", has_audio=False, width=1, height=1, duration=1.0)
+    for m, body in ((a1, b"a1"), (a2, b"a2"), (a3, b"a3"), (b1, b"b1")):
+        anno_path(m).write_bytes(body)
+
+    # Project A is deleted while project B still references the shared upload + its own annotation.
+    res = CM.purge_orphan_assets([a1, a2, a3], [b1], data_dir=data, anno_path_fn=anno_path)
+    check("独占上传被删除", not only_a.exists())
+    check("共享上传保留", shared.exists())
+    check("工程外部视频绝不删除", external.exists())
+    check("独占标注被删除", not anno_path(a1).exists() and not anno_path(a2).exists())
+    check("共享素材的他工程标注保留", anno_path(b1).exists())
+    check("外部视频标注同样随工程删除", not anno_path(a3).exists())
+    check("回收大小只含应用目录文件", res["freed"] == 5 + 6)
+    check("删除计数", res["uploads_removed"] == 1 and res["annotations_removed"] == 3)
+
+    # Deleting the last referencing project frees the shared upload too.
+    res2 = CM.purge_orphan_assets([b1], [], data_dir=data, anno_path_fn=anno_path)
+    check("最后引用消失后删除共享上传", not shared.exists())
+    check("二次回收大小", res2["freed"] == 10 + 2)
+
+
 def test_export_merge_passes_cancel() -> None:
     """Every ffmpeg call in the segmented (merge) path, including the final merge, must receive cancel."""
     print("\n导出合并传递取消")
@@ -3082,6 +3436,352 @@ def test_samples_endpoint() -> None:
             MAIN.DATA_DIR = old_data_dir
 
 
+# ------------------------------------------------------------------ bugfix regression:
+# overlay tracking/interpolation, npz cache, optimize job progress/guard
+
+
+def test_boxes_cache_v3_raw_align_and_interp() -> None:
+    """v3 npz: raw detections are re-bucketed from the raw sampling grid onto the timeline grid,
+    and the per-row ``interp`` flag round-trips so the UI can dim interpolated boxes.
+
+    Real case: 30fps source sampled every other frame runs the detector at 15fps while the
+    labeled timeline is 12fps; v2 stored raw row indices verbatim, so the raw overlay drifted
+    in time and lost its tail rows.
+    """
+    print("\n球员：v3 缓存 raw 时间对齐与插值标记")
+    import tempfile
+
+    fps = 12.0
+    raw_fps = 15.0
+    n = 24  # 2 seconds at 12fps
+    frame_boxes = [[(7, 0.10, 0.20, 0.30, 0.90)]] * n
+    frame_confs = [[0.8]] * n
+    frame_interps = [[0]] * n
+    frame_interps[5] = [1]
+    # 30 raw rows = 2 seconds at 15fps, one detection each.
+    raw_dets = [[((0.01 * i, 0.1, 0.2, 0.8), 0.5)] for i in range(30)]
+
+    with tempfile.TemporaryDirectory() as td:
+        ok = PL.save_boxes_cache("unittest_v3", frame_boxes, fps, n / fps, (7,),
+                                 cache_dir=td, frame_confs=frame_confs, raw_dets=raw_dets,
+                                 raw_fps=raw_fps, frame_interp=frame_interps)
+        check("v3 保存成功", ok)
+        doc = PL.load_boxes_cache("unittest_v3", cache_dir=td)
+        check("v3 加载成功", doc is not None)
+        if doc is None:
+            return
+        check("raw_fps 元数据为 15", abs(float(doc["raw_fps"]) - 15.0) < 1e-9,
+              str(doc["raw_fps"]))
+        interps = doc["frame_interps"]
+        check("v3 带插值标记列", interps is not None)
+        check("插值框标记为 1", interps is not None and interps[5] == [1])
+        check("观察框标记为 0", interps is not None and interps[0] == [0] and interps[23] == [0])
+        rd = doc["raw_dets"]
+        check("raw 层对齐到时间线长度", rd is not None and len(rd) == n)
+        # raw row 15 at 15fps is t=1.0s -> timeline cell round(1.0*12)=12
+        check("raw 按时间重分桶（15fps 第15行 -> 12fps 第12格）",
+              rd is not None and len(rd[12]) == 1 and abs(rd[12][0][0] - 0.15) < 0.02,
+              str(rd[12] if rd else None))
+        # All 30 rows must survive (v2 dropped the tail) and the last one lands on cell 23.
+        total_raw = sum(len(r) for r in (rd or []))
+        check("raw 尾部行不再丢失（30 行全保留）", total_raw == 30, str(total_raw))
+        check("raw 最后一行落在第 23 格", rd is not None and len(rd[23]) >= 1)
+
+
+def test_boxes_cache_v2_raw_grid_remap() -> None:
+    """Old v2 caches with a drifted raw grid are detected and remapped on load."""
+    print("\n球员：v2 旧缓存 raw 网格自动重映射")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        n, fps, dur = 24, 12.0, 2.0
+
+        def write_v2(path: Path, raw_count: int) -> None:
+            np.savez_compressed(
+                path,
+                version=np.int64(2), fps=np.float64(fps), duration=np.float64(dur),
+                n=np.int64(n), active_ids=np.asarray([7], dtype=np.int32),
+                frame=np.asarray([0], dtype=np.int32), track=np.asarray([7], dtype=np.int32),
+                boxes=np.zeros((1, 4), dtype=np.uint16), conf=np.asarray([200], dtype=np.uint8),
+                raw_frame=np.arange(raw_count, dtype=np.int32),
+                raw_boxes=np.zeros((raw_count, 4), dtype=np.uint16),
+                raw_conf=np.full(raw_count, 128, dtype=np.uint8),
+            )
+
+        # Drifted file: 30 raw rows over 2s -> inferred 15fps grid.
+        write_v2(d / "boxes_unittest_drift.npz", 30)
+        doc = PL.load_boxes_cache("unittest_drift", cache_dir=td)
+        check("漂移 v2 可加载", doc is not None)
+        if doc is not None:
+            check("推断 raw_fps≈15", abs(float(doc["raw_fps"] or 0) - 15.0) < 1e-6,
+                  str(doc["raw_fps"]))
+            rd = doc["raw_dets"]
+            check("重映射后第 15 行进第 12 格", rd is not None and len(rd[12]) == 1)
+            check("重映射无越界行", rd is not None and sum(len(r) for r in rd) == 30)
+
+        # Aligned file (24 rows): no remap, raw_fps stays at the timeline fps.
+        write_v2(d / "boxes_unittest_aligned.npz", 24)
+        doc2 = PL.load_boxes_cache("unittest_aligned", cache_dir=td)
+        check("对齐 v2 可加载", doc2 is not None and abs(float(doc2["raw_fps"] or 0) - 12.0) < 1e-9)
+
+
+def test_track_hole_interpolation_rules() -> None:
+    """Short same-track holes are linearly filled; >2s gaps, occupied slots and inactive
+    tracks are left alone."""
+    print("\n球员：跟踪空洞插值规则")
+    fps = 12.0
+    n = 400
+    boxes_map: list[dict] = [dict() for _ in range(n)]
+    confs_map: list[dict] = [dict() for _ in range(n)]
+    interps_map: list[dict] = [dict() for _ in range(n)]
+
+    def track(tid: int, slots: list[int], box0=(0.10, 0.20, 0.30, 0.80),
+              box1=(0.20, 0.20, 0.40, 0.80), conf0=0.8, conf1=0.6):
+        # analyze_players summarizes tracker buffers into PlayerTrack before timeline assembly.
+        return PL.PlayerTrack(
+            track_id=tid,
+            frames=list(slots),
+            times=[s / fps for s in slots],
+            boxes=[box0, box1],
+            speeds=[0.0, 0.0],
+            confidences=[conf0, conf1],
+        )
+
+    t_fill = track(1, [0, 24])          # exactly 2.0s gap -> fill
+    t_wide = track(3, [30, 55])         # 25 cells = 2.083s -> stay empty
+    t_long = track(4, [60, 300])        # 240 cells = 20s -> stay empty
+    t_inactive = track(9, [0, 24])      # not an active id -> ignored
+    active_set = {1, 2, 3, 4}
+
+    # Seed observed endpoint boxes for the active tracks (as the assembly loop would).
+    for tid, slots in ((1, [0, 24]), (3, [30, 55]), (4, [60, 300])):
+        for s in slots:
+            boxes_map[s][tid] = (tid, 0.1, 0.2, 0.3, 0.8)
+            confs_map[s][tid] = 0.8
+            interps_map[s][tid] = 0
+    # Slot 12 is already occupied by another track: never overwrite it.
+    boxes_map[12][2] = (2, 0.5, 0.5, 0.6, 0.9)
+    confs_map[12][2] = 0.9
+    interps_map[12][2] = 0
+
+    filled, gaps = PL._fill_track_holes(
+        [t_fill, t_wide, t_long, t_inactive], active_set,
+        boxes_map, confs_map, interps_map, fps,
+    )
+    check("仅 1 个短空洞被处理", gaps == 1, str(gaps))
+    check("填充 22 格（23 格空洞减去 1 格占位冲突）", filled == 22, str(filled))
+    check("中间框为线性插值（g=6, f=0.25）",
+          abs(boxes_map[6][1][1] - (0.10 + 0.10 * 0.25)) < 1e-9
+          and abs(boxes_map[6][1][3] - (0.30 + 0.10 * 0.25)) < 1e-9)
+    check("插值置信度为两端均值", abs(confs_map[6][1] - 0.7) < 1e-9)
+    check("插值格打标", interps_map[6][1] == 1 and interps_map[23][1] == 1)
+    check("观测端点不打标", interps_map[0][1] == 0 and interps_map[24][1] == 0)
+    check("占位槽不被覆盖", set(boxes_map[12].keys()) == {2} and interps_map[12] == {2: 0})
+    check(">2s 小空洞不填", all(1 not in boxes_map[g] for g in range(31, 55)))
+    check("20s 长空洞不填", all(4 not in boxes_map[g] for g in range(61, 300)))
+    check("非激活 track 不插值", all(9 not in m for m in boxes_map))
+
+
+def test_junction_edge_clip_endpoints() -> None:
+    """Seam geometry trims border-clipped end boxes and gives up when none are fully visible."""
+    print("\n球员：接缝边缘框裁剪")
+
+    def buf(times_boxes):
+        tk = PL._TrackBuf(1, 16.0 / 9.0)
+        tk.frames = list(range(len(times_boxes)))
+        tk.times = [t for t, _ in times_boxes]
+        tk.boxes = [b for _, b in times_boxes]
+        tk.confs = [0.9] * len(times_boxes)
+        tk.speeds = [0.0] * len(times_boxes)
+        return tk
+
+    inner = (0.2, 0.2, 0.4, 0.8)
+    edge = (0.0, 0.1, 0.2, 0.9)  # x1 == 0 -> clipped
+    check("边缘判定：贴边框", PL._box_touches_edge(edge))
+    check("边缘判定：内部框", not PL._box_touches_edge(inner))
+    check("eps 容差生效", PL._box_touches_edge((0.005, 0.2, 0.4, 0.8)))
+
+    # prev fragment: last two boxes (0.8s, 1.0s) clipped, box at 0.3s fully visible -> chosen.
+    prev = buf([(0.3, inner), (0.8, edge), (1.0, edge)])
+    # nxt fragment: first two clipped within 0.75s, third is fully visible -> chosen.
+    nxt = buf([(2.0, edge), (2.3, edge), (2.6, inner)])
+    ends = PL._junction_endpoints(prev, nxt)
+    check("接缝回退到最近完整框", ends is not None and ends[0] == 0.3 and ends[2] == 2.6,
+          str(ends))
+
+    # Every box within the 0.75s trim window is clipped -> no usable seam.
+    prev_bad = buf([(0.0, edge), (0.5, edge), (1.0, edge)])
+    check("窗口内全是边缘框 -> None", PL._junction_endpoints(prev_bad, nxt) is None)
+
+
+def test_npz_lru_cache() -> None:
+    """The process-wide npz cache: hits return the same decoded object, stat changes invalidate,
+    None results are not cached, and LRU eviction respects capacity."""
+    print("\n叠加：npz LRU 进程缓存")
+    import tempfile
+    from bms.analysis.npz_cache import NpzLruCache
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        paths = []
+        for i, name in enumerate(("a.npz", "b.npz", "c.npz", "missing.npz")):
+            f = d / name
+            if name != "missing.npz":
+                f.write_bytes(b"x" * (10 + i))
+            paths.append(f)
+        calls: dict[str, int] = {}
+
+        def loader(p: Path):
+            calls[p.name] = calls.get(p.name, 0) + 1
+            if p.name == "missing.npz":
+                return None
+            return {"name": p.name, "size": p.stat().st_size}
+
+        cache = NpzLruCache(capacity=2)
+        a1 = cache.get_or_load(paths[0], loader)
+        b1 = cache.get_or_load(paths[1], loader)
+        check("首次加载 miss", a1 is not None and b1 is not None
+              and cache.hits == 0 and cache.misses == 2)
+        check("二次读取命中同一对象", cache.get_or_load(paths[0], loader) is a1
+              and calls["a.npz"] == 1 and cache.hits == 1)
+        # Access order is now [b, a]; inserting c evicts b.
+        cache.get_or_load(paths[2], loader)
+        check("未淘汰项仍命中", cache.get_or_load(paths[0], loader) is a1
+              and calls["a.npz"] == 1)
+        check("LRU 淘汰最久未用", cache.get_or_load(paths[1], loader) is not b1
+              and calls["b.npz"] == 2)
+        # None is never cached: the loader reruns every time.
+        check("None 不缓存", cache.get_or_load(paths[3], loader) is None)
+        check("None 每次重新尝试", cache.get_or_load(paths[3], loader) is None
+              and calls["missing.npz"] == 2)
+        # mtime/size change invalidates the cached copy (loader reruns exactly once).
+        paths[2].write_bytes(b"y" * 99)
+        ns = paths[2].stat().st_mtime_ns + 5_000_000_000
+        os.utime(paths[2], ns=(ns, ns))
+        calls_before = calls["c.npz"]
+        new_c = cache.get_or_load(paths[2], loader)
+        check("文件变化自动失效", new_c is not None and new_c["size"] == 99
+              and calls["c.npz"] == calls_before + 1)
+        cache.clear()
+        check("clear 重置计数", cache.hits == 0 and cache.misses == 0)
+
+
+def test_optimize_progress_monotonic() -> None:
+    """Optimize progress callbacks are monotonic 0→1 and walk stable stage codes."""
+    print("\n标注优化：进度回调单调且阶段码稳定")
+    fps = 12.0
+    dur = 120.0
+    n = int(dur * fps)
+    act = np.full(n, 0.4, dtype=np.float32)
+    pm = np.zeros(n, dtype=np.float32)
+    for a, b in ((10, 35), (60, 90)):
+        pm[int(a * fps):int(b * fps)] = 1.0
+        act[int(a * fps):int(b * fps)] = 0.9
+    hit_times = [t for a, b in ((10, 35), (60, 90)) for t in np.arange(a, b, 1.2)]
+    res = AnalysisResult(
+        media_id="m_prog", status="done",
+        params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.5, post_roll=0.5),
+        signals={
+            "activity_full": act.tolist(),
+            "player_motion_full": pm.tolist(),
+            "player_coverage_full": np.ones(n, dtype=np.float32).tolist(),
+            "fps": [fps], "duration": [dur], "player_fps": [fps],
+            "hit_times": [round(float(t), 3) for t in hit_times],
+        },
+        stats={"audio_reliability": 0.8},
+    )
+    seen: list[tuple[float, str]] = []
+    AN.optimize(res, [(10.0, 34.0), (61.0, 89.0)], focus=(0.0, dur),
+                grid=[("seg_min_core", [0.8, 1.8]), ("min_rally_seconds", [2.0])],
+                on_progress=lambda p, stage: seen.append((p, stage)))
+    check("有多次进度回调", len(seen) >= 5, str(len(seen)))
+    ps = [p for p, _ in seen]
+    check("进度单调不减", all(b >= a - 1e-12 for a, b in zip(ps, ps[1:])))
+    check("进度落在 [0.03, 1.0]", ps[0] == 0.03 and ps[-1] == 1.0, f"{ps[0]}..{ps[-1]}")
+    stages = [s for _, s in seen]
+    check("包含 segment 阶段", "optimize_segment" in stages)
+    check("以 done 阶段结束", stages[-1] == "optimize_done")
+    check("阶段码为稳定 ASCII", all(s.startswith("optimize_") for s in stages))
+
+
+def test_jobs_keep_optimize_results_and_guard() -> None:
+    """optimize job results survive prune/public_info (UI needs best params); other kinds are
+    stripped. The resegment guard rejects mid-flight optimize jobs with 409."""
+    print("\n任务：optimize 结果保留与分割守卫")
+    import threading
+    from fastapi import HTTPException
+    from bms.core.jobs import JobManager, manager as global_jobs, public_info
+    from bms.main import _guard_no_active_optimize
+
+    # Result retention uses a private table (deterministic); the guard reads the GLOBAL manager.
+    mgr = JobManager()
+    j_opt = mgr.submit("optimize", "优化", lambda j: {"best": {"f1": 0.9}})
+    j_other = mgr.submit("analysis", "分析", lambda j: {"heavy": list(range(1000))})
+    j_opt.join(5)
+    j_other.join(5)
+    mgr.prune(keep=100)
+    check("optimize 结果保留", j_opt.info.result is not None and j_opt.info.result["best"]["f1"] == 0.9)
+    check("其他类型结果被摘除", j_other.info.result is None)
+    check("public_info 保留 optimize 结果",
+          public_info(j_opt.info.model_copy(deep=False)).result is not None)
+    check("public_info 剥离重结果",
+          j_other.info.result is None or public_info(j_other.info.model_copy(deep=False)).result is None)
+
+    # Guard: an active optimize job for this media blocks segmentation mutations with 409.
+    released = threading.Event()
+
+    def block(_job):
+        released.wait(5.0)
+
+    blocker = global_jobs.submit("optimize", "优化中", block, media_id="m_guard")
+    for _ in range(50):
+        if blocker.info.status == "running":
+            break
+        blocker.join(0.02)
+    try:
+        try:
+            _guard_no_active_optimize("m_guard")
+            check("优化进行中分割请求被拒（409）", False)
+        except HTTPException as e:
+            check("优化进行中分割请求被拒（409）", e.status_code == 409)
+        check("其他素材不受影响（无异常）", _guard_no_active_optimize("m_other") is None)
+    finally:
+        released.set()
+        blocker.join(5)
+
+    # Route-level 409 happens before any new job is submitted.
+    from bms.api import annotations as ANN_API
+    import types as _types
+
+    res = AnalysisResult(media_id="m_guard", status="done", params=AnalysisParams())
+    fake_proj = _types.SimpleNamespace(analyses={"m_guard": res})
+    fake_media = _types.SimpleNamespace(name="clip.mp4")
+    held = threading.Event()
+    blocker2 = global_jobs.submit("optimize", "优化中", lambda j: held.wait(5.0), media_id="m_guard")
+    for _ in range(50):
+        if blocker2.info.status == "running":
+            break
+        blocker2.join(0.02)
+    orig_load, orig_media = ANN_API._load, ANN_API._media
+    orig_labels = ANN_API._read_optimize_labels
+    try:
+        ANN_API._load = lambda pid: fake_proj
+        ANN_API._media = lambda proj, mid: fake_media
+        # Provide non-empty labels so the request passes validation and reaches the 409 check.
+        ANN_API._read_optimize_labels = lambda m: ([(1.0, 2.0)], [], None)
+        try:
+            ANN_API.optimize("p_x", "m_guard", {})
+            check("重复 optimize 返回 409", False)
+        except HTTPException as e:
+            check("重复 optimize 返回 409", e.status_code == 409)
+    finally:
+        ANN_API._load, ANN_API._media = orig_load, orig_media
+        ANN_API._read_optimize_labels = orig_labels
+        held.set()
+        blocker2.join(5)
+
+
 def main() -> int:
     test_player_pipeline_contract()
     test_shuttle_pipeline_contract()
@@ -3090,6 +3790,7 @@ def main() -> int:
     test_size_filter()
     test_probe_frame_capture()
     test_size_filter_selects_end_to_end()
+    test_analyze_players_smoke_empty_detections()
     test_polygon_geometry()
     test_polygon_calibration()
     test_select_active_players_signature_end_to_end()
@@ -3124,6 +3825,11 @@ def main() -> int:
     test_pose_keypoint_crop_inverse_map()
     test_pose_boxes_signature_quantization_stable()
     test_boxes_cache_v2_roundtrip_and_v1_compat()
+    test_boxes_cache_v3_raw_align_and_interp()
+    test_boxes_cache_v2_raw_grid_remap()
+    test_track_hole_interpolation_rules()
+    test_junction_edge_clip_endpoints()
+    test_npz_lru_cache()
     test_pose_gate_force()
     test_resegment_regates_hits()
     test_resegment_gate_degrades_without_raw()
@@ -3135,12 +3841,14 @@ def main() -> int:
     test_annotation_objective_and_grid()
     test_annotation_label_quality()
     test_annotation_optimizer_runs()
+    test_optimize_progress_monotonic()
     test_annotation_weights_stage()
     test_annotation_eval_window_intersection()
     test_annotation_hit_gate_stage()
     test_preset_hit_params()
     test_api_filters_and_id_safety()
     test_job_media_binding()
+    test_jobs_keep_optimize_results_and_guard()
     test_analyze_batch_scope()
     test_preset_helpers()
     test_bulk_media_purge()
@@ -3164,6 +3872,15 @@ def main() -> int:
     test_malformed_body_validation()
     test_corrupt_project_json_and_atomic_save()
     test_cache_clear_unknown_target()
+    test_cachemgmt_scan_reports_targets()
+    test_cachemgmt_clear_selected_only_keeps_dirs()
+    test_cachemgmt_models_require_confirm()
+    test_cachemgmt_logs_keeps_today()
+    test_cachemgmt_retries_and_isolates_failures()
+    test_cachemgmt_timeout_stops_cleanly()
+    test_cachemgmt_cancel_stops_cleanly()
+    test_cachemgmt_clear_endpoint_validates_danger_target()
+    test_purge_orphan_assets_on_project_delete()
     test_export_merge_passes_cancel()
     test_local_origin_guard()
     test_samples_generation()

@@ -146,6 +146,7 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
             </Button>
             <Button
               variant="primary"
+              data-tour="dlg-run"
               loading={!!activeJob}
               disabled={!media || !!activeJob || speechInvalid || (scope === 'all' && mediaCount === 0)}
               onClick={async () => {
@@ -340,6 +341,16 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
             </div>
           </div>
         </>
+      )}
+
+      {done && analysis?.stats?.mock && (
+        <div
+          data-tour-mock-badge
+          className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-400/10 px-2.5 py-1 text-[11px] font-medium text-amber-300"
+        >
+          <span aria-hidden="true">🧪</span>
+          {tr('tour.mock.badge')}
+        </div>
       )}
 
       {done && analysis && (

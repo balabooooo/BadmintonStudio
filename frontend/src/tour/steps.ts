@@ -1,18 +1,31 @@
 /** Guided-tour step table: pure data consumed by the overlay engine (TourOverlay).
  *
  * One step per spec §4 table row (29 rows), with row 12 (analysis-dialog
- * parameters) split into an info step on the parameters block and an
- * interactive "close the dialog" step -> 30 steps in total.
+ * parameters) split into an info step, an interactive "run the (mock)
+ * analysis" step and an interactive "close the dialog" step -> 31 steps.
  *
  * Steps reference the ``data-tour`` anchors added to the components by the
  * anchor task; copy lives in the i18n fragment ``tour.*`` (both languages),
- * never inline. Interactive steps gate "Next" behind ``waitFor``; the user
- * can always skip an individual step from the bubble.
+ * never inline. Interactive steps gate "Next" behind ``waitFor``; they carry
+ * a one-line ``hintKey`` instruction and optionally an ``assist`` action the
+ * bubble's "do it for me" button can perform. The user can always skip an
+ * individual step from the bubble.
  */
 
 import { useStore } from '../store/useStore'
 
 export type TourKind = 'info' | 'interactive' | 'centered'
+
+/** "Do it for me" action attached to an interactive step.
+ * - ``click``: programmatically click the target anchor (or ``selector`` inside it)
+ * - ``createProject``: create a project directly, skipping the name-and-confirm modal
+ * - ``play``: start playback via the store
+ */
+export interface TourAssist {
+  kind: 'click' | 'createProject' | 'play'
+  /** Optional CSS selector scoped inside the target anchor (e.g. a specific tab). */
+  selector?: string
+}
 
 export interface TourStep {
   id: string
@@ -37,10 +50,15 @@ export interface TourStep {
   bodyKey: string
   /** Group summary rendered at the bottom of the bubble (reserved; currently unused). */
   summaryKey?: string
+  /** One-line concrete instruction ("click the highlighted X, then Y") shown
+   * on interactive steps while their waitFor is unsatisfied. */
+  hintKey?: string
   /** "Next" stays disabled until this returns true (interactive steps). */
   waitFor?: () => boolean
   /** Anchor programmatically clicked when the step is entered (e.g. open the analysis dialog). */
-  action?: { click: string }
+  action?: { click: string; selector?: string }
+  /** Optional "do it for me" action for users who get stuck. */
+  assist?: TourAssist
   customAction?: 'loadSamples'
 }
 
@@ -61,17 +79,12 @@ const dialogClosed = () => !document.querySelector('[data-tour="dlg-scope"]')
 /** True while the player is actually playing. */
 const isPlaying = () => useStore.getState().playing
 
-/**
- * True when the inspector's "clip" tab is the active one.
- *
- * The Segmented control marks the active option with the ``text-ink-950``
- * text-color class on the button itself (no aria-selected/data-active exists),
- * and the clip tab is the 2nd of the three tab buttons inside the anchor.
- * Works whether the anchor lands on the tab-bar container or on the
- * Segmented root: nth-of-type counts within the buttons' own parent.
- */
-const clipTabActive = () =>
-  !!document.querySelector('[data-tour="insp-tabs"] button:nth-of-type(2).text-ink-950')
+/** True once the flagged mock analysis of the current media is done. A real
+ * analysis never satisfies it, even on a replay tour with real data present. */
+const mockAnalysisReady = () => {
+  const a = useStore.getState().currentAnalysis()
+  return !!a && a.status === 'done' && a.stats?.mock === true
+}
 
 /* ------------------------------------------------------------------ step table */
 
@@ -106,7 +119,9 @@ export function buildSteps(): TourStep[] {
       group: 'library',
       titleKey: 'tour.library.title',
       bodyKey: 'tour.library.body',
+      hintKey: 'tour.library.hint',
       waitFor: hasProject,
+      assist: { kind: 'createProject' },
     },
     // 4. sample media (bubble button runs the seed+import chain)
     {
@@ -117,6 +132,7 @@ export function buildSteps(): TourStep[] {
       group: 'samples',
       titleKey: 'tour.samples.title',
       bodyKey: 'tour.samples.body',
+      hintKey: 'tour.samples.hint',
       customAction: 'loadSamples',
       waitFor: hasMedia,
     },
@@ -130,7 +146,9 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.court.title',
       bodyKey: 'tour.court.body',
     },
-    // 6. topbar: open the analysis dialog
+    // 6. topbar: open the analysis dialog (user clicks the highlighted button;
+    //     no auto-click so the interaction stays intentional and the button
+    //     reads as a normal, enabled control rather than auto-triggering).
     {
       id: 'btn-analysis',
       view: 'studio',
@@ -139,8 +157,9 @@ export function buildSteps(): TourStep[] {
       group: 'topbar',
       titleKey: 'tour.analysis.title',
       bodyKey: 'tour.analysis.body',
-      action: { click: 'btn-analysis' },
+      hintKey: 'tour.analysis.hint',
       waitFor: dialogOpen,
+      assist: { kind: 'click' },
     },
     // 7. dialog: analysis scope
     {
@@ -202,7 +221,22 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.dlg.params.title',
       bodyKey: 'tour.dlg.params.body',
     },
-    // 12b. dialog: close it (row 12 split, part 2; user clicks the dialog's own close button)
+    // 12b. dialog: run the analysis. While the tour is active the store
+    // intercepts this button and runs the flagged mock pipeline (no GPU work).
+    {
+      id: 'dlg-run',
+      view: 'studio',
+      target: 'dlg-run',
+      placement: 'top',
+      kind: 'interactive',
+      group: 'dialog',
+      titleKey: 'tour.dlg.run.title',
+      bodyKey: 'tour.dlg.run.body',
+      hintKey: 'tour.dlg.run.hint',
+      waitFor: mockAnalysisReady,
+      assist: { kind: 'click' },
+    },
+    // 12c. dialog: close it (user clicks the dialog's own close button)
     {
       id: 'dlg-close',
       view: 'studio',
@@ -211,19 +245,11 @@ export function buildSteps(): TourStep[] {
       group: 'dialog',
       titleKey: 'tour.dlg.close.title',
       bodyKey: 'tour.dlg.close.body',
+      hintKey: 'tour.dlg.close.hint',
       waitFor: dialogClosed,
+      assist: { kind: 'click' },
     },
-    // 13. topbar: export
-    {
-      id: 'btn-export',
-      view: 'studio',
-      target: 'btn-export',
-      kind: 'info',
-      group: 'topbar',
-      titleKey: 'tour.export.title',
-      bodyKey: 'tour.export.body',
-    },
-    // 14. left column: rally list
+    // 13. left column: rally list
     {
       id: 'rally-panel',
       view: 'studio',
@@ -232,6 +258,26 @@ export function buildSteps(): TourStep[] {
       group: 'main',
       titleKey: 'tour.rallies.title',
       bodyKey: 'tour.rallies.body',
+    },
+    // 14b. left column: add filtered rallies to the film bar
+    {
+      id: 'rally-film-bar',
+      view: 'studio',
+      target: 'rally-film-bar',
+      kind: 'info',
+      group: 'main',
+      titleKey: 'tour.rallyFilm.title',
+      bodyKey: 'tour.rallyFilm.body',
+    },
+    // 14c. left column: filter rallies
+    {
+      id: 'rally-filter',
+      view: 'studio',
+      target: 'rally-filter',
+      kind: 'info',
+      group: 'main',
+      titleKey: 'tour.rallyFilter.title',
+      bodyKey: 'tour.rallyFilter.body',
     },
     // 15. player: try playing
     {
@@ -242,7 +288,9 @@ export function buildSteps(): TourStep[] {
       group: 'main',
       titleKey: 'tour.player.title',
       bodyKey: 'tour.player.body',
+      hintKey: 'tour.player.hint',
       waitFor: isPlaying,
+      assist: { kind: 'play' },
     },
     // 16. player: preview mode
     {
@@ -253,6 +301,16 @@ export function buildSteps(): TourStep[] {
       group: 'main',
       titleKey: 'tour.playerMode.title',
       bodyKey: 'tour.playerMode.body',
+    },
+    // 16b. player: source / filtered playback switch
+    {
+      id: 'rally-play-mode',
+      view: 'studio',
+      target: 'player-mode',
+      kind: 'info',
+      group: 'main',
+      titleKey: 'tour.rallyPlayMode.title',
+      bodyKey: 'tour.rallyPlayMode.body',
     },
     // 17. timeline: film track & toolbar
     {
@@ -274,16 +332,16 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.timelineZoom.title',
       bodyKey: 'tour.timelineZoom.body',
     },
-    // 19. inspector: switch to the clip tab
+    // 19. inspector: introduce the three tabs (rally is active by default so
+    //     the rally-tab steps that follow resolve immediately)
     {
       id: 'insp-tabs',
       view: 'studio',
       target: 'insp-tabs',
-      kind: 'interactive',
+      kind: 'info',
       group: 'inspector',
       titleKey: 'tour.insp.tabs.title',
       bodyKey: 'tour.insp.tabs.body',
-      waitFor: clipTabActive,
     },
     // 20. inspector / rally: summary
     {
@@ -315,7 +373,27 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.insp.rallyRange.title',
       bodyKey: 'tour.insp.rallyRange.body',
     },
-    // 23. inspector / clip: splitting
+    // 22b. inspector / rally: adjust start (in-point)
+    {
+      id: 'insp-rally-start',
+      view: 'studio',
+      target: 'insp-rally-start',
+      kind: 'info',
+      group: 'inspector',
+      titleKey: 'tour.rallyRangeStart.title',
+      bodyKey: 'tour.rallyRangeStart.body',
+    },
+    // 22c. inspector / rally: adjust end (out-point)
+    {
+      id: 'insp-rally-end',
+      view: 'studio',
+      target: 'insp-rally-end',
+      kind: 'info',
+      group: 'inspector',
+      titleKey: 'tour.rallyRangeEnd.title',
+      bodyKey: 'tour.rallyRangeEnd.body',
+    },
+    // 23. inspector / clip: splitting (switch to the clip tab on entry)
     {
       id: 'insp-clip-split',
       view: 'studio',
@@ -324,6 +402,7 @@ export function buildSteps(): TourStep[] {
       group: 'inspector',
       titleKey: 'tour.insp.clipSplit.title',
       bodyKey: 'tour.insp.clipSplit.body',
+      action: { click: 'insp-tabs', selector: 'button:nth-of-type(2)' },
     },
     // 24. inspector / clip: speed & volume
     {
@@ -335,7 +414,7 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.insp.clipSpeed.title',
       bodyKey: 'tour.insp.clipSpeed.body',
     },
-    // 25. inspector / info: activity chart
+    // 25. inspector / info: activity chart (switch to the info tab on entry)
     {
       id: 'insp-info-chart',
       view: 'studio',
@@ -344,6 +423,7 @@ export function buildSteps(): TourStep[] {
       group: 'inspector',
       titleKey: 'tour.insp.infoChart.title',
       bodyKey: 'tour.insp.infoChart.body',
+      action: { click: 'insp-tabs', selector: 'button:nth-of-type(3)' },
     },
     // 26. inspector / info: analysis stats (right-column summary embedded in the body)
     {
@@ -354,8 +434,20 @@ export function buildSteps(): TourStep[] {
       group: 'inspector',
       titleKey: 'tour.insp.infoStats.title',
       bodyKey: 'tour.insp.infoStats.body',
+      // ensure the info tab is active even if the user switched tabs manually
+      action: { click: 'insp-tabs', selector: 'button:nth-of-type(3)' },
     },
-    // 27. studio summary (centered card)
+    // 27. topbar: export (after the rally workflow so the film is ready)
+    {
+      id: 'btn-export',
+      view: 'studio',
+      target: 'btn-export',
+      kind: 'info',
+      group: 'topbar',
+      titleKey: 'tour.export.title',
+      bodyKey: 'tour.export.body',
+    },
+    // 28. studio summary (centered card)
     {
       id: 'summary',
       view: 'studio',
@@ -374,7 +466,27 @@ export function buildSteps(): TourStep[] {
       titleKey: 'tour.settings.title',
       bodyKey: 'tour.settings.body',
     },
-    // 29. final (centered card)
+    // 29. settings: debug log export for issue reports
+    {
+      id: 'settings-debug-logs',
+      view: 'settings',
+      target: 'settings-debug-logs',
+      kind: 'info',
+      group: 'settings',
+      titleKey: 'tour.settings.debugLogsTitle',
+      bodyKey: 'tour.settings.debugLogsBody',
+    },
+    // 30. settings: selective cache cleanup
+    {
+      id: 'settings-clear-cache',
+      view: 'settings',
+      target: 'settings-clear-cache',
+      kind: 'info',
+      group: 'settings',
+      titleKey: 'tour.settings.clearCacheTitle',
+      bodyKey: 'tour.settings.clearCacheBody',
+    },
+    // 31. final (centered card)
     {
       id: 'final',
       view: 'settings',

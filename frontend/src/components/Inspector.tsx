@@ -438,24 +438,28 @@ export default function Inspector() {
                   {tr('inspector.clipRangeHint2')}
                 </div>
                 <div className="space-y-2">
-                  <Slider
-                    label={tr('inspector.inPoint')}
-                    value={rally.clip_start}
-                    min={0}
-                    max={Math.max(0.1, rally.clip_end - 0.05)}
-                    step={0.05}
-                    onChange={(v) => patchRally(rally.id, { clip_start: Math.max(0, Math.min(v, rally.clip_end - 0.05)) })}
-                    format={(v) => timecode(v, false)}
-                  />
-                  <Slider
-                    label={tr('inspector.outPoint')}
-                    value={rally.clip_end}
-                    min={Math.max(0, rally.clip_start + 0.05)}
-                    max={(analysis?.stats?.duration as number) ?? rally.clip_end + 30}
-                    step={0.05}
-                    onChange={(v) => patchRally(rally.id, { clip_end: Math.max(v, rally.clip_start + 0.05) })}
-                    format={(v) => timecode(v, false)}
-                  />
+                  <div data-tour="insp-rally-start">
+                    <Slider
+                      label={tr('inspector.inPoint')}
+                      value={rally.clip_start}
+                      min={0}
+                      max={Math.max(0.1, rally.clip_end - 0.05)}
+                      step={0.05}
+                      onChange={(v) => patchRally(rally.id, { clip_start: Math.max(0, Math.min(v, rally.clip_end - 0.05)) })}
+                      format={(v) => timecode(v, false)}
+                    />
+                  </div>
+                  <div data-tour="insp-rally-end">
+                    <Slider
+                      label={tr('inspector.outPoint')}
+                      value={rally.clip_end}
+                      min={Math.max(0, rally.clip_start + 0.05)}
+                      max={(analysis?.stats?.duration as number) ?? rally.clip_end + 30}
+                      step={0.05}
+                      onChange={(v) => patchRally(rally.id, { clip_end: Math.max(v, rally.clip_start + 0.05) })}
+                      format={(v) => timecode(v, false)}
+                    />
+                  </div>
                   <div className="flex gap-1.5 pt-0.5">
                     {(
                       [
@@ -601,34 +605,33 @@ export default function Inspector() {
                   onChange={(v) => updateClip(clip.id, { volume: Number(v.toFixed(2)) }, false)}
                   format={(v) => `${(v * 100).toFixed(0)}%`}
                 />
-              </div>
-
-              <div>
-                <div className="mb-1.5 text-[10.5px] text-ink-500">{tr('inspector.speedPresets')}</div>
-                <div className="flex flex-wrap gap-1.5">
-                  {[
-                    [0.35, tr('inspector.speed.superSlow')],
-                    [0.5, tr('inspector.speed.slow')],
-                    [1, tr('inspector.speed.normal')],
-                    [1.5, tr('inspector.speed.fast15')],
-                    [2, tr('inspector.speed.fast2')],
-                  ].map(([s, label]) => (
-                    <button
-                      key={label as string}
-                      onClick={() => updateClip(clip.id, { speed: s as number })}
-                      className={cn(
-                        'rounded-md px-2 py-1 text-[11px] transition-colors',
-                        Math.abs(clip.speed - (s as number)) < 0.01
-                          ? 'bg-court-500/20 text-court-300'
-                          : 'bg-white/6 text-ink-300 hover:bg-white/12',
-                      )}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
-                  {tr('inspector.dragHint')}
+                <div>
+                  <div className="mb-1.5 text-[10.5px] text-ink-500">{tr('inspector.speedPresets')}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      [0.35, tr('inspector.speed.superSlow')],
+                      [0.5, tr('inspector.speed.slow')],
+                      [1, tr('inspector.speed.normal')],
+                      [1.5, tr('inspector.speed.fast15')],
+                      [2, tr('inspector.speed.fast2')],
+                    ].map(([s, label]) => (
+                      <button
+                        key={label as string}
+                        onClick={() => updateClip(clip.id, { speed: s as number })}
+                        className={cn(
+                          'rounded-md px-2 py-1 text-[11px] transition-colors',
+                          Math.abs(clip.speed - (s as number)) < 0.01
+                            ? 'bg-court-500/20 text-court-300'
+                            : 'bg-white/6 text-ink-300 hover:bg-white/12',
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-1.5 text-[10.5px] leading-relaxed text-ink-500">
+                    {tr('inspector.dragHint')}
+                  </div>
                 </div>
               </div>
             </div>
