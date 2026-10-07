@@ -77,6 +77,18 @@ FRAG: list[tuple[str, str, str]] = [
     # Cache
     ("cache.busy", "还有任务在运行，请等任务结束后再清理缓存", "Jobs are still running; wait until they finish before clearing the cache"),
     ("cache.unknown_target", "未知的缓存清理目标：{target}", "Unknown cache clear target: {target}"),
+    ("cache.no_targets", "未选择任何清理目标", "No cache targets selected"),
+    ("cache.models_confirm_required", "删除模型文件需要二次确认", "Deleting model files requires explicit confirmation"),
+    ("cache.progress_target", "正在清理{target}（{done}/{total}）", "Clearing {target} ({done}/{total})"),
+    ("cache.target.proxies", "代理视频", "Proxy videos"),
+    ("cache.target.thumbs", "缩略图", "Thumbnails"),
+    ("cache.target.audio", "提取音轨", "Extracted audio"),
+    ("cache.target.frames", "临时抽帧", "Extracted frames"),
+    ("cache.target.ai", "AI 中间结果", "AI intermediate results"),
+    ("cache.target.eval", "调参与评估产物", "Tuning & evaluation artifacts"),
+    ("cache.target.logs", "历史日志", "Historical logs"),
+    ("cache.target.webview", "内嵌浏览器缓存", "Built-in browser cache"),
+    ("cache.target.models", "模型文件", "Model files"),
 
     # Static frontend placeholder
     ("frontend.not_built", "前端尚未构建。开发时请运行 `npm run dev`（Vite，默认 http://127.0.0.1:5273）；构建请运行 `npm run build`（输出到 frontend/dist）。", "Frontend not built. For development run `npm run dev` (Vite, default http://127.0.0.1:5273); to build run `npm run build` (output to frontend/dist)."),

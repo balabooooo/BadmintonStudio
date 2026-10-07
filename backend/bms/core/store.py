@@ -142,6 +142,11 @@ def load_project(project_id: str) -> Project | None:
     for a in p.analyses.values():
         for r in a.rallies:
             r.tags = migrate_tags(r.tags)
+    logger.debug(
+        "project loaded: id={} media={} analyses={} rallies={}",
+        p.id, len(p.media), len(p.analyses),
+        sum(len(a.rallies) for a in p.analyses.values()),
+    )
     return p
 
 
@@ -178,6 +183,8 @@ def save_project(p: Project, write_analyses: bool = True) -> Project:
         payload = p.model_dump(mode="json")
         payload["analyses"] = {}          # analysis results go to the sidecar file
         _write_json(_path(p.id), payload)
+    logger.debug("project saved: id={} media={} sidecars_written={} write_analyses={}",
+                 p.id, len(p.media), len(p.analyses) if write_analyses else 0, write_analyses)
     return p
 
 
@@ -185,6 +192,8 @@ def save_analysis(project_id: str, media_id: str, res: AnalysisResult) -> None:
     ensure_dirs()
     with _lock:
         _write_json(_analysis_path(project_id, media_id), res.model_dump(mode="json"))
+    logger.debug("analysis sidecar saved: project={} media={} status={} rallies={}",
+                 project_id, media_id, res.status, len(res.rallies))
 
 
 def delete_analysis(project_id: str, media_id: str) -> None:

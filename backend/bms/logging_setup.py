@@ -6,6 +6,10 @@ entry point calls :func:`setup_logging` once, which installs:
 
 * a colorized stderr sink, for interactive / development runs;
 * a rotating file sink under ``data/logs/``, for post-mortem debugging;
+* an always-on DEBUG-level rotating file sink (``bms_debug_*.log``): the main sink honors
+  ``BMS_LOG_LEVEL`` (default INFO), but post-mortem investigations — especially playback/UI bugs
+  that reproduce only in the desktop app — need DEBUG records to exist on disk without the user
+  relaunching with a special level. Disable it with ``BMS_DEBUG_LOG=0``;
 * a stdlib ``logging`` intercept, so uvicorn / ultralytics / faster-whisper / PIL records land in the
   same sinks instead of a second, unsynchronized logging pipeline.
 
@@ -81,6 +85,17 @@ def setup_logging(level: str | None = None, *, log_dir: Path | None = None,
         encoding="utf-8", rotation="10 MB", retention="14 days", enqueue=True,
         backtrace=True, diagnose=False, catch=True,
     )
+
+    # Always-on debug trail (separate file, smaller retention): DEBUG never reaches the console at
+    # the default INFO level, yet it must be available on disk when diagnosing UI/playback bugs
+    # after the fact. BMS_DEBUG_LOG=0 turns the extra sink off.
+    if os.environ.get("BMS_DEBUG_LOG", "1") != "0":
+        logger.add(
+            str(directory / "bms_debug_{time:YYYY-MM-DD}.log"), level="DEBUG",
+            format=_FILE_FORMAT, encoding="utf-8", rotation="10 MB",
+            retention="7 days", enqueue=True, backtrace=True, diagnose=False, catch=True,
+            filter=lambda record: record["level"].no >= logging.DEBUG,
+        )
 
     # Bridge stdlib logging into loguru and replace any pre-existing handlers so records are not
     # emitted twice.

@@ -16,6 +16,8 @@ _BASE: dict[str, str] = {
     "job.title.analyze": "分析 {name}",
     "job.title.export": "导出 {name}",
     "job.title.export_n": "导出 {count} 段",
+    "job.title.optimize": "优化切分参数 {name}",
+    "job.title.cache_clear": "清理缓存",
 }
 
 MESSAGES: dict[str, str] = {**_BASE, **zh_messages()}

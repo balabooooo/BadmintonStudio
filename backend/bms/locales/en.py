@@ -16,6 +16,8 @@ _BASE: dict[str, str] = {
     "job.title.analyze": "Analyze {name}",
     "job.title.export": "Export {name}",
     "job.title.export_n": "Export {count} clips",
+    "job.title.optimize": "Optimize segmentation {name}",
+    "job.title.cache_clear": "Clear cache",
 }
 
 MESSAGES: dict[str, str] = {**_BASE, **en_messages()}

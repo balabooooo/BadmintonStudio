@@ -28,12 +28,14 @@ from .config import (
     DATA_DIR,
     EXPORT_DIR,
     FRONTEND_DIST,
+    LOGS_DIR,
     MODELS_DIR,
     PROXIES_DIR,
     PROJECTS_DIR,
     THUMBS_DIR,
     ensure_dirs,
 )
+from .core import cachemgmt as CM
 from .core import ffmpeg as ff
 from .core import media as M
 from .core import store as ST
@@ -108,6 +110,28 @@ async def _lang_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _access_log_middleware(request: Request, call_next):
+    """Debug-level access log: method/path, status and elapsed ms for every API call.
+
+    Media byte-range responses (video scrubbing) are summarized without the query string so the
+    trail stays readable. Installed outermost (last added middleware wraps first) so the timing
+    also covers the origin guard and language handling.
+    """
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed = (time.perf_counter() - started) * 1000.0
+        logger.debug("http {} {} -> raised after {:.1f}ms", request.method, request.url.path, elapsed)
+        raise
+    elapsed = (time.perf_counter() - started) * 1000.0
+    if request.url.path.startswith("/api/"):
+        logger.debug("http {} {} -> {} in {:.1f}ms",
+                     request.method, request.url.path, response.status_code, elapsed)
+    return response
+
+
 @app.exception_handler(Exception)
 async def _unhandled_error(request: Request, exc: Exception):
     """Log unhandled route errors (a 500 otherwise leaves no trace anywhere durable)."""
@@ -177,6 +201,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         return
     set_lang(parse_lang(ws.query_params.get("lang")))
     await HUB.connect(ws)
+    logger.debug("ws client connected (clients={})", len(HUB.clients))
     try:
         await ws.send_text(json.dumps({"type": "hello", "version": APP_VERSION}))
         while True:
@@ -193,6 +218,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         pass
     finally:
         HUB.disconnect(ws)
+        logger.debug("ws client disconnected (clients={})", len(HUB.clients))
 
 
 # ------------------------------------------------------------------ Basics
@@ -256,6 +282,7 @@ def env_info() -> dict:
         "models_dir": str(MODELS_DIR),
         "cache_dir": str(CACHE_DIR),
         "export_dir": str(EXPORT_DIR),
+        "logs_dir": str(LOGS_DIR),
     }
 
 
@@ -415,7 +442,23 @@ def patch_project(pid: str, payload: dict = Body(...)) -> dict:
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: str) -> dict:
     _check_id(pid, tr("api.project_id"))
-    return {"ok": ST.delete_project(pid)}
+    # Load before the soft-delete so its media can be reference-counted for orphan cleanup.
+    proj = ST.load_project(pid)
+    ok = ST.delete_project(pid)
+    purged = None
+    if ok and proj is not None and proj.media:
+        from .analysis import annotation as AN
+
+        other_media: list[MediaInfo] = []
+        for f in sorted(PROJECTS_DIR.glob("p_*.json")):
+            # Sidecars (*.analysis.json) and .deleted_* backups are not active projects.
+            if f.name.count(".") > 1 or f.stem == pid:
+                continue
+            other = ST.load_project(f.stem)
+            if other is not None:
+                other_media.extend(other.media)
+        purged = CM.purge_orphan_assets(proj.media, other_media, anno_path_fn=AN.annotation_path)
+    return {"ok": ok, "purged": purged}
 
 
 @app.post("/api/projects/{pid}/duplicate")
@@ -1060,6 +1103,19 @@ def player_probe(pid: str, payload: dict = Body(default={})) -> dict:
         raise HTTPException(500, f"{type(e).__name__}: {e}") from None
 
 
+def _guard_no_active_optimize(mid: str) -> None:
+    """Reject segmentation-mutating requests while an optimize job is running for this media.
+
+    The optimizer scores against the stored signals/params; a concurrent resegment or hit rebuild
+    would move the target under the running search and could apply stale "best" parameters.
+    """
+    for j in JOBS.active():
+        if j.kind == "optimize" and j.media_id == mid:
+            logger.debug("segmentation mutation blocked (409): optimize job {} active for mid={}",
+                         j.id, mid)
+            raise HTTPException(409, tr("annotation.optimize_guard"))
+
+
 @app.post("/api/projects/{pid}/resegment")
 def resegment(pid: str, payload: dict = Body(default={})) -> dict:
     """Quickly resegment rallies from the stored activity curve (milliseconds), for tuning segmentation parameters and scoring profiles.
@@ -1075,6 +1131,7 @@ def resegment(pid: str, payload: dict = Body(default={})) -> dict:
     res = proj.analyses.get(mid)
     if res is None or res.status != "done":
         raise HTTPException(400, tr("analysis.missing_result"))
+    _guard_no_active_optimize(mid)
 
     base = _param_with_overrides(res.params, payload.get("params"))
     weights_key = _validated_weights(payload.get("weights"), fallback=res.stats.get("weights"))
@@ -1125,6 +1182,7 @@ def rebuild_hits(pid: str, payload: dict = Body(default={})) -> dict:
     res = proj.analyses.get(mid)
     if res is None or res.status != "done":
         raise HTTPException(400, tr("analysis.missing_result"))
+    _guard_no_active_optimize(mid)
 
     base = _param_with_overrides(res.params, payload.get("params"))
 
@@ -1856,57 +1914,105 @@ def cache_stats() -> dict:
     }
 
 
+@app.get("/api/cache/targets")
+def cache_targets() -> list[dict]:
+    """Per-target occupancy scan for the selective cache-clear dialog."""
+    return CM.scan_targets()
+
+
+def _invalidate_derived_paths(field_targets: set[str]) -> int:
+    """Drop stale proxy/audio/poster paths from every project after those areas were cleared.
+
+    The fields would otherwise stay set but point at deleted files, and consumers (plus the
+    frontend "already prepared" check) treat a non-empty path as ready, handing a missing file
+    to cv2/ffmpeg. Returns how many media entries were touched.
+    """
+    invalidated = 0
+    for f in sorted(PROJECTS_DIR.glob("p_*.json")):
+        if f.name.count(".") > 1:
+            continue  # skip sidecar files
+        proj = ST.load_project(f.stem)
+        if proj is None:
+            continue
+        touched = [m for m in proj.media if ST.clear_derived_paths(m, field_targets)]
+        if not touched:
+            continue
+        ST.save_project(proj, write_analyses=False)
+        invalidated += len(touched)
+        for m in touched:
+            HUB.publish({"type": "media", "project_id": proj.id,
+                         "media": m.model_dump(mode="json")})
+    return invalidated
+
+
 @app.post("/api/cache/clear")
 def cache_clear(payload: dict = Body(default={})) -> dict:
     import shutil as _sh
 
-    #: Clearable cache areas. ``all`` is the default; anything else must be one of these.
-    targets = {
-        "proxies": {"proxies": PROXIES_DIR},
-        "thumbs": {"thumbs": THUMBS_DIR},
-        "audio": {"audio": CACHE_DIR / "audio"},
-        "frames": {"frames": CACHE_DIR / "frames"},
-    }
-    target = str(payload.get("target") or "all")
-    if target == "all":
-        dirs = {k: v for group in targets.values() for k, v in group.items()}
-    elif target in targets:
-        dirs = targets[target]
-    else:
-        raise HTTPException(400, tr("cache.unknown_target", target=target))
-    # Clearing the cache rmtrees proxies/audio being read/written by running jobs, causing mid-job
-    # failures. Check *all* jobs (an earlier truncated 200-item list could miss the active one).
+    # Legacy single-target payload {"target": "all|proxies|thumbs|audio|frames"} stays synchronous
+    # for scripts/external callers; the settings dialog sends {"targets": [...], "confirm": {...}}
+    # and gets a background job with progress.
+    if "targets" not in payload:
+        #: Clearable cache areas. ``all`` is the default; anything else must be one of these.
+        targets = {
+            "proxies": {"proxies": PROXIES_DIR},
+            "thumbs": {"thumbs": THUMBS_DIR},
+            "audio": {"audio": CACHE_DIR / "audio"},
+            "frames": {"frames": CACHE_DIR / "frames"},
+        }
+        target = str(payload.get("target") or "all")
+        if target == "all":
+            dirs = {k: v for group in targets.values() for k, v in group.items()}
+        elif target in targets:
+            dirs = targets[target]
+        else:
+            raise HTTPException(400, tr("cache.unknown_target", target=target))
+        # Clearing the cache rmtrees proxies/audio being read/written by running jobs, causing mid-job
+        # failures. Check *all* jobs (an earlier truncated 200-item list could miss the active one).
+        if JOBS.active():
+            raise HTTPException(409, tr("cache.busy"))
+        freed = 0
+        for d in dirs.values():
+            if d.exists():
+                freed += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                _sh.rmtree(d, ignore_errors=True)
+                d.mkdir(parents=True, exist_ok=True)
+        invalidated = _invalidate_derived_paths({k for k in dirs if k in ("proxies", "thumbs", "audio")})
+        logger.info("cache cleared: target={} freed={}B invalidated_media={}", target, freed, invalidated)
+        return {"freed": freed}
+
+    # --------------------------------------------------------- selective, job-backed cleanup
+    raw_ids = payload.get("targets")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, tr("cache.no_targets"))
+    ids = [str(x) for x in raw_ids]
+    unknown = next((i for i in ids if i not in CM.TARGET_IDS), None)
+    if unknown:
+        raise HTTPException(400, tr("cache.unknown_target", target=unknown))
+    confirms = payload.get("confirm") if isinstance(payload.get("confirm"), dict) else {}
+    # Danger targets require an explicit, per-target confirmation flag (defense in depth: the UI
+    # confirms, the API enforces).
+    if "models" in ids and not bool(confirms.get("models")):
+        raise HTTPException(400, tr("cache.models_confirm_required"))
     if JOBS.active():
         raise HTTPException(409, tr("cache.busy"))
-    freed = 0
-    for d in dirs.values():
-        if d.exists():
-            freed += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
-            _sh.rmtree(d, ignore_errors=True)
-            d.mkdir(parents=True, exist_ok=True)
-    # Drop the now-dead derived paths from every project. The fields stay set but point at deleted
-    # files, and consumers (plus the frontend "already prepared" check) treat a non-empty path as
-    # ready, then hand a missing file to cv2/ffmpeg. Clearing them makes the fallback-to-source and
-    # regeneration paths kick in.
-    field_targets = {k for k in dirs if k in ("proxies", "thumbs", "audio")}
-    invalidated = 0
-    if field_targets:
-        for f in sorted(PROJECTS_DIR.glob("p_*.json")):
-            if f.name.count(".") > 1:
-                continue  # skip sidecar files
-            proj = ST.load_project(f.stem)
-            if proj is None:
-                continue
-            touched = [m for m in proj.media if ST.clear_derived_paths(m, field_targets)]
-            if not touched:
-                continue
-            ST.save_project(proj, write_analyses=False)
-            invalidated += len(touched)
-            for m in touched:
-                HUB.publish({"type": "media", "project_id": proj.id,
-                             "media": m.model_dump(mode="json")})
-    logger.info("cache cleared: target={} freed={}B invalidated_media={}", target, freed, invalidated)
-    return {"freed": freed}
+    selected = set(ids)
+
+    def work(job) -> dict:
+        def on_progress(done: int, total: int, tid: str) -> None:
+            job.progress(done / total if total else 1.0, "cache_clear",
+                         tr("cache.progress_target", target=tr(f"cache.target.{tid}"),
+                            done=done, total=total))
+
+        res = CM.clear_targets(ids, confirms=confirms,
+                               on_progress=on_progress, is_cancelled=job.cancelled)
+        if selected & {"proxies", "thumbs", "audio"}:
+            res["invalidated_media"] = _invalidate_derived_paths(
+                selected & {"proxies", "thumbs", "audio"})
+        return res
+
+    job = JOBS.submit("cache_clear", tr("job.title.cache_clear"), work, lang=get_lang())
+    return {"job_id": job.id}
 
 
 @app.post("/api/samples/seed")
