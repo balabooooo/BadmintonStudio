@@ -70,3 +70,73 @@ describe('visibleBoxes / visibleDets (detection threshold filters)', () => {
     expect(visibleDets({ t: 0, boxes: [], skeletons: [] }, 0.1)).toEqual([])
   })
 })
+
+describe('selectFrame binary search parity with the old linear scan', () => {
+  /** Reference implementation (pre-performance-fix linear scan, first-min tie kept). */
+  function linearNearest(frames: OverlayFrame[], t: number): number {
+    let best = 0
+    let bestDt = Infinity
+    frames.forEach((f, i) => {
+      const dt = Math.abs(f.t - t)
+      if (dt < bestDt) {
+        bestDt = dt
+        best = i
+      }
+    })
+    return best
+  }
+
+  function makeFrames(ts: number[]): OverlayFrame[] {
+    return ts.map((tv) => ({ t: tv, boxes: [], skeletons: [] }))
+  }
+
+  it('picks the same frame on dense ascending 12fps-like grids for boundaries and ties', () => {
+    const grid = Array.from({ length: 200 }, (_, i) => Math.round(i / 12 * 1000) / 1000)
+    const frames = makeFrames(grid)
+    const probes = [0, 0.04, 0.5, 0.5 / 12, grid[grid.length - 1], grid[grid.length - 1] + 5]
+    for (const q of probes) {
+      const li = frames[linearNearest(frames, q)]
+      if (Math.abs(li.t - q) <= strictGap(fps)) {
+        expect(selectFrame(frames, q, fps)).toBe(li)
+      } else {
+        expect(selectFrame(frames, q, fps)).toBeNull()
+      }
+      const tol = selectFrameTolerant(frames, q, fps, 0.35)
+      const linAge = Math.abs(li.t - q)
+      if (linAge <= Math.max(strictGap(fps), 0.35)) {
+        expect(tol?.frame).toBe(li)
+        expect(tol?.age).toBeCloseTo(linAge, 8)
+      } else {
+        expect(tol).toBeNull()
+      }
+    }
+  })
+
+  it('matches linear scan on randomized ascending arrays (incl. wide gaps)', () => {
+    let seed = 1234567
+    const rand = () => {
+      // Deterministic LCG so the property check is reproducible.
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff
+      return seed / 0x7fffffff
+    }
+    for (let trial = 0; trial < 40; trial++) {
+      const ts: number[] = []
+      let t = 0
+      const count = 1 + Math.floor(rand() * 120)
+      for (let i = 0; i < count; i++) {
+        // Strictly ascending: backend frames are keyed by unique frame index; add gaps to
+        // emulate missing frames as well.
+        t += 0.001 + rand() * 0.4
+        ts.push(Number(t.toFixed(3)))
+      }
+      const frames = makeFrames(ts)
+      for (let k = 0; k < 10; k++) {
+        const q = rand() * (t + 1) - 0.5
+        const got = selectFrame(frames, q, fps)
+        const want = frames[linearNearest(frames, q)]
+        if (Math.abs(want.t - q) <= strictGap(fps)) expect(got).toBe(want)
+        else expect(got).toBeNull()
+      }
+    }
+  })
+})

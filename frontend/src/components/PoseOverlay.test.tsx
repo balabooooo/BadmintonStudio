@@ -22,12 +22,16 @@ const mockedOverlay = vi.mocked(api.getAnnotationOverlay)
 
 /** Minimal stand-in for the annotated page's <video>: only the fields the overlay reads. */
 function fakeVideo(currentTime = 0): HTMLVideoElement {
+  const target = new EventTarget()
   return {
     currentTime,
     videoWidth: 960,
     videoHeight: 540,
     clientWidth: 960,
     clientHeight: 540,
+    addEventListener: target.addEventListener.bind(target),
+    removeEventListener: target.removeEventListener.bind(target),
+    dispatchEvent: target.dispatchEvent.bind(target),
   } as unknown as HTMLVideoElement
 }
 
@@ -184,6 +188,68 @@ describe('PoseOverlay component', () => {
     expect(mockedOverlay.mock.calls[1][2]).toBeCloseTo(20 - WINDOW_LEAD, 6)
   })
 
+  /* --------------------------------------------------------------- 回归：拖动卡顿
+   * 旧实现在进度条拖动时每个 250ms 轮询都 abort 上一个请求再发新请求（拖动一秒 4 次
+   * 重 npz 解析 + 4 次 abort），UI 长时间卡死。现在 seeking 期间轮询挂起，seeked 时
+   * 合并成一次取数。 */
+  it('coalesces a scrub drag (repeated seeking) into one fetch on seeked', async () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    vi.useFakeTimers()
+    mockedOverlay.mockResolvedValue(okResponse) // window [0, 8]
+    const video = fakeVideo(0)
+    renderOverlay(video)
+    fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(mockedOverlay).toHaveBeenCalledTimes(1)
+
+    // User drags the progress bar: 'seeking' fires repeatedly at new positions.
+    for (const t of [5, 12, 24, 30]) {
+      video.currentTime = t
+      video.dispatchEvent(new window.Event('seeking'))
+    }
+    // Two poll ticks pass DURING the drag: they must not fetch (old code fired 2 requests here).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+    })
+    expect(mockedOverlay).toHaveBeenCalledTimes(1)
+
+    // Drag ends -> exactly one fetch, centered on the FINAL playhead position.
+    video.dispatchEvent(new window.Event('seeked'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(mockedOverlay).toHaveBeenCalledTimes(2)
+    expect(mockedOverlay.mock.calls[1][2]).toBeCloseTo(30 - WINDOW_LEAD, 6)
+  })
+
+  it('releases the seek lock via the stall timer when seeked never arrives', async () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    vi.useFakeTimers()
+    mockedOverlay.mockResolvedValue(okResponse) // window [0, 8]
+    const video = fakeVideo(0)
+    renderOverlay(video)
+    fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    video.currentTime = 40
+    video.dispatchEvent(new window.Event('seeking'))
+    // Polls while seeking: suppressed.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750)
+    })
+    expect(mockedOverlay).toHaveBeenCalledTimes(1)
+    // After the 1s stall safety net, the next poll resumes fetching (150ms out-of-window throttle).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350) // 750 -> 1100ms: stall fires at 1000ms, one poll catches it
+    })
+    expect(mockedOverlay).toHaveBeenCalledTimes(2)
+    expect(mockedOverlay.mock.calls[1][2]).toBeCloseTo(40 - WINDOW_LEAD, 6)
+  })
+
   it('surfaces a retry hint after two consecutive fetch failures and clears it on success', async () => {
     act(() => useStore.setState({ lang: 'en' }))
     vi.useFakeTimers()
@@ -211,5 +277,64 @@ describe('PoseOverlay component', () => {
     })
     expect(mockedOverlay).toHaveBeenCalledTimes(3)
     expect(screen.queryByText(/retrying/i)).toBeNull()
+  })
+
+  it('draws v3 interpolated boxes dimmed (alpha 0.55) and observed boxes opaque', async () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    // jsdom has no canvas 2d backend; record globalAlpha at every strokeRect to verify dimming.
+    const alphas: number[] = []
+    const ctx2d = {
+      globalAlpha: 1,
+      clearRect: vi.fn(),
+      strokeRect: vi.fn(() => {
+        alphas.push(ctx2d.globalAlpha)
+      }),
+      fillRect: vi.fn(),
+      fillText: vi.fn(),
+      measureText: vi.fn(() => ({ width: 10 })),
+      setLineDash: vi.fn(),
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      arc: vi.fn(),
+    }
+    const getCtxSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(ctx2d as unknown as CanvasRenderingContext2D)
+    let rafCb: FrameRequestCallback | null = null
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCb = cb
+      return 1
+    })
+    const cancelSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+
+    const res: OverlayResponse = {
+      ...okResponse,
+      skeletons_available: false,
+      frames: [
+        {
+          t: 0,
+          boxes: [
+            { track: 1, xyxy: [0.1, 0.2, 0.3, 0.9], conf: 0.9 },
+            { track: 2, xyxy: [0.5, 0.2, 0.7, 0.9], conf: 0.9, interp: true },
+          ],
+          skeletons: [],
+        },
+      ],
+    }
+    mockedOverlay.mockResolvedValue(res)
+    renderOverlay()
+    fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
+    await waitFor(() => expect(mockedOverlay).toHaveBeenCalledTimes(1))
+    // Run one draw tick at the sampled position t=0.
+    act(() => rafCb?.(0))
+    expect(alphas).toContain(1)
+    expect(alphas).toContain(0.55)
+    getCtxSpy.mockRestore()
+    rafSpy.mockRestore()
+    cancelSpy.mockRestore()
   })
 })

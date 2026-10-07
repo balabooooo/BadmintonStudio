@@ -29,6 +29,7 @@ import {
   X,
 } from 'lucide-react'
 import { api } from '../lib/api'
+import { createLogger } from '../lib/logger'
 import { cn, clamp } from '../lib/format'
 import { itemCounts, snapPatch, visibleWarnings, warningKey } from '../lib/annotationQuality'
 import { Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
@@ -38,26 +39,17 @@ import OptimizePanel from './OptimizePanel'
 import PoseOverlay from './PoseOverlay'
 import SignalTracks from './SignalTracks'
 import { useStore } from '../store/useStore'
+import { useAnnotationDraft, type DraftHit as AnnHit, type DraftRally as AnnRally } from '../store/annotationDraft'
 import { useT } from '../i18n/useT'
 import type {
   AnalysisParams,
   AnnotationDraft,
-  AnnotationRally,
-  OptimizeResult,
   QualityItem,
   QualityReport,
   QualityWarning,
 } from '../lib/types'
 
-interface AnnRally extends AnnotationRally {
-  id: number
-}
-
-interface AnnHit {
-  t: number
-  ours: boolean
-  id: number
-}
+const annLog = createLogger('annotate')
 
 const fmt = (t: number) => {
   t = Math.max(0, t || 0)
@@ -96,18 +88,32 @@ export default function AnnotatePage() {
   const detailRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
-  // ---------- 数据
-  const [duration, setDuration] = useState(media?.duration ?? 0)
-  const [fps, setFps] = useState(media?.fps ?? 0)
-  const [auto, setAuto] = useState<AnnotationDraft[]>([])
-  const [ann, setAnn] = useState<AnnRally[]>([])
-  const [hits, setHits] = useState<AnnHit[]>([])
-  const [rawHitTimes, setRawHitTimes] = useState<number[]>([])
-  const [focus, setFocus] = useState<[number, number]>([0, 0])
-  const [note, setNote] = useState('')
-  const [loaded, setLoaded] = useState(false)
-  const [dirty, setDirty] = useState(false)
-  const [saveState, setSaveState] = useState('—')
+  // ---------- 数据：per-media 草稿保存在全局 draft store，切页（组件卸载）再回来即时 hydrate
+  const draft = useAnnotationDraft(pid || null, mid || null, {
+    duration: media?.duration,
+    fps: media?.fps,
+  })
+  const {
+    loaded,
+    duration,
+    fps,
+    auto,
+    rallies: ann,
+    hits,
+    rawHitTimes,
+    focus,
+    note,
+    dirty,
+    saveState,
+    nextId,
+    setRallies: setAnn,
+    setHits,
+    setFocus,
+    setDuration,
+    markDirty,
+    save: doSave,
+    reload,
+  } = draft
   const [videoError, setVideoError] = useState(false)
   const [tab, setTab] = useState<'auto' | 'ann'>('auto')
 
@@ -125,14 +131,24 @@ export default function AnnotatePage() {
   const [pending, setPending] = useState<{ start: number } | null>(null)
   const undoRef = useRef<{ rallies: Omit<AnnRally, 'id'>[]; hits: { t: number; ours: boolean }[] }[]>([])
 
-  // ---------- 优化（per-clip：结果按 mediaId 保存，面板永远只显示当前 clip 的结果；
-  // 切换素材不会把旧 clip 的标定误用到新 clip，切回来结果也还在）
-  const [optByMid, setOptByMid] = useState<Record<string, OptimizeResult>>({})
-  const [optimizingMid, setOptimizingMid] = useState<string | null>(null)
+  // ---------- 优化结果由全局 store 按 mediaId 维护（任务化；切页/切素材不丢）
+  const optimizeResults = useStore((s) => s.optimizeResults)
+  const mediaIsOptimizing = useStore((s) => s.mediaIsOptimizing)
   const [showTracks, setShowTracks] = useState(false)
-  /** 当前素材的优化结果 / 是否正在优化（面板与回调全部经由这两个派生值，天然 per-clip） */
-  const opt = mid ? optByMid[mid] ?? null : null
-  const optimizing = !!mid && optimizingMid === mid
+  /** 当前素材的优化结果（store 在 optimize 任务 done 时写入） */
+  const opt = mid ? optimizeResults[mid] ?? null : null
+  const optimizing = mediaIsOptimizing(mid)
+  /** 当前素材的活跃 optimize 任务（进度/阶段/取消用） */
+  const optimizeJob = useStore((s) => {
+    if (!s.mediaId) return null
+    for (const j of Object.values(s.jobs)) {
+      if (j.kind === 'optimize' && j.media_id === s.mediaId
+        && (j.status === 'queued' || j.status === 'running')) {
+        return j
+      }
+    }
+    return null
+  })
 
   // ---------- 标注质量审计（P2-d：只建议，不自动改写）
   const [quality, setQuality] = useState<QualityReport | null>(null)
@@ -146,11 +162,6 @@ export default function AnnotatePage() {
   const [presetNote, setPresetNote] = useState('')
   const [presetSaving, setPresetSaving] = useState(false)
 
-  const idSeq = useRef(1)
-  const nextId = () => idSeq.current++
-  const saveTimer = useRef<number | null>(null)
-  // 每次编辑自增；保存返回时用它判断「保存期间是否又有新改动」，避免把 dirty 误清。
-  const editSeq = useRef(0)
   const dragging = useRef<null | {
     id: number
     edge: 'start' | 'end' | 'move'
@@ -169,10 +180,6 @@ export default function AnnotatePage() {
   useEffect(() => {
     stateRef.current = { ann, auto, hits, sel, pending, duration, viewSpan, viewCenter, focus, tab, loop, note, dirty }
   })
-  // The media id whose data stateRef currently holds. Null while a reload is in
-  // flight: flushing during that window would write the previous media's draft
-  // against a media that has not loaded yet (rapid A -> B -> C switches).
-  const loadedMidRef = useRef<string | null>(null)
 
   /* ------------------------------------------------- 标注质量审计（P2-d） */
   const loadQuality = useCallback(async (silent = false) => {
@@ -188,124 +195,32 @@ export default function AnnotatePage() {
     }
   }, [pid, mid, toast, tr])
 
-  /* ---------------------------------------------------------------- 加载 */
-  const reload = useCallback(async () => {
-    if (!pid || !mid) return
-    // Snapshot is not trustworthy until the GET below resolves.
-    loadedMidRef.current = null
-    try {
-      const info = await api.getAnnotation(pid, mid)
-      setDuration(info.duration || media?.duration || 0)
-      setFps(info.fps || media?.fps || 0)
-      setAuto(info.auto || [])
-      setAnn((info.rallies || []).map((r) => ({ ...r, id: nextId() })))
-      const infoHits = info.hits || []
-      const raw = (info.hit_times_raw && info.hit_times_raw.length
-        ? info.hit_times_raw
-        : (info.hit_times || []))
-      setRawHitTimes(raw)
-      setHits(
-        infoHits.length
-          ? infoHits.map((h) => ({ t: h.t, ours: h.ours, id: nextId() }))
-          : raw.map((t) => ({ t, ours: true, id: nextId() })),
-      )
-      setNote(info.note || '')
-      const f = info.focus && info.focus[1] ? (info.focus as [number, number]) : [0, info.duration || 0]
-      setFocus(f as [number, number])
-      setViewSpan(Math.max(10, Math.min(60, info.duration || 30)))
-      setViewCenter(f[0])
-      setSel(null)
-      setLoaded(true)
-      setVideoError(false)
-      setDirty(false)
-      setSaveState(info.rallies?.length ? tr('annotate.loadedRallies', { n: info.rallies.length }) : tr('annotate.newAnnotation'))
-      undoRef.current = []
-      loadedMidRef.current = mid
-      setQuality(null)
-      setQOpenIdx(null)
-      setDismissed(new Set())
-      void loadQuality(true)
-    } catch (e) {
-      toast({ kind: 'error', title: tr('annotate.loadFailed'), detail: String(e) })
-    }
-  }, [pid, mid, media?.duration, media?.fps, toast, tr, loadQuality])
-
+  // Server data landed for this media (first GET / forced reload / clean-draft background
+  // refresh): reset viewport, selection and undo history the same way the old in-page reload
+  // did, then refresh the auxiliary quality audit. draft.rev identifies each landing.
+  const draftRev = draft.rev
   useEffect(() => {
-    void reload()
-  }, [reload])
+    if (!loaded) return
+    setVideoError(false)
+    setSel(null)
+    undoRef.current = []
+    setViewSpan(Math.max(10, Math.min(60, duration || 30)))
+    setViewCenter(focus[0])
+    setQuality(null)
+    setQOpenIdx(null)
+    setDismissed(new Set())
+    void loadQuality(true)
+    annLog.debug('server data applied; view reset', { mid, rev: draftRev })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftRev, mid])
 
-  /* ---------------------------------------------------------------- 保存 */
-  const doSave = useCallback(async () => {
-    if (!pid || !mid) return
-    const seq = editSeq.current
-    try {
-      const res = await api.saveAnnotation(pid, mid, {
-        rallies: stateRef.current.ann.map(({ start, end, source, note: n }) => ({
-          start, end, source, note: n,
-        })),
-        hits: stateRef.current.hits.map(({ t, ours }) => ({ t, ours })),
-        focus,
-        note,
-      })
-      // 保存期间又编辑过就不要清 dirty：否则编辑会被这次「旧」保存的返回误标成已保存。
-      if (seq === editSeq.current) setDirty(false)
-      setSaveState(tr('annotate.savedCount', { n: res.count }))
-      // Labels moved: refresh the quality audit so snap suggestions stay in sync.
-      if (quality) void loadQuality(true)
-    } catch (e) {
-      setSaveState(tr('annotate.saveFailed'))
-      toast({ kind: 'error', title: tr('annotate.saveFailed'), detail: String(e) })
-    }
-  }, [pid, mid, focus, note, toast, tr, quality, loadQuality])
-
-  const markDirty = useCallback(() => {
-    editSeq.current += 1
-    setDirty(true)
-    setSaveState(tr('annotate.unsaved'))
-    if (saveTimer.current) window.clearTimeout(saveTimer.current)
-    saveTimer.current = window.setTimeout(() => void doSave(), 1200)
-  }, [doSave, tr])
-
-  // 卸载时清掉待触发的自动保存，避免离开页面后回调里再去 setState。
-  useEffect(
-    () => () => {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current)
-    },
-    [],
-  )
-
-  // Switching media from the global picker must flush the OLD media's draft
-  // immediately (no debounce, no confirm). The listener runs synchronously
-  // inside the store update, before React re-renders this page, so stateRef
-  // still holds the outgoing media's data. Switching projects must not save
-  // A's annotation into B (project id guard), and a clean draft is skipped.
+  // Labels changed on the server (autosave landed): refresh the audit so snap suggestions
+  // track the new rallies.
+  const statusCodeRef = useRef(draft.statusCode)
   useEffect(() => {
-    const unsub = useStore.subscribe((next, prev) => {
-      if (next.project?.id !== prev.project?.id) return
-      if (next.mediaId === prev.mediaId || !prev.project || !prev.mediaId) return
-      // Deleting the current media also changes mediaId; never save a draft
-      // against the removed id.
-      if (!prev.project.media.some((m) => m.id === prev.mediaId)) return
-      // stateRef must hold this exact media's loaded data. During a reload the
-      // snapshot still belongs to the previous media (A -> B -> C guard).
-      if (loadedMidRef.current !== prev.mediaId) return
-      const snap = stateRef.current
-      if (!snap.dirty) return
-      if (saveTimer.current) {
-        window.clearTimeout(saveTimer.current)
-        saveTimer.current = null
-      }
-      void api
-        .saveAnnotation(prev.project.id, prev.mediaId, {
-          rallies: snap.ann.map(({ start, end, source, note: n }) => ({ start, end, source, note: n })),
-          hits: snap.hits.map(({ t, ours }) => ({ t, ours })),
-          focus: snap.focus,
-          note: snap.note,
-        })
-        .catch(() => undefined)
-    })
-    return unsub
-  }, [])
+    if (draft.statusCode === 'saved' && statusCodeRef.current !== 'saved') void loadQuality(true)
+    statusCodeRef.current = draft.statusCode
+  }, [draft.statusCode, loadQuality])
 
   const pushUndo = useCallback(() => {
     undoRef.current.push({
@@ -863,31 +778,31 @@ export default function AnnotatePage() {
   /* ---------------------------------------------------------------- 优化 */
   const runOptimize = useCallback(async () => {
     if (!pid || !mid) return
+    if (mediaIsOptimizing(mid)) return
     if (!stateRef.current.ann.length) {
       toast({ kind: 'warn', title: tr('annotate.needAnnotations') })
       return
     }
-    setOptimizingMid(mid)
     try {
-      // 先把当前标注落盘，优化读的是磁盘上的标注
+      // Persist current labels first — the optimizer reads the annotation file on disk.
       await doSave()
-      const res = await api.optimizeSegmentation(pid, mid, { params })
-      // 写回发起时那个 clip 的槽位：即使优化期间已切走素材，结果也归属原 clip
-      setOptByMid((prev) => ({ ...prev, [mid]: res }))
-      if (!res.best) toast({ kind: 'warn', title: tr('annotate.noUsableParams') })
-      else
-        toast({
-          kind: 'success',
-          title: tr('annotate.bestF1', { f1: res.best.f1.toFixed(3), baseline: res.baseline.f1.toFixed(3) }),
-          detail: tr('annotate.triedDetail', { n: res.tried }),
-        })
+      const { job_id } = await api.optimizeSegmentation(pid, mid, { params })
+      // The report arrives through the WS job "done" event (store.optimizeResults).
+      annLog.debug('optimize submitted', { job: job_id, mid })
+      toast({ kind: 'info', title: tr('annotate.optimizeStarted') })
     } catch (e) {
       toast({ kind: 'error', title: tr('annotate.optimizeFailed'), detail: String((e as Error)?.message || e) })
-    } finally {
-      // 只清自己的 loading：期间若已在别的 clip 上发起新优化，不要误关它的按钮
-      setOptimizingMid((cur) => (cur === mid ? null : cur))
     }
-  }, [doSave, mid, pid, params, toast, tr])
+  }, [doSave, mediaIsOptimizing, mid, params, pid, toast, tr])
+
+  const cancelOptimize = useCallback(async () => {
+    if (!optimizeJob) return
+    try {
+      await api.cancelJob(optimizeJob.id)
+    } catch (e) {
+      toast({ kind: 'warn', title: tr('annotate.optimizeCancelFailed'), detail: String(e) })
+    }
+  }, [optimizeJob, toast, tr])
 
   // 只要改动了 hit_sensitivity，就必须重跑音频检测（重建击球序列）；否则 resegment 只会
   // 复用按旧灵敏度检测的原始击球，标注标定出的灵敏度等于没生效。
@@ -1525,9 +1440,12 @@ export default function AnnotatePage() {
           <OptimizePanel
             opt={opt}
             optimizing={optimizing}
+            progress={optimizeJob?.progress ?? 0}
+            stage={optimizeJob?.stage ?? ''}
             canOptimize={canOptimize}
             matchFormat={matchFormatCode}
             onRun={() => void runOptimize()}
+            onCancel={() => void cancelOptimize()}
             onApplyBest={() => void applyBest()}
             onApplyParam={(patch) => void applyParam(patch)}
             onOpenPreset={openPresetDialog}

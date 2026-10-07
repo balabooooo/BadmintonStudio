@@ -16,6 +16,7 @@ vi.mock('../lib/api', () => ({
     getAnnotation: vi.fn(),
     saveAnnotation: vi.fn(),
     optimizeSegmentation: vi.fn(),
+    cancelJob: vi.fn(),
     getAnnotationQuality: vi.fn(),
     getAnnotationSignals: vi.fn().mockResolvedValue({}),
     getAnnotationOverlay: vi.fn().mockResolvedValue({ frames: [] }),
@@ -125,11 +126,13 @@ describe('AnnotatePage optimize panel is bound to the active clip', () => {
       ),
     )
     mockedSave.mockResolvedValue({ ok: true, count: 0, path: 'x', updated_at: '' })
-    mockedOptimize.mockResolvedValue(optimizeResult(0.62))
+    // Optimize is now a background job: the endpoint returns a job id and the report arrives
+    // later via a WS "job done" event (parked in store.optimizeResults by mediaId).
+    mockedOptimize.mockResolvedValue({ job_id: 'job_opt_1' })
   })
 
   afterEach(() => {
-    useStore.setState({ project: null, mediaId: null, lang: 'zh' })
+    useStore.setState({ project: null, mediaId: null, lang: 'zh', optimizeResults: {}, jobs: {} })
   })
 
   it('shows this clip result after optimizing, hides it when switching clips, restores it when switching back', async () => {
@@ -140,8 +143,11 @@ describe('AnnotatePage optimize panel is bound to the active clip', () => {
     await waitFor(() => expect(optimizeBtn).not.toBeDisabled())
 
     fireEvent.click(optimizeBtn)
-    // runOptimize saves first, then posts the optimize request for THIS clip
+    // runOptimize saves first, then submits the optimize job for THIS clip
     await waitFor(() => expect(mockedOptimize).toHaveBeenCalledWith('p1', 'm_a', expect.anything()))
+
+    // Simulate the WS "job done" event landing the report in the store.
+    useStore.setState({ optimizeResults: { m_a: optimizeResult(0.62) } })
     expect((await screen.findAllByText('F1 0.620')).length).toBeGreaterThanOrEqual(1)
 
     // switch to clip B: the panel must show the empty state, not clip A's stale numbers

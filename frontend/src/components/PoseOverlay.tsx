@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Eye, EyeOff, Box, Bone, Ruler, ScanSearch } from 'lucide-react'
 import { api } from '../lib/api'
+import { createLogger } from '../lib/logger'
 import type { OverlayResponse } from '../lib/types'
 import { useT } from '../i18n/useT'
 import { cn } from '../lib/format'
@@ -34,7 +35,16 @@ import {
   visibleDets,
 } from '../lib/overlay'
 
+const overlayLog = createLogger('overlay')
+
 const PLAYHEAD_POLL_MS = 250
+/**
+ * Minimum gap between two window fetches once the playhead is already OUTSIDE the loaded
+ * window. The old code fetched immediately in that case, so dragging the progress bar fired a
+ * (heavy) request per 250 ms poll and aborted the previous one every time. 150 ms still feels
+ * instant on click-seek but collapses scrub drags into a handful of requests.
+ */
+const OUT_WINDOW_MIN_INTERVAL_MS = 150
 const DEFAULT_CONF = 0.35
 const DEFAULT_DET_THR = 0.15
 const DET_THR_MIN = 0.1
@@ -75,6 +85,10 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
   const dataRef = useRef<OverlayResponse | null>(null)
   const lastFetchAtRef = useRef(0)
   const failCountRef = useRef(0)
+  /** True while the browser is resolving a seek (scrub drag fires 'seeking' repeatedly). */
+  const seekingRef = useRef(false)
+  /** Safety net: if a 'seeked' event is ever missed, release the seek lock after 1s. */
+  const seekStallTimerRef = useRef<number | null>(null)
   const confRef = useRef(confThr)
   const layersRef = useRef({ showBoxes, showSkeleton, showSize, showDets, detThr, lostTol })
   dataRef.current = data
@@ -85,10 +99,12 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
     async (center: number) => {
       const t0 = Math.max(0, center - WINDOW_LEAD)
       const t1 = t0 + MAX_WINDOW
-      lastFetchAtRef.current = Date.now()
+      const now = Date.now()
+      lastFetchAtRef.current = now
       abortRef.current?.abort()
       const ctrl = new AbortController()
       abortRef.current = ctrl
+      overlayLog.debug('overlay fetch window', { mid, center: Number(center.toFixed(2)), t0: Number(t0.toFixed(2)), t1: Number(t1.toFixed(2)) })
       try {
         const res = await api.getAnnotationOverlay(pid, mid, t0, t1, ctrl.signal)
         if (ctrl.signal.aborted) return
@@ -97,16 +113,23 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
         dataRef.current = res
         setData(res)
         setUnavailable(!res.boxes_available && !res.skeletons_available)
+        overlayLog.debug('overlay window applied', { mid, frames: res.frames.length })
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') return
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          overlayLog.debug('overlay fetch aborted (superseded)', { mid })
+          return
+        }
         // 4xx/网络错误：安静降级（图层还在，只是没数据），轮询会持续重试；
         // 连续失败才提示用户，成功一次即清除。
         failCountRef.current += 1
+        overlayLog.warn('overlay fetch failed', { mid, fail: failCountRef.current, err: String(err) })
         if (failCountRef.current >= FETCH_FAIL_HINT_AFTER) setFetchFailed(true)
       }
     },
     [pid, mid],
   )
+  const fetchWindowRef = useRef(fetchWindow)
+  fetchWindowRef.current = fetchWindow
 
   /* 开关 / 切素材：立即取一次；关闭时取消在途请求并清空 */
   useEffect(() => {
@@ -120,9 +143,51 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, pid, mid, fetchWindow])
 
+  /* Seek coalescing: while the user drags the progress bar the video fires 'seeking' many
+     times — ignore the 250 ms poll during that burst and fetch exactly once on 'seeked', so a
+     whole drag costs one request instead of one per poll tick. */
+  useEffect(() => {
+    if (!enabled) return
+    const v = videoRef.current
+    if (!v) return
+    const clearStall = () => {
+      if (seekStallTimerRef.current !== null) {
+        window.clearTimeout(seekStallTimerRef.current)
+        seekStallTimerRef.current = null
+      }
+    }
+    const onSeeking = () => {
+      if (!seekingRef.current) {
+        overlayLog.debug('overlay seek start', { mid, t: Number(v.currentTime.toFixed(2)) })
+        // Auto-release if this seek never gets a matching 'seeked' (browser quirks / src swap).
+        clearStall()
+        seekStallTimerRef.current = window.setTimeout(() => {
+          seekingRef.current = false
+          seekStallTimerRef.current = null
+          overlayLog.debug('overlay seek stall timer released', { mid })
+        }, 1000)
+      }
+      seekingRef.current = true
+    }
+    const onSeeked = () => {
+      clearStall()
+      seekingRef.current = false
+      overlayLog.debug('overlay seeked -> fetch', { mid, t: Number(v.currentTime.toFixed(2)) })
+      void fetchWindowRef.current(v.currentTime)
+    }
+    v.addEventListener('seeking', onSeeking)
+    v.addEventListener('seeked', onSeeked)
+    return () => {
+      clearStall()
+      v.removeEventListener('seeking', onSeeking)
+      v.removeEventListener('seeked', onSeeked)
+    }
+  }, [enabled, mid, videoRef])
+
   /* 切素材或关闭图层：清掉已绘制数据，避免新窗口返回前画出旧素材的框 */
   useEffect(() => {
     if (!enabled && !mid) return
+    seekingRef.current = false
     dataRef.current = null
     setData(null)
     setUnavailable(false)
@@ -130,13 +195,15 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
     failCountRef.current = 0
   }, [enabled, mid])
 
-  /* 播放头轮询：边缘区间按 500ms 节流取相邻窗口；完全冲出窗口时立即取（seek 快速恢复） */
+  /* 播放头轮询：拖动（seeking）期间不取；接近边缘按 500ms 节流；已冲出窗口按 150ms 节流 */
   useEffect(() => {
     if (!enabled) return
     const timer = window.setInterval(() => {
       const v = videoRef.current
       const win = dataRef.current
       if (!v) return
+      // A seek burst is in progress: the 'seeked' handler owns the next fetch.
+      if (seekingRef.current) return
       const t = v.currentTime
       // Near the clip start t0 is clamped to 0 and can't be extended backward, so the lower-edge
       // trigger only fires when there actually is earlier video to cover.
@@ -144,13 +211,13 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
       const nearHigh = win ? t > win.t1 - 1.0 : true
       if (win && !nearLow && !nearHigh) return
       const outOfWindow = win ? t < win.t0 || t > win.t1 : false
+      const minInterval = outOfWindow ? OUT_WINDOW_MIN_INTERVAL_MS : REFETCH_MIN_INTERVAL_MS
       // 节流（不是防抖！）：防抖定时器会被本 250ms 轮询不断重置而永不触发。
-      // 只有还在窗口内、只是接近边缘时才需要等待节流间隔；已冲出窗口则立即重取。
-      if (!outOfWindow && Date.now() - lastFetchAtRef.current < REFETCH_MIN_INTERVAL_MS) return
-      void fetchWindow(t)
+      if (Date.now() - lastFetchAtRef.current < minInterval) return
+      void fetchWindowRef.current(t)
     }, PLAYHEAD_POLL_MS)
     return () => window.clearInterval(timer)
-  }, [enabled, fetchWindow, videoRef])
+  }, [enabled, videoRef])
 
   /* 绘制循环：rAF 跟随播放头选最近采样帧（丢失容忍内画半透明 LOST 帧）；jsdom / 无 2d 上下文时不启动 */
   useEffect(() => {
@@ -224,6 +291,9 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
 
       if (b) {
         for (const box of visibleBoxes(frame, dt)) {
+          // Interpolated boxes (v3 cache, short occlusion gaps) are real timeline data but not
+          // actual detections — draw them dimmed so the user can tell guessed boxes from hits.
+          ctx.globalAlpha = ghost ? 0.35 : box.interp ? 0.55 : 1
           const [x1, y1, x2, y2] = box.xyxy
           const px = r.x + x1 * r.w
           const py = r.y + y1 * r.h
@@ -256,6 +326,7 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
       }
 
       if (s) {
+        ctx.globalAlpha = ghost ? 0.35 : 1
         for (const sk of frame.skeletons) {
           const color = colorOf(sk.track)
           const pts = sk.kp.map(([x, y, c]) =>

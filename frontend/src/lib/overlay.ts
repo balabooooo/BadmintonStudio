@@ -45,20 +45,30 @@ export function strictGap(fps = 12): number {
   return fps > 0 ? Math.min(MAX_FRAME_GAP, 1.5 / fps) : MAX_FRAME_GAP
 }
 
+/**
+ * Nearest-frame index in an ASCENDING-by-``t`` array (binary search).
+ * Contract: the backend overlay emits frames sorted by frame index, so ``t`` is monotonic.
+ * Returns the insertion position of ``t``; the nearest element is that index or the one before.
+ */
+function nearestIndex(frames: OverlayFrame[], t: number): number {
+  let lo = 0
+  let hi = frames.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (frames[mid].t < t) lo = mid + 1
+    else hi = mid
+  }
+  // lo is the first index with frames[lo].t >= t; compare it with lo-1.
+  if (lo <= 0) return 0
+  if (lo >= frames.length) return frames.length - 1
+  return t - frames[lo - 1].t <= frames[lo].t - t ? lo - 1 : lo
+}
+
 /** 选距离 t 最近的采样帧；超过一帧间隔认为该时刻无数据 */
 export function selectFrame(frames: OverlayFrame[], t: number, fps = 12): OverlayFrame | null {
   if (!frames.length) return null
-  const gap = strictGap(fps)
-  let best: OverlayFrame | null = null
-  let bestDt = Infinity
-  for (const f of frames) {
-    const dt = Math.abs(f.t - t)
-    if (dt < bestDt) {
-      bestDt = dt
-      best = f
-    }
-  }
-  return bestDt <= gap ? best : null
+  const best = frames[nearestIndex(frames, t)]
+  return Math.abs(best.t - t) <= strictGap(fps) ? best : null
 }
 
 /** selectFrame 的「丢失容忍」版：容差内返回最近帧及其帧龄（用于半透明 LOST 绘制） */
@@ -70,17 +80,10 @@ export function selectFrameTolerant(
 ): { frame: OverlayFrame; age: number } | null {
   if (!frames.length) return null
   const limit = Math.max(strictGap(fps), tolerance)
-  let best: OverlayFrame | null = null
-  let bestDt = Infinity
-  for (const f of frames) {
-    const dt = Math.abs(f.t - t)
-    if (dt < bestDt) {
-      bestDt = dt
-      best = f
-    }
-  }
-  if (best == null || bestDt > limit) return null
-  return { frame: best, age: bestDt }
+  const best = frames[nearestIndex(frames, t)]
+  const dt = Math.abs(best.t - t)
+  if (dt > limit) return null
+  return { frame: best, age: dt }
 }
 
 /** 高于检测阈值的跟踪框（v1 缓存无 conf 时不过滤，保持旧行为） */
