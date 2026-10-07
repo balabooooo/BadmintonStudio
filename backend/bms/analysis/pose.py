@@ -817,13 +817,22 @@ def load_keypoints(path: str | Path | None) -> dict | None:
     Returns ``{"n", "fps", "duration", "frame", "fi", "track", "xy", "conf"}`` where ``xy`` is a
     float32 (K,17,2) array in normalized frame coordinates and ``conf`` float32 (K,17); returns
     ``None`` for a missing/corrupt/v1 file so callers degrade to "skeleton unavailable".
+
+    Parsed documents are memoized in the shared npz LRU (mtime/size invalidated).
     """
     if path is None:
         return None
+    p = Path(str(path))
+    if not p.is_file():
+        return None
+    from .npz_cache import NPZ_CACHE
+
+    return NPZ_CACHE.get_or_load(p, _parse_keypoints)
+
+
+def _parse_keypoints(p: Path) -> dict | None:
+    """Decode one pose npz; ``None`` when its layout is missing/corrupt/v1."""
     try:
-        p = Path(str(path))
-        if not p.is_file():
-            return None
         z = np.load(p, allow_pickle=False)
         if "version" not in z.files or int(z["version"]) < POSE_CACHE_VERSION:
             return None

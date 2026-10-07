@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
+from loguru import logger
 
 from ..i18n import tr
 from .court_calib import point_in_poly
@@ -77,6 +78,16 @@ MERGE_MAX_DIST = 0.10
 MERGE_AREA_RATIO = 3.5
 #: Track merging: when overlapping in time, the lower bound on the fraction of overlapping frames that look like "the same person"
 MERGE_OVERLAP_RATIO = 0.5
+#: Junction seam: boxes closer than this to a frame edge are treated as clipped/partial and ignored
+#: when comparing the geometry at a merge seam (fragments frequently start/end glued to an edge).
+EDGE_CLIP_EPS = 0.01
+#: When searching for a complete seam box, look at most this many seconds inward from the fragment end.
+EDGE_TRIM_SECONDS = 0.75
+#: Timeline assembly: fill per-track gaps no longer than this (seconds) with linearly interpolated
+#: boxes, so brief occlusions don't flicker the overlay box in/out. Matches the ByteTrack buffer
+#: window (30 sampled frames @15fps ≈ 2s). Longer gaps (fragment splits, scene cuts, a player
+#: walking off court) are deliberately NOT bridged — a guessed box is worse than a missing one.
+TRACK_INTERP_MAX_GAP = 2.0
 
 #: Size filtering: histogram bin count and upper bound (box height in frame-height units; above 0.5 is basically a close-up)
 SIZE_HIST_BINS = 24
@@ -680,6 +691,39 @@ class _ByteTracker:
 # ------------------------------------------------------------------ track merging
 
 
+def _box_touches_edge(box: Sequence[float], eps: float = EDGE_CLIP_EPS) -> bool:
+    """True when the box is clipped by (or practically glued to) a frame edge.
+
+    Such boxes miss part of the body, so their center/scale are unreliable for merge-seam
+    geometry; the seam comparison trims them and uses the nearest fully-visible box instead.
+    """
+    x1, y1, x2, y2 = box
+    return x1 <= eps or y1 <= eps or x2 >= 1.0 - eps or y2 >= 1.0 - eps
+
+
+def _junction_endpoints(prev: _TrackBuf, nxt: _TrackBuf,
+                        trim_seconds: float = EDGE_TRIM_SECONDS
+                        ) -> tuple[float, Sequence[float], float, Sequence[float]] | None:
+    """Pick the last/first fully-visible observations near each fragment's seam.
+
+    Returns ``(prev_time, prev_box, nxt_time, nxt_box)``. ByteTrack fragments frequently
+    start/end with partial boxes on the frame border (a player half out of frame); comparing the
+    seam on those rejects merges of the same person reappearing just inside the edge. Search up
+    to ``trim_seconds`` inward; return None when either side has no complete box in that window.
+    """
+    pi = prev.n - 1
+    while pi >= 0 and prev.times[-1] - prev.times[pi] <= trim_seconds and _box_touches_edge(prev.boxes[pi]):
+        pi -= 1
+    if pi < 0 or prev.times[-1] - prev.times[pi] > trim_seconds:
+        return None
+    ni = 0
+    while ni < nxt.n and nxt.times[ni] - nxt.times[0] <= trim_seconds and _box_touches_edge(nxt.boxes[ni]):
+        ni += 1
+    if ni >= nxt.n or nxt.times[ni] - nxt.times[0] > trim_seconds:
+        return None
+    return prev.times[pi], prev.boxes[pi], nxt.times[ni], nxt.boxes[ni]
+
+
 def _junction_ok(prev: _TrackBuf, nxt: _TrackBuf, aspect: float) -> bool:
     """Determine whether the "seam" between two tracks looks like the same person.
 
@@ -692,13 +736,18 @@ def _junction_ok(prev: _TrackBuf, nxt: _TrackBuf, aspect: float) -> bool:
     if prev.times[-1] < nxt.times[0]:
         if nxt.times[0] - prev.times[-1] > MERGE_MAX_GAP:
             return False
-        c_prev = prev.predict(nxt.times[0]) or _box_center(prev.boxes[-1])
-        c_new = _box_center(nxt.boxes[0])
+        # Trim edge-clipped boxes at either fragment end before judging the seam geometry.
+        ends = _junction_endpoints(prev, nxt)
+        if ends is None:
+            return False
+        _, box_prev, t_new, box_new = ends
+        c_prev = prev.predict(t_new) or _box_center(box_prev)
+        c_new = _box_center(box_new)
         dist = math.hypot((c_prev[0] - c_new[0]) * aspect, c_prev[1] - c_new[1])
         if dist > MERGE_MAX_DIST:
             return False
-        a_prev = _box_area(prev.boxes[-1])
-        a_new = _box_area(nxt.boxes[0])
+        a_prev = _box_area(box_prev)
+        a_new = _box_area(box_new)
         return min(a_prev, a_new) > 1e-9 and max(a_prev, a_new) / min(a_prev, a_new) <= MERGE_AREA_RATIO
 
     # Time overlap: sample the observations of the shorter track that fall within the overlap interval
@@ -1331,6 +1380,72 @@ def _select_active_players_windowed(
     return out
 
 
+def _fill_track_holes(
+    tracks: Sequence[PlayerTrack],
+    active_set: set[int],
+    boxes_map: list[dict[int, tuple]],
+    confs_map: list[dict[int, float]],
+    interps_map: list[dict[int, int]],
+    sample_fps: float,
+    max_gap_seconds: float = TRACK_INTERP_MAX_GAP,
+) -> tuple[int, int]:
+    """Bridge short holes of active tracks on the timeline grid with linear interpolation.
+
+    ByteTrack buffers at most ~2s of misses, so the same player track can legitimately contain
+    brief holes (timeline slots without a surviving association). Filling them keeps the overlay
+    box from flickering out. Rules, kept conservative on purpose:
+
+    * only gaps ``<= max_gap_seconds`` between two observations of the SAME active track are
+      filled; wider holes stay empty;
+    * a slot already occupied in ``boxes_map`` is never overwritten (another track, or a
+      later observation — same last-write-wins ordering as the assembly loop);
+    * interpolated rows are flagged in ``interps_map`` so the UI can dim them.
+
+    Returns ``(filled_slots, considered_gaps)`` for diagnostics/tests.
+    """
+    n = len(boxes_map)
+
+    def _ti(t: float) -> int:
+        return min(n - 1, max(0, int(round(t * sample_fps))))
+
+    interp_filled = 0
+    interp_gaps = 0
+    for tk in tracks:
+        if tk.track_id not in active_set or tk.n < 2:
+            continue
+        # Last-write-wins per timeline slot, matching the assembly loop above.
+        seen: dict[int, tuple[Sequence[float], float]] = {}
+        for j in range(tk.n):
+            seen[_ti(tk.times[j])] = (tk.boxes[j], float(tk.confidences[j]))
+        slots = sorted(seen)
+        for pa, pb in zip(slots, slots[1:]):
+            gap_cells = pb - pa
+            if gap_cells < 2:
+                continue
+            gap_seconds = gap_cells / float(sample_fps)
+            if gap_seconds > max_gap_seconds:
+                continue
+            interp_gaps += 1
+            (ba, ca), (bb, cb) = seen[pa], seen[pb]
+            for g in range(pa + 1, pb):
+                # Any surviving box in this slot wins (another track, or a later observation) —
+                # same last-write-wins ordering as the timeline assembly loop above.
+                if boxes_map[g]:
+                    continue
+                f = (g - pa) / gap_cells
+                boxes_map[g][tk.track_id] = (
+                    tk.track_id,
+                    float(ba[0] + (bb[0] - ba[0]) * f),
+                    float(ba[1] + (bb[1] - ba[1]) * f),
+                    float(ba[2] + (bb[2] - ba[2]) * f),
+                    float(ba[3] + (bb[3] - ba[3]) * f),
+                )
+                confs_map[g][tk.track_id] = 0.5 * (ca + cb)
+                interps_map[g][tk.track_id] = 1
+                interp_filled += 1
+    return interp_filled, interp_gaps
+
+
 # ------------------------------------------------------------------ main entry point
 
 
@@ -1431,6 +1546,13 @@ def analyze_players(
     eff_fps = src_fps / step                      # actual sampling frame rate
     step_dt = 1.0 / eff_fps
     limit = int(round(max_seconds * src_fps)) if max_seconds > 0 else (total_frames or 10 ** 9)
+    # Metadata estimate only (the actually-analyzed duration is known after the sampling loop
+    # and logged there); renaming avoids colliding with that later local.
+    est_duration = (min(total_frames, limit) / src_fps) if total_frames > 0 else 0.0
+    logger.debug(
+        "analyze_players sampling: src_fps={:.3f} step={} eff_fps={:.3f} timeline_fps={:.3f} est_duration={:.2f}",
+        src_fps, step, eff_fps, sample_fps, est_duration,
+    )
     batch_size = max(1, int(batch_hint))
 
     # ---- load the model ----
@@ -1634,6 +1756,8 @@ def analyze_players(
     boxes_map: list[dict[int, tuple[int, float, float, float, float]]] = [dict() for _ in range(n)]
     # Per-observation detection confidence, parallel to boxes_map rows (v2 cache column).
     confs_map: list[dict[int, float]] = [dict() for _ in range(n)]
+    # Per-row interpolation flag, parallel to boxes_map rows (v3 cache column): 1 = guessed box.
+    interps_map: list[dict[int, int]] = [dict() for _ in range(n)]
     active_set = set(active_ids)
 
     for tk in tracks:
@@ -1649,6 +1773,18 @@ def analyze_players(
                 b = tk.boxes[j]
                 boxes_map[i][tk.track_id] = (tk.track_id, float(b[0]), float(b[1]), float(b[2]), float(b[3]))
                 confs_map[i][tk.track_id] = float(tk.confidences[j])
+                interps_map[i][tk.track_id] = 0
+
+    # ---- bridge short in-track holes with linear interpolation ----
+    # See _fill_track_holes: gaps <= TRACK_INTERP_MAX_GAP seconds of the same active track are
+    # interpolated (slots already taken are never overwritten); wider holes stay empty.
+    interp_filled, interp_gaps = _fill_track_holes(
+        tracks, active_set, boxes_map, confs_map, interps_map, float(sample_fps),
+    )
+    logger.debug(
+        "analyze_players timeline: n={} active_ids={} interpolated_frames={} over {} short gaps (max_gap={}s)",
+        n, active_ids, interp_filled, interp_gaps, TRACK_INTERP_MAX_GAP,
+    )
 
     active_count = np.asarray([len(s) for s in active_present], dtype=np.float32)
     active_speed = np.asarray(
@@ -1659,6 +1795,7 @@ def analyze_players(
     )
     frame_boxes = [list(m.values()) for m in boxes_map]
     frame_confs = [list(m.values()) for m in confs_map]
+    frame_interps = [list(m.values()) for m in interps_map]
 
     size_stats = _build_size_stats(
         sf, size_samples, size_dropped, size_frames,
@@ -1678,7 +1815,8 @@ def analyze_players(
             )
             if not save_boxes_cache(cache_tag, frame_boxes, float(sample_fps),
                                     float(duration), active_ids,
-                                    frame_confs=frame_confs, raw_dets=raw_dets):
+                                    frame_confs=frame_confs, raw_dets=raw_dets,
+                                    raw_fps=float(eff_fps), frame_interp=frame_interps):
                 cache_tag = ""
         except Exception:
             cache_tag = ""
@@ -1704,7 +1842,10 @@ def analyze_players(
 #: Cache format version. Bump when the npz layout changes; loaders treat an unknown version as a miss.
 #: v2 adds per-row detection ``conf`` (uint8 ×255) plus raw pre-size-filter detections
 #: (``raw_frame`` / ``raw_boxes`` / ``raw_conf``). The loader still accepts v1 files (no conf, no raw).
-BOXES_CACHE_VERSION = 2
+#: v3 aligns the raw detections onto the timeline grid (``raw_fps`` column; v2 stored raw rows on
+#: the actual sampling grid, which could differ from the labeled ``fps``) and adds a per-row
+#: ``interp`` flag (1 for boxes interpolated across short occlusion gaps).
+BOXES_CACHE_VERSION = 3
 #: Normalized box coordinates are quantized to uint16 (resolution ~1.5e-5 of the frame, sub-pixel on a 960px proxy)
 _BOX_QUANT = 65535.0
 #: Confidence quantization for the uint8 conf columns (resolution ~0.004)
@@ -1791,16 +1932,24 @@ def save_boxes_cache(
     cache_dir: str | Path | None = None,
     frame_confs: list[list[float]] | None = None,
     raw_dets: list[list[tuple[tuple[float, float, float, float], float]]] | None = None,
+    raw_fps: float | None = None,
+    frame_interp: list[list[int]] | None = None,
 ) -> bool:
-    """Persist per-frame active-player boxes as a compact compressed npz (v2 layout).
+    """Persist per-frame active-player boxes as a compact compressed npz (v3 layout).
 
     Layout (flat rows, one row per ``(frame, track)`` observation):
     ``frame`` int32, ``track`` int32, ``boxes`` uint16×4 (normalized 0~1 quantized),
-    ``conf`` uint8 (×255, v2; aligned with the ``frame``/``track`` rows).
+    ``conf`` uint8 (×255), ``interp`` uint8 (1 when the box was interpolated across a short
+    occlusion gap rather than observed).
     Raw pre-size-filter detections (``raw_frame`` int32, ``raw_boxes`` uint16×4,
     ``raw_conf`` uint8) capture every trusted detection for the overlay's
     miss-diagnosis layer — they carry no track id (that is the point: untracked boxes).
-    Never raises: returns ``False`` and lets the caller degrade silently.
+
+    ``raw_dets`` rows are indexed on the ACTUAL sampling grid (``raw_fps``, e.g. 15 when the
+    source is 30fps sampled every other frame while ``fps`` labels the 12fps timeline); they are
+    re-bucketed onto the timeline ``fps`` grid BY TIME here, so the overlay can index raw and
+    tracked boxes with the same frame number. When ``raw_fps`` is omitted it is assumed equal to
+    ``fps``. Never raises: returns ``False`` and lets the caller degrade silently.
     """
     path = boxes_cache_path(tag, cache_dir)
     if path is None:
@@ -1811,6 +1960,7 @@ def save_boxes_cache(
         tracks: list[int] = []
         rows: list[list[float]] = []
         confs: list[float] = []
+        interps: list[int] = []
         for i, fr in enumerate(frame_boxes):
             for k, item in enumerate(fr or ()):
                 if len(item) < 5:
@@ -1822,18 +1972,28 @@ def save_boxes_cache(
                 if frame_confs is not None and i < len(frame_confs) and k < len(frame_confs[i]):
                     c = float(frame_confs[i][k])
                 confs.append(min(1.0, max(0.0, c)))
+                iv = 0
+                if frame_interp is not None and i < len(frame_interp) and k < len(frame_interp[i]):
+                    iv = 1 if int(frame_interp[i][k]) else 0
+                interps.append(iv)
         if rows:
             quant = np.round(np.clip(np.asarray(rows, dtype=np.float64), 0.0, 1.0)
                              * _BOX_QUANT).astype(np.uint16)
             conf_arr = np.round(np.asarray(confs, dtype=np.float64) * _CONF_QUANT).astype(np.uint8)
+            interp_arr = np.asarray(interps, dtype=np.uint8)
             frame_arr = np.asarray(frames, dtype=np.int32)
             track_arr = np.asarray(tracks, dtype=np.int32)
         else:
             quant = np.zeros((0, 4), dtype=np.uint16)
             conf_arr = np.zeros(0, dtype=np.uint8)
+            interp_arr = np.zeros(0, dtype=np.uint8)
             frame_arr = np.zeros(0, dtype=np.int32)
             track_arr = np.zeros(0, dtype=np.int32)
 
+        # Raw detections live on the actual sampling grid (raw_fps); re-bucket every row onto the
+        # timeline grid (fps) BY TIME. Historically the raw row index was stored verbatim, which
+        # silently drifted time whenever raw_fps != fps (30fps source / 12fps target -> 15 vs 12).
+        raw_grid_fps = float(raw_fps) if raw_fps and float(raw_fps) > 0 else float(fps)
         raw_frame_arr = np.zeros(0, dtype=np.int32)
         raw_quant = np.zeros((0, 4), dtype=np.uint16)
         raw_conf_arr = np.zeros(0, dtype=np.uint8)
@@ -1842,8 +2002,14 @@ def save_boxes_cache(
             rr: list[list[float]] = []
             rc: list[float] = []
             for i, fr in enumerate(raw_dets):
+                if raw_grid_fps > 0.0:
+                    j = int(round(i / raw_grid_fps * float(fps)))
+                else:
+                    j = i
+                if not 0 <= j < n:
+                    continue
                 for b, c in fr or ():
-                    rf.append(i)
+                    rf.append(j)
                     rr.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
                     rc.append(min(1.0, max(0.0, float(c))))
             if rr:
@@ -1862,11 +2028,13 @@ def save_boxes_cache(
             fps=np.float64(fps),
             duration=np.float64(duration),
             n=np.int64(n),
+            raw_fps=np.float64(raw_grid_fps),
             active_ids=np.asarray(list(active_ids or []), dtype=np.int32),
             frame=frame_arr,
             track=track_arr,
             boxes=quant,
             conf=conf_arr,
+            interp=interp_arr,
             raw_frame=raw_frame_arr,
             raw_boxes=raw_quant,
             raw_conf=raw_conf_arr,
@@ -1874,18 +2042,28 @@ def save_boxes_cache(
         os.replace(tmp, path)
         return True
     except Exception:
+        logger.opt(exception=True).debug("save_boxes_cache failed for tag {}", tag)
         return False
 
 
 def load_boxes_cache(tag_or_path: str | Path, cache_dir: str | Path | None = None) -> dict | None:
-    """Load a box cache produced by :func:`save_boxes_cache` (v1 and v2 layouts).
+    """Load a box cache produced by :func:`save_boxes_cache` (v1/v2/v3 layouts).
 
-    Returns ``{"frame_boxes", "fps", "duration", "active_ids", "tag"}`` plus, for v2 files,
-    ``"frame_confs"`` (per-row detection confidence aligned with ``frame_boxes``) and
-    ``"raw_dets"`` (per sampled frame ``[(x1, y1, x2, y2, conf), ...]`` pre-size-filter
-    detections). v1 files load with ``frame_confs=None, raw_dets=None`` — the overlay then
-    simply has no conf to filter on and no diagnosis layer. ``None`` on any miss / unknown
-    version / corrupt file.
+    Returns ``{"frame_boxes", "frame_confs", "raw_dets", "frame_interps", "fps", "duration",
+    "active_ids", "tag", "raw_fps"}``. v1 files load with ``frame_confs=None, raw_dets=None,
+    frame_interps=None`` — the overlay then has no conf/diagnosis/interp layers.
+
+    v2 gotcha: raw rows were written with their *sampling-grid* row index while the cache labels
+    the timeline ``fps``/``n``; when sampling did not divide the source fps evenly (30fps source
+    with a 12fps target runs the detector at 15fps), the raw overlay was silently time-drifting
+    and its tail rows were dropped. Here such v2 files are detected (raw row range larger than
+    the timeline grid) and re-bucketed onto the timeline grid BY TIME; the inferred
+    ``raw_fps`` is returned. v3 files are saved already bucketed.
+
+    Parsed documents are memoized in :data:`bms.analysis.npz_cache.NPZ_CACHE` keyed by path and
+    invalidated on mtime/size change, so overlay polling does not redecode the npz.
+
+    ``None`` on any miss / unknown version / corrupt file.
     """
     try:
         p = Path(str(tag_or_path))
@@ -1893,20 +2071,36 @@ def load_boxes_cache(tag_or_path: str | Path, cache_dir: str | Path | None = Non
             p = boxes_cache_path(str(tag_or_path), cache_dir)  # type: ignore[arg-type]
         if p is None or not p.is_file():
             return None
+        from .npz_cache import NPZ_CACHE
+
+        return NPZ_CACHE.get_or_load(p, _parse_boxes_cache)
+    except Exception:
+        logger.opt(exception=True).debug("load_boxes_cache failed for {}", tag_or_path)
+        return None
+
+
+def _parse_boxes_cache(p: Path) -> dict | None:
+    """Decode one boxes npz file (v1/v2/v3 layouts); ``None`` when the layout is unusable."""
+    try:
         z = np.load(p, allow_pickle=False)
         if "version" not in z.files:
             return None
         version = int(z["version"])
-        if version not in (1, BOXES_CACHE_VERSION):
+        if version not in (1, 2, BOXES_CACHE_VERSION):
             return None
         n = int(z["n"])
+        fps = float(z["fps"])
+        duration = float(z["duration"])
         frame_idx = z["frame"].astype(np.int64)
         track = z["track"].astype(np.int64)
         coords = z["boxes"].astype(np.float32) / _BOX_QUANT
         has_conf = version >= 2 and "conf" in z.files
         conf_col = (z["conf"].astype(np.float32) / _CONF_QUANT) if has_conf else None
+        has_interp = version >= 3 and "interp" in z.files
+        interp_col = z["interp"].astype(np.uint8) if has_interp else None
         frame_boxes: list[list[tuple[int, float, float, float, float]]] = [[] for _ in range(n)]
         frame_confs: list[list[float]] | None = [[] for _ in range(n)] if has_conf else None
+        frame_interps: list[list[int]] | None = [[] for _ in range(n)] if has_interp else None
         for row in range(frame_idx.shape[0]):
             i = int(frame_idx[row])
             if 0 <= i < n and coords.shape[1] == 4:
@@ -1917,31 +2111,63 @@ def load_boxes_cache(tag_or_path: str | Path, cache_dir: str | Path | None = Non
                 ))
                 if frame_confs is not None and conf_col is not None:
                     frame_confs[i].append(float(conf_col[row]))
+                if frame_interps is not None and interp_col is not None:
+                    frame_interps[i].append(int(interp_col[row]))
 
+        raw_fps: float | None = None
         raw_dets: list[list[tuple[float, float, float, float, float]]] | None = None
         if version >= 2 and "raw_frame" in z.files and "raw_boxes" in z.files and "raw_conf" in z.files:
             rf = z["raw_frame"].astype(np.int64)
             rb = z["raw_boxes"].astype(np.float32) / _BOX_QUANT
             rc = z["raw_conf"].astype(np.float32) / _CONF_QUANT
+            # v3 saves raw rows already bucketed onto the timeline grid; raw_fps is metadata.
+            # v2 needs the heuristic fix-up described in the docstring.
+            raw_grid_fps = fps
+            if version >= 3 and "raw_fps" in z.files:
+                raw_grid_fps = float(z["raw_fps"]) or fps
+            elif version == 2 and rf.shape[0] > 0:
+                raw_count = int(rf.max()) + 1
+                if raw_count > int(n * 1.05):
+                    raw_grid_fps = (raw_count / duration) if duration > 0 else fps
+                    logger.debug(
+                        "boxes cache v2 raw-grid fixup tag={}: raw rows={} timeline n={} -> raw_fps~{:.3f} (fps={:.3f})",
+                        p.stem, raw_count, n, raw_grid_fps, fps,
+                    )
+            raw_fps = raw_grid_fps
             raw_dets = [[] for _ in range(n)]
+            kept = 0
+            dropped = 0
             for row in range(rf.shape[0]):
-                i = int(rf[row])
-                if 0 <= i < n and rb.shape[1] == 4:
-                    raw_dets[i].append((
+                if rb.shape[1] != 4:
+                    break
+                if version >= 3 or raw_grid_fps == fps:
+                    j = int(rf[row])
+                else:
+                    j = int(round(int(rf[row]) / raw_grid_fps * fps))
+                if 0 <= j < n:
+                    raw_dets[j].append((
                         float(rb[row, 0]), float(rb[row, 1]),
                         float(rb[row, 2]), float(rb[row, 3]),
                         float(rc[row]),
                     ))
+                    kept += 1
+                else:
+                    dropped += 1
+            if dropped:
+                logger.debug("boxes cache tag={}: {} raw rows out of timeline range dropped", p.stem, dropped)
         return {
             "frame_boxes": frame_boxes,
             "frame_confs": frame_confs,
+            "frame_interps": frame_interps,
             "raw_dets": raw_dets,
-            "fps": float(z["fps"]),
-            "duration": float(z["duration"]),
+            "raw_fps": raw_fps,
+            "fps": fps,
+            "duration": duration,
             "active_ids": [int(v) for v in z["active_ids"].tolist()],
             "tag": p.stem.replace("boxes_", "", 1),
         }
     except Exception:
+        logger.opt(exception=True).debug("parse boxes cache failed for {}", p)
         return None
 
 
