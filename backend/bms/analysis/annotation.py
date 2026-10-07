@@ -23,7 +23,7 @@ import json
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -473,15 +473,19 @@ def combo_score(iou_f1: float, band_f1: float,
 def _grid_search(ctx: _Context, gt: list[tuple[float, float]], base: AnalysisParams,
                  grid: list[tuple[str, list[float]]], iou_thr: float,
                  hit_labels: list[tuple[float, bool]] | None,
-                 fixed_hits=None) -> list[dict[str, Any]]:
+                 fixed_hits=None, progress_cb=None) -> list[dict[str, Any]]:
     names = [n for n, _ in grid]
+    combos = list(itertools.product(*[vals for _, vals in grid]))
+    total = max(1, len(combos))
     out: list[dict[str, Any]] = []
-    for combo in itertools.product(*[vals for _, vals in grid]):
+    for ci, combo in enumerate(combos):
         patch = dict(zip(names, combo))
         params = base.model_copy(update=patch)
         try:
             preds = _predict(ctx, params, hits=fixed_hits)
         except Exception:  # noqa: BLE001
+            if progress_cb is not None:
+                progress_cb(ci + 1, total)
             continue
         m = metrics(preds, gt, iou_thr)
         m["boundary_band_f1"] = boundary_band_f1(preds, gt)
@@ -490,6 +494,8 @@ def _grid_search(ctx: _Context, gt: list[tuple[float, float]], base: AnalysisPar
         if hit_labels:
             m["hit"] = hit_metrics(_predict_hit_times(ctx, params, hits=fixed_hits), hit_labels)
         out.append(m)
+        if progress_cb is not None:
+            progress_cb(ci + 1, total)
     return out
 
 
@@ -660,12 +666,17 @@ def _weights_stage(ctx: _Context, gt: list[tuple[float, float]], params: Analysi
 
 
 
+class OptimizeCancelled(Exception):
+    """Raised from an :func:`optimize` progress callback when the owning job is cancelled."""
+
+
 def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
              focus: tuple[float, float] | None = None,
              grid: list[tuple[str, list[float]]] | None = None,
              iou_thr: float = 0.5,
              hit_labels: list[tuple[float, bool]] | None = None,
-             sensitivity_fn=None) -> dict[str, Any]:
+             sensitivity_fn=None,
+             on_progress: Callable[[float, str], None] | None = None) -> dict[str, Any]:
     """Search for segmentation / gate / hit-sensitivity parameters with the highest F1.
 
     Staged coordinate descent (avoids the combinatorial explosion of a joint grid):
@@ -708,6 +719,23 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     # static grid; explicit caller grids (tests) bypass the augmentation.
     grid = grid or dynamic_grid(gt)
 
+    # ---- progress plumbing ----
+    # Fixed 0→1 map over the five search stages (see docstring); stage boundaries are where the
+    # job worker also checks cancellation, so the callback may raise OptimizeCancelled.
+    def _report(p: float, stage: str) -> None:
+        if on_progress is not None:
+            on_progress(float(max(0.0, min(1.0, p))), stage)
+
+    def _stage_cb(lo: float, hi: float, stage: str):
+        if on_progress is None:
+            return None
+
+        def cb(done: int, total: int) -> None:
+            _report(lo + (hi - lo) * (done / max(1, total)), stage)
+
+        return cb
+
+    _report(0.03, "optimize_prepare")
     baseline_preds = _predict(ctx, base)
     baseline = metrics(baseline_preds, gt, iou_thr)
     baseline["boundary_band_f1"] = boundary_band_f1(baseline_preds, gt)
@@ -715,13 +743,15 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     baseline["params"] = {n: float(getattr(base, n)) for n, _ in grid}
     if hit_labels:
         baseline["hit"] = hit_metrics(_predict_hit_times(ctx, base), hit_labels)
+    _report(0.10, "optimize_prepare")
 
     out: list[dict[str, Any]] = []
     stages: dict[str, Any] = {}
 
     # ---- Stage A: segmentation structure (gate fixed -> gate once, reuse across combos)
     hits_a = _gated_hits(ctx, base)
-    res_a = _grid_search(ctx, gt, base, grid, iou_thr, hit_labels, fixed_hits=hits_a)
+    res_a = _grid_search(ctx, gt, base, grid, iou_thr, hit_labels, fixed_hits=hits_a,
+                         progress_cb=_stage_cb(0.10, 0.50, "optimize_segment"))
     out.extend(res_a)
     best_a = _pick_best(res_a, hit_labels=False)
     params_a = base
@@ -738,7 +768,9 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     stage_b_best = None
     if ctx.pose is not None and ctx.hits_raw is not None \
             and getattr(ctx.hits_raw, "times", np.zeros(0)).size:
-        res_b = _grid_search(ctx, gt, params_a, GATE_GRID, iou_thr, hit_labels)
+        _report(0.50, "optimize_gate")
+        res_b = _grid_search(ctx, gt, params_a, GATE_GRID, iou_thr, hit_labels,
+                             progress_cb=_stage_cb(0.50, 0.62, "optimize_gate"))
         out.extend(res_b)
         stage_b_best = _pick_best(res_b, hit_labels=bool(hit_labels))
         if stage_b_best is not None:
@@ -764,20 +796,32 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     params_c = params_b
     if sensitivity_fn is not None and hit_labels:
         res_c: list[dict[str, Any]] = []
+        sens_total = sum(len(vals) for _n, vals in SENS_GRID)
+        sens_done = 0
+        _report(0.62, "optimize_sensitivity")
         for _n, vals in SENS_GRID:
             for sens in vals:
                 patch = {"hit_sensitivity": float(sens)}
                 try:
                     raw = sensitivity_fn(float(sens))
                 except Exception:  # noqa: BLE001
+                    sens_done += 1
+                    _report(0.62 + 0.16 * (sens_done / max(1, sens_total)),
+                            "optimize_sensitivity")
                     continue
                 if raw is None:
+                    sens_done += 1
+                    _report(0.62 + 0.16 * (sens_done / max(1, sens_total)),
+                            "optimize_sensitivity")
                     continue
                 cctx = replace(ctx, hits_raw=raw, has_raw=True)
                 p = params_b.model_copy(update=patch)
                 try:
                     preds = _predict(cctx, p)
                 except Exception:  # noqa: BLE001
+                    sens_done += 1
+                    _report(0.62 + 0.16 * (sens_done / max(1, sens_total)),
+                            "optimize_sensitivity")
                     continue
                 m = metrics(preds, gt, iou_thr)
                 m["boundary_band_f1"] = boundary_band_f1(preds, gt)
@@ -786,6 +830,9 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
                 m["hit"] = hit_metrics(_predict_hit_times(cctx, p), hit_labels)
                 res_c.append(m)
                 out.append(m)
+                sens_done += 1
+                _report(0.62 + 0.16 * (sens_done / max(1, sens_total)),
+                        "optimize_sensitivity")
         best_c = _pick_best(res_c, hit_labels=True)
         if best_c is not None:
             cur = ((baseline.get("hit") or {}).get("f1", 0.0)
@@ -813,7 +860,9 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
                             round(min(2.0, max(0.0, float(params_c.post_roll) - float(de))), 2)})
         pad_grid = [("pre_roll", pre_cand), ("post_roll", post_cand)]
         hits_d = _gated_hits(ctx, params_c)
-        res_d = _grid_search(ctx, gt, params_c, pad_grid, iou_thr, hit_labels, fixed_hits=hits_d)
+        _report(0.78, "optimize_padding")
+        res_d = _grid_search(ctx, gt, params_c, pad_grid, iou_thr, hit_labels, fixed_hits=hits_d,
+                             progress_cb=_stage_cb(0.78, 0.84, "optimize_padding"))
         out.extend(res_d)
         best_d = _pick_best([m for m in res_d if not hit_labels or "hit" in m],
                             hit_labels=bool(hit_labels))
@@ -832,9 +881,11 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
     # ---- Stage E: fusion component weights (needs P4-1+ full-rate component curves)
     params_e = params_d
     if _components_available(ctx.sig):
+        _report(0.84, "optimize_weights")
         params_e, w_trace, res_e = _weights_stage(ctx, gt, params_d, iou_thr)
         out.extend(res_e)
         stages["weights"] = w_trace
+        _report(0.98, "optimize_weights")
 
     # Combined best parameters re-evaluated end to end.
     final_preds = _predict(ctx, params_e)
@@ -856,6 +907,7 @@ def optimize(res: AnalysisResult, gt: list[tuple[float, float]],
 
     out.sort(key=lambda m: (m.get("score", m["f1"]), m["f1"], m["recall"], m["precision"]),
              reverse=True)
+    _report(1.0, "optimize_done")
     return {
         "gt_count": len(gt),
         "focus": [lo, hi],

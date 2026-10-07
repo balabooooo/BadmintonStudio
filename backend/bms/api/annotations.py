@@ -12,15 +12,18 @@ The routes are mounted on the main service (:mod:`bms.main`); no separate proces
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import PlainTextResponse
+from loguru import logger
 
 from ..analysis import annotation as AN
 from ..core import store as ST
+from ..core.jobs import manager as JOBS
 from ..core.models import MediaInfo, Project
-from ..i18n import tr
+from ..i18n import get_lang, tr
 
 router = APIRouter(prefix="/api/projects/{pid}/media/{mid}/annotation", tags=["annotation"])
 
@@ -81,6 +84,11 @@ def get_annotation(pid: str, mid: str) -> dict:
         fps = float(m.fps or 0.0)
     res = proj.analyses.get(mid)
     sig = (res.signals or {}) if res is not None else {}
+    logger.debug(
+        "annotation get: pid={} mid={} rallies={} hits={} focus={} auto={} path={}",
+        pid, mid, len(doc.get("rallies") or []), len(doc.get("hits") or []),
+        bool(doc.get("focus")), len(auto), path,
+    )
     return {
         "media_id": mid,
         "media_name": m.name,
@@ -110,6 +118,12 @@ def put_annotation(pid: str, mid: str, payload: dict = Body(...)) -> dict:
     if fps <= 0:
         fps = float(m.fps or 0.0)
     doc = AN.save_annotation(AN.annotation_path(m), m, payload, duration, fps)
+    logger.debug(
+        "annotation put: pid={} mid={} rallies={} hits={} focus={} keys={} path={}",
+        pid, mid, int(doc.get("count") or 0),
+        len(payload.get("hits") or []), bool(payload.get("focus")),
+        sorted(payload.keys()), AN.annotation_path(m),
+    )
     return {"ok": True, "count": doc["count"], "path": str(AN.annotation_path(m)),
             "updated_at": doc["updated_at"]}
 
@@ -214,14 +228,20 @@ def get_annotation_overlay(pid: str, mid: str, t0: float = 0.0, t1: float = 1.0)
     from ..analysis import players as PL
     from ..analysis import pose as POSE
 
+    t_start = time.perf_counter()
     boxes_tag = str(stats.get("boxes_cache") or "")
     pose_tag = str(stats.get("pose_cache") or "")
+    t_boxes0 = time.perf_counter()
     boxes_doc = PL.load_boxes_cache(boxes_tag) if boxes_tag else None
+    t_boxes_ms = (time.perf_counter() - t_boxes0) * 1000.0
     kp_doc = None
     if pose_tag:
         pose_dir = POSE.default_cache_dir()
         if pose_dir is not None:
+            t_pose0 = time.perf_counter()
             kp_doc = POSE.load_keypoints(pose_dir / f"{pose_tag}.npz")
+            logger.debug("overlay pose npz load: {:.1f}ms (tag={})",
+                         (time.perf_counter() - t_pose0) * 1000.0, pose_tag)
 
     # frame-index -> payload entry (only frames carrying a box, a skeleton or a raw detection are emitted)
     entries: dict[int, dict[str, Any]] = {}
@@ -237,6 +257,7 @@ def get_annotation_overlay(pid: str, mid: str, t0: float = 0.0, t1: float = 1.0)
     if boxes_doc is not None:
         frame_boxes = boxes_doc["frame_boxes"]
         frame_confs = boxes_doc.get("frame_confs")
+        frame_interps = boxes_doc.get("frame_interps")
         raw_dets = boxes_doc.get("raw_dets")
         fps = float(boxes_doc["fps"])
         n = len(frame_boxes)
@@ -253,8 +274,11 @@ def get_annotation_overlay(pid: str, mid: str, t0: float = 0.0, t1: float = 1.0)
                 # v1 boxes have none and are always shown (no filtering possible).
                 if frame_confs is not None and k < len(frame_confs[i]):
                     box_json["conf"] = round(float(frame_confs[i][k]), 3)
+                # v3 marks boxes interpolated across short occlusion gaps; the UI draws them dimmed.
+                if frame_interps is not None and k < len(frame_interps[i]) and int(frame_interps[i][k]):
+                    box_json["interp"] = True
                 _entry(i, fps)["boxes"].append(box_json)
-            # Raw pre-size-filter detections (v2 only): what the detector saw before tracking /
+            # Raw pre-size-filter detections (v2/v3): what the detector saw before tracking /
             # active-player selection. No track id — the frontend draws them as a dashed
             # miss-diagnosis layer behind the colored tracked boxes.
             if raw_dets is not None:
@@ -282,6 +306,14 @@ def get_annotation_overlay(pid: str, mid: str, t0: float = 0.0, t1: float = 1.0)
             _entry(int(fr[r]), kfps)["skeletons"].append(
                 {"track": int(trk[r]), "kp": kp})
 
+    n_boxes = sum(len(e["boxes"]) for e in entries.values())
+    n_dets = sum(len(e["dets"]) for e in entries.values())
+    n_skel = sum(len(e["skeletons"]) for e in entries.values())
+    logger.debug(
+        "overlay mid={} window=[{:.2f},{:.2f}] entries={} boxes={} dets={} skeletons={} boxes_npz={:.1f}ms total={:.1f}ms",
+        mid, t0, t1, len(entries), n_boxes, n_dets, n_skel, t_boxes_ms,
+        (time.perf_counter() - t_start) * 1000.0,
+    )
     return {
         "t0": round(max(0.0, t0), 3),
         "t1": round(t1, 3),
@@ -330,13 +362,36 @@ def annotation_quality(pid: str, mid: str) -> dict:
     return quality
 
 
+def _read_optimize_labels(m: MediaInfo) -> tuple[list[tuple[float, float]],
+                                                  list[tuple[float, bool]],
+                                                  tuple[float, float] | None]:
+    """Load rally/hit labels for optimization from the media's annotation file.
+
+    Hit-level stages are only meaningful when the user has actually marked at least one
+    neighboring-court sound; labels that are all "ours" would simply reward keeping every hit, so
+    an all-ours set is downgraded to "no hit labels" here.
+    """
+    doc = AN.load_annotation(AN.annotation_path(m))
+    gt = [(float(r["start"]), float(r["end"])) for r in AN.normalize_rallies(doc.get("rallies") or [])]
+    hit_labels = [(float(h["t"]), bool(h.get("ours", True)))
+                  for h in AN.normalize_hits(doc.get("hits") or [])]
+    if hit_labels and not any(not ours for _, ours in hit_labels):
+        hit_labels = []
+    focus = doc.get("focus")
+    focus_t = (float(focus[0]), float(focus[1])) \
+        if isinstance(focus, (list, tuple)) and len(focus) == 2 else None
+    return gt, hit_labels, focus_t
+
+
 @router.post("/optimize")
 def optimize(pid: str, mid: str, payload: dict = Body(default={})) -> dict:
     """Evaluate the current segmentation against the annotation and search for the parameter set with the highest F1.
 
-    Reads only the stored analysis signals; it does not re-run AI. In the return value, ``best`` is
-    the parameters to write back and ``results`` are the top results on the grid, for the frontend
-    to display.
+    Runs as a background ``optimize`` job with live progress; the response only carries
+    ``{"job_id"}`` — the result (``best`` parameters, top grid rows, ``suggest``) is delivered in
+    the job's ``done`` event / job listing. Input validation (missing analysis / labels, bad base
+    params) stays synchronous and keeps its 400 semantics; a second optimize for media already
+    being optimized is rejected with 409.
     """
     proj = _load(pid)
     m = _media(proj, mid)
@@ -344,54 +399,73 @@ def optimize(pid: str, mid: str, payload: dict = Body(default={})) -> dict:
     if res is None or res.status != "done":
         raise HTTPException(400, tr("annotation.no_analysis"))
 
-    doc = AN.load_annotation(AN.annotation_path(m))
-    gt = [(float(r["start"]), float(r["end"])) for r in AN.normalize_rallies(doc.get("rallies") or [])]
+    gt, _hit_labels, _focus_t = _read_optimize_labels(m)
     if not gt:
         raise HTTPException(400, tr("annotation.no_labels"))
 
-    hit_labels = [(float(h["t"]), bool(h.get("ours", True)))
-                  for h in AN.normalize_hits(doc.get("hits") or [])]
-    # Hit-level stages are only meaningful when the user has actually marked at least one
-    # neighboring-court sound; labels that are all "ours" would simply reward keeping every hit.
-    if hit_labels and not any(not ours for _, ours in hit_labels):
-        hit_labels = []
-
-    focus = doc.get("focus")
-    if isinstance(focus, (list, tuple)) and len(focus) == 2:
-        focus_t = (float(focus[0]), float(focus[1]))
-    else:
-        focus_t = None
-
-    # Hit-level labels unlock two extra calibration stages: the attribution gate threshold and the
-    # audio detection sensitivity. The latter needs the cached WAV (cheap STFT done once) so we can
-    # re-threshold over a sensitivity grid without re-running any video AI.
-    sensitivity_fn = None
-    if hit_labels:
-        try:
-            from ..analysis import audio_hits as AH
-            from ..core import media as _M
-
-            _M.ensure_audio(m)
-            if m.audio_path:
-                env = AH.build_hit_envelope(m.audio_path)
-                if env is not None:
-                    sensitivity_fn = lambda s, _e=env: AH.pick_hits(_e, sensitivity=float(s))
-        except Exception:  # noqa: BLE001
-            sensitivity_fn = None
-
-    # Allow the frontend to pass "the parameters currently in use" as a base, so the optimization result matches what is on screen.
-    base = res.params
+    # Validate the optional "parameters currently in use" base up front (only known fields are
+    # applied, same as the old synchronous endpoint).
+    base_params = res.params
     for k, v in (payload.get("params") or {}).items():
-        if hasattr(base, k):
-            base = base.model_copy(update={k: v})
-    res = res.model_copy(update={"params": base})
+        if hasattr(base_params, k):
+            try:
+                base_params = base_params.model_copy(update={k: v})
+            except (TypeError, ValueError):
+                raise HTTPException(400, tr("annotation.bad_params", key=k)) from None
+    params_patch = {k: getattr(base_params, k) for k in (payload.get("params") or {})
+                    if hasattr(base_params, k)}
 
-    try:
-        result = AN.optimize(res, gt, focus=focus_t, hit_labels=hit_labels,
-                             sensitivity_fn=sensitivity_fn)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from None
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"{type(e).__name__}: {e}") from None
-    result["suggest"] = AN.suggest(gt)
-    return result
+    for j in JOBS.active():
+        if j.kind == "optimize" and j.media_id == mid:
+            logger.debug("optimize rejected 409: mid={} existing_job={}", mid, j.id)
+            raise HTTPException(409, tr("annotation.optimize_running"))
+
+    def work(job):  # noqa: ANN202 - Job worker closure
+        # Re-read everything inside the worker: annotation edits and re-analysis may have landed
+        # while the job was queued.
+        proj2 = _load(pid)
+        m2 = _media(proj2, mid)
+        res2 = proj2.analyses.get(mid)
+        if res2 is None or res2.status != "done":
+            raise RuntimeError(tr("annotation.no_analysis"))
+        gt2, hit_labels2, focus_t2 = _read_optimize_labels(m2)
+        if not gt2:
+            raise RuntimeError(tr("annotation.no_labels"))
+
+        # Hit-level sensitivity needs the cached WAV (cheap STFT done once) so the search can
+        # re-threshold over a sensitivity grid without re-running any video AI.
+        sensitivity_fn = None
+        if hit_labels2:
+            try:
+                from ..analysis import audio_hits as AH
+                from ..core import media as _M
+
+                _M.ensure_audio(m2)
+                if m2.audio_path:
+                    env = AH.build_hit_envelope(m2.audio_path)
+                    if env is not None:
+                        sensitivity_fn = lambda s, _e=env: AH.pick_hits(_e, sensitivity=float(s))
+            except Exception:  # noqa: BLE001
+                sensitivity_fn = None
+
+        res2 = res2.model_copy(update={"params": res2.params.model_copy(update=params_patch)})
+
+        def on_progress(p: float, stage: str) -> None:
+            # Stage boundaries double as cancellation checkpoints.
+            if job.cancelled():
+                raise AN.OptimizeCancelled(tr("job.cancelled"))
+            job.progress(p, stage=stage, message=tr(f"job.{stage}"))
+
+        logger.debug("optimize job {} start: mid={} gt={} hit_labels={}",
+                     job.id, mid, len(gt2), len(hit_labels2))
+        result = AN.optimize(res2, gt2, focus=focus_t2, hit_labels=hit_labels2,
+                             sensitivity_fn=sensitivity_fn, on_progress=on_progress)
+        result["suggest"] = AN.suggest(gt2)
+        logger.debug("optimize job {} done: tried={} best_f1={}",
+                     job.id, result.get("tried"),
+                     (result.get("best") or {}).get("f1"))
+        return result
+
+    job = JOBS.submit("optimize", tr("job.title.optimize", name=m.name), work,
+                      media_id=mid, lang=get_lang())
+    return {"job_id": job.id}

@@ -17,10 +17,18 @@ from .models import JobInfo, now_ms
 from ..i18n import get_lang, set_lang, tr, translate
 
 
+#: Job kinds whose finished result payload must survive :func:`public_info` / :meth:`prune`.
+#: Export results carry the output path; optimize results are the parameter-search report the
+#: annotation panel shows after the job finishes (including when the UI reconnects / reopens).
+#: cache_clear results are small per-target stats the cleanup dialog shows on completion.
+RESULT_KEEP_KINDS = ("export", "optimize", "cache_clear")
+
+
 def public_info(info: JobInfo) -> JobInfo:
-    """Job snapshot suitable for broadcasting/listing: export results are kept (the UI needs the
-    output path), every other kind has its (possibly multi-MB) analysis result stripped."""
-    if info.kind != "export" and info.result is not None:
+    """Job snapshot suitable for broadcasting/listing: export and optimize results are kept (the
+    UI needs the output path / parameter report), every other kind has its (possibly multi-MB)
+    analysis result stripped."""
+    if info.kind not in RESULT_KEEP_KINDS and info.result is not None:
         return info.model_copy(update={"result": None})
     return info
 
@@ -53,6 +61,8 @@ class Job:
         return self._cancel.is_set()
 
     def cancel(self) -> None:
+        logger.debug("job cancel requested: id={} kind={} media={}",
+                     self.info.id, self.info.kind, self.info.media_id)
         self._cancel.set()
         if self.info.status in ("queued", "running"):
             # Localize in the job's own language, not whatever thread happens to trigger the cancel.
@@ -161,6 +171,8 @@ class JobManager:
         job.on_update = self._broadcast
         with self._lock:
             self._jobs[job.id] = job
+        logger.debug("job submitted: id={} kind={} media={} title={!r}",
+                     job.id, kind, media_id, title)
         # In long sessions the job table grows without bound; each analysis job's result is the
         # full analysis result (possibly several MB), so completed jobs must be pruned regularly.
         self.prune()
@@ -220,10 +232,12 @@ class JobManager:
                 for j in items[: len(self._jobs) - keep]:
                     if j.info.status in ("done", "error", "cancelled"):
                         self._jobs.pop(j.id, None)
-            # Drop the heavy result from retained finished non-export jobs: the broadcast already
-            # strips it, so keeping it only bloats the table (and the default /api/jobs payload).
+            # Drop heavy results from retained finished jobs whose UI does not need them after
+            # completion: the broadcast already strips them, so keeping them only bloats the
+            # table (and the default /api/jobs payload). Export/optimize results are retained.
             for j in self._jobs.values():
-                if j.info.kind != "export" and j.info.status in ("done", "error", "cancelled"):
+                if j.info.kind not in RESULT_KEEP_KINDS \
+                        and j.info.status in ("done", "error", "cancelled"):
                     j.info.result = None
 
 
