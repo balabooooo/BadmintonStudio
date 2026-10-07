@@ -2,7 +2,7 @@ import { motion } from 'motion/react'
 import { useEffect, useMemo, useState } from 'react'
 import { FolderPlus, Film, Trash2, Clock, Sparkles, Search, Clapperboard, Copy } from 'lucide-react'
 import { api } from '../lib/api'
-import { humanDuration, relTime } from '../lib/format'
+import { bytes, humanDuration, relTime } from '../lib/format'
 import { Button, Card, Empty, Modal, Skeleton, Tooltip, useConfirm } from './ui'
 import ImportVideoButton from './ImportVideoButton'
 import { useStore } from '../store/useStore'
@@ -245,11 +245,22 @@ export default function LibraryPage() {
                             danger: true,
                           })
                           if (ok) {
-                            try {
-                              await deleteProject(p.id)
-                              toast({ kind: 'info', title: t('library.deleted') })
-                            } catch (err) {
-                              toast({ kind: 'error', title: t('library.deleteFailed'), detail: String(err) })
+                            const res = await deleteProject(p.id)
+                            // null means the request failed (the store already shows an error toast).
+                            if (res !== null) {
+                              const purged = res.purged
+                              const reclaimed = (purged?.freed ?? 0) > 0
+                              toast({
+                                kind: 'info',
+                                title: t('library.deleted'),
+                                detail: reclaimed && purged
+                                  ? t('library.purgeDetail', {
+                                      size: bytes(purged.freed),
+                                      uploads: purged.uploads_removed,
+                                      annos: purged.annotations_removed,
+                                    })
+                                  : undefined,
+                              })
                             }
                           }
                         }}

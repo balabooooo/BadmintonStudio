@@ -4,6 +4,18 @@ import './index.css'
 import App from './App'
 import { useStore } from './store/useStore'
 import { t } from './i18n'
+import { createLogger } from './lib/logger'
+
+const log = createLogger('global')
+
+// Capture failures that never reach a React boundary / fetch caller, so the in-memory debug log
+// (Settings → 导出调试日志) keeps a trace of what happened before the user filed the issue.
+window.addEventListener('error', (e) => {
+  log.error('uncaught error', { message: e.message, filename: e.filename, lineno: e.lineno, error: e.error })
+})
+window.addEventListener('unhandledrejection', (e) => {
+  log.error('unhandled promise rejection', { reason: e.reason })
+})
 
 declare global {
   interface Window {

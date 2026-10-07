@@ -1,5 +1,5 @@
 import { motion } from 'motion/react'
-import { Component, useEffect, type ReactNode } from 'react'
+import { Component, useEffect, type ErrorInfo, type ReactNode } from 'react'
 import {
   Film,
   FolderOpen,
@@ -26,6 +26,7 @@ import MediaPickerDialog from './components/MediaPickerDialog'
 import TourOverlay from './tour/TourOverlay'
 import { isFirstRun } from './tour/prefs'
 import { useTourStore } from './tour/tourStore'
+import { createLogger } from './lib/logger'
 
 function Logo() {
   const t = useT()
@@ -170,6 +171,13 @@ class ErrorBoundary extends Component<{ children: ReactNode; view: string }, { e
 
   componentDidUpdate(prev: { view: string }) {
     if (prev.view !== this.props.view && this.state.err) this.setState({ err: null })
+  }
+
+  componentDidCatch(err: Error, info: ErrorInfo) {
+    createLogger('error-boundary').error(`render error in view=${this.props.view}`, {
+      error: err,
+      componentStack: info.componentStack,
+    })
   }
 
   render() {

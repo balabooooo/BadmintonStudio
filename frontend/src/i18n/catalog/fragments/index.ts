@@ -6,6 +6,7 @@ import { FRAG as annotate } from './annotate'
 import { FRAG as player } from './player'
 import { FRAG as media } from './media'
 import { FRAG as tour } from './tour'
+import { FRAG as cache } from './cache'
 
 export const FRAGMENTS: [string, string, string][] = [
   ...analysis,
@@ -14,6 +15,7 @@ export const FRAGMENTS: [string, string, string][] = [
   ...player,
   ...media,
   ...tour,
+  ...cache,
 ]
 
 export function zhDict(): Record<string, string> {

@@ -11,14 +11,22 @@ import {
   AlertTriangle,
   Languages,
   Sparkles,
+  ScrollText,
+  Download,
+  Eraser,
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { bytes, cn } from '../lib/format'
+import { clearLogs, downloadLogs, getLogs } from '../lib/logger'
 import { Button, Card, Progress, SectionTitle, Segmented, Stat, useConfirm } from './ui'
+import CacheClearDialog from './CacheClearDialog'
 import { useStore } from '../store/useStore'
 import { useTourStore } from '../tour/tourStore'
 import { useT } from '../i18n/useT'
 import type { Lang } from '../i18n'
+
+/** Frontend ring-buffer capacity; must match RING_SIZE in lib/logger.ts. */
+const FRONTEND_LOG_CAPACITY = 1500
 
 export default function SettingsPage() {
   const env = useStore((s) => s.env)
@@ -28,6 +36,10 @@ export default function SettingsPage() {
   const confirm = useConfirm()
   const t = useT()
   const [cache, setCache] = useState<{ cache: number; proxies: number; thumbs: number; exports: number } | null>(null)
+  const [cacheDialogOpen, setCacheDialogOpen] = useState(false)
+  // Buffered frontend log count; initialized lazily on mount and refreshed after export/clear.
+  const [logCount, setLogCount] = useState(() => getLogs().length)
+  const refreshLogCount = useCallback(() => setLogCount(getLogs().length), [])
 
   const loadCache = useCallback(async () => {
     try {
@@ -169,29 +181,11 @@ export default function SettingsPage() {
             </div>
           </Card>
 
-          <Card className="p-5 md:col-span-2">
+          <Card data-tour="settings-clear-cache" className="p-5 md:col-span-2">
             <SectionTitle
               right={
                 <div className="flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      const ok = await confirm({
-                        title: t('settings.clearCacheTitle'),
-                        desc: t('settings.clearCacheDesc'),
-                        danger: true,
-                      })
-                      if (!ok) return
-                      try {
-                        const r = await api.clearCache('all')
-                        toast({ kind: 'success', title: t('settings.cacheFreed', { size: bytes(r.freed) }) })
-                        void loadCache()
-                      } catch (e) {
-                        toast({ kind: 'error', title: t('settings.clearCacheFailed'), detail: String(e) })
-                      }
-                    }}
-                  >
+                  <Button variant="outline" size="sm" onClick={() => setCacheDialogOpen(true)}>
                     <Trash2 size={13} />
                     {t('settings.clearCache')}
                   </Button>
@@ -253,8 +247,78 @@ export default function SettingsPage() {
               ))}
             </div>
           </Card>
+
+          <Card data-tour="settings-debug-logs" className="p-5 md:col-span-2">
+            <SectionTitle
+              right={
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const n = getLogs().length
+                      if (n === 0 || !downloadLogs()) {
+                        toast({ kind: 'info', title: t('settings.debugLogsEmpty') })
+                        return
+                      }
+                      toast({ kind: 'success', title: t('settings.debugLogsExported', { count: n }) })
+                    }}
+                  >
+                    <Download size={13} />
+                    {t('settings.exportFrontendLogs')}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={async () => {
+                      const ok = await confirm({
+                        title: t('settings.clearFrontendLogs'),
+                        desc: t('settings.frontendLogsHint', { max: FRONTEND_LOG_CAPACITY, count: logCount }),
+                      })
+                      if (!ok) return
+                      clearLogs()
+                      refreshLogCount()
+                      toast({ kind: 'info', title: t('settings.debugLogsCleared') })
+                    }}
+                  >
+                    <Eraser size={13} />
+                    {t('settings.clearFrontendLogs')}
+                  </Button>
+                </div>
+              }
+            >
+              <ScrollText size={13} /> {t('settings.debugLogs')}
+            </SectionTitle>
+            <div className="space-y-2 text-[12.5px]">
+              <p className="text-ink-300">{t('settings.debugLogsDesc')}</p>
+              <p className="text-ink-400">
+                {t('settings.frontendLogsHint', { max: FRONTEND_LOG_CAPACITY, count: logCount })}
+              </p>
+              <p className="text-[11.5px] text-ink-500">{t('settings.backendLogsHint')}</p>
+              <div className="flex items-center gap-3">
+                <code className="mono min-w-0 flex-1 truncate rounded-md bg-black/25 px-2 py-1 text-[11px] text-ink-300">
+                  {env?.logs_dir ? `${env.logs_dir}\\bms_debug_YYYY-MM-DD.log` : '-'}
+                </code>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if (env?.logs_dir) navigator.clipboard.writeText(env.logs_dir)
+                    toast({ kind: 'info', title: t('common.copied') })
+                  }}
+                >
+                  {t('common.copy')}
+                </Button>
+              </div>
+            </div>
+          </Card>
         </div>
       </div>
+      <CacheClearDialog
+        open={cacheDialogOpen}
+        onClose={() => setCacheDialogOpen(false)}
+        onCleared={() => void loadCache()}
+      />
     </div>
   )
 }
