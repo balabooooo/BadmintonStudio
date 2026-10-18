@@ -1447,15 +1447,32 @@ def _select_active_players_windowed(
     # the near side would throw away every far-side window pick, which is exactly the bug we fix.
     size_floor = max(g_min, g_ref * 0.45) if g_ref > 0 else 0.0
     floor_by_track: dict[int, float] = {}
-    if size_floor > 0:
-        full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
-        for band in (_depth_bands(full, aspect) or []):
+    # The band partition is computed once and consumed by both the floor and the final cap.
+    # The cap's redundancy test is band-aware: a near-side box at second t does NOT replace
+    # a far-side player's box at second t, so "covered" must be tracked per depth band.
+    band_of_track: dict[int, int] = {}
+    full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
+    all_bands = _depth_bands(full, aspect)
+    if all_bands:
+        for bi, band in enumerate(all_bands):
             bstat = _band_size_stats(band, aspect)
-            if bstat["ref"] <= 0:
-                continue
-            bfloor = max(bstat["min_abs"], bstat["ref"] * 0.45)
+            if size_floor > 0 and bstat["ref"] > 0:
+                bfloor = max(bstat["min_abs"], bstat["ref"] * 0.45)
+                for t in band:
+                    floor_by_track[t.track_id] = bfloor
             for t in band:
-                floor_by_track[t.track_id] = bfloor
+                band_of_track[t.track_id] = bi
+
+    def _band_of(t: PlayerTrack) -> int:
+        """Depth band of a track; unmapped (sub-min_frames fallback) tracks go to the nearest band."""
+        b = band_of_track.get(t.track_id)
+        if b is not None:
+            return b
+        if not all_bands:
+            return 0
+        small_max = max(_track_median_size(t2, aspect) for t2 in all_bands[0])
+        large_min = min(_track_median_size(t2, aspect) for t2 in all_bands[1])
+        return 1 if _track_median_size(t, aspect) >= 0.5 * (small_max + large_min) else 0
 
     n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S)
                                / _ACTIVE_WINDOW_STEP_S))) + 1
@@ -1499,17 +1516,21 @@ def _select_active_players_windowed(
         # was a short fragment that lost the length sort to long tracks elsewhere in an
         # 82-minute multi-game video. With the greedy rule a short track covering otherwise
         # uncovered seconds is always admitted before any redundant duplicate.
+        # The redundancy test is BAND-AWARE: coverage is tracked per depth band, because a
+        # near-side box at second t cannot stand in for the far-side player's box at second t
+        # (measured on clip1: window 0 correctly picked far-side fragments 86/123, and the
+        # time-only metric still dropped them as "redundant" against near-side tracks).
         kept = [t for t in out if t.track_id in base_ids]
         rest = [t for t in out if t.track_id not in base_ids]
         frame_sets = {t.track_id: set(t.frames) for t in rest}
-        covered: set[int] = set()
+        covered_by_band: dict[int, set[int]] = {}
         for t in kept:
-            covered.update(t.frames)
+            covered_by_band.setdefault(_band_of(t), set()).update(t.frames)
         rest.sort(key=lambda t: (-t.n, t.track_id))
         while len(kept) < _ACTIVE_MAX_TRACKS and rest:
             best_i, best_gain = 0, -1
             for i, t in enumerate(rest):
-                gain = len(frame_sets[t.track_id] - covered)
+                gain = len(frame_sets[t.track_id] - covered_by_band.get(_band_of(t), set()))
                 if gain > best_gain:
                     best_i, best_gain = i, gain
             if best_gain <= 0:
@@ -1517,7 +1538,7 @@ def _select_active_players_windowed(
             t = rest.pop(best_i)
             frame_sets.pop(t.track_id, None)
             kept.append(t)
-            covered.update(t.frames)
+            covered_by_band.setdefault(_band_of(t), set()).update(t.frames)
         out = sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
     return out
 

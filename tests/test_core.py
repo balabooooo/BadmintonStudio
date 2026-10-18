@@ -664,6 +664,67 @@ def test_select_active_players_windowed_cap_keeps_unique_coverage() -> None:
         PL._ACTIVE_MAX_TRACKS = orig_cap
 
 
+def test_cap_band_aware_coverage_keeps_far_short_tracks() -> None:
+    """The cap's redundancy test must be depth-band-aware: a far-side short track whose TIME
+    is already covered by kept near-side tracks is NOT redundant — a near-side box at
+    second t does not replace the far-side player's box at second t.
+
+    Regression for clip1's 229 s cliff: windows 0-1 picked far-side fragments (86/123),
+    but the time-only coverage metric scored them as redundant against near-side tracks
+    and the cap silently dropped them, erasing the far player from the first ~4 minutes
+    even though the windowed picks were correct.
+    """
+    print("\n球员选人：截断冗余判定按纵深带（回归）")
+    fps = 12.0
+    orig_pick = PL._select_active_players
+    orig_cap = PL._ACTIVE_MAX_TRACKS
+
+    def make(tid: int, t0: float, span_s: float, h: float) -> PL.PlayerTrack:
+        n = int(span_s * fps)
+        tr = PL.PlayerTrack(
+            track_id=tid,
+            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+            times=[t0 + i / fps for i in range(n)],
+            boxes=[(0.45 - 0.25 * h, 0.5 - 0.5 * h, 0.45 + 0.25 * h, 0.5 + 0.5 * h)] * n,
+            speeds=[0.05] * n,
+            confidences=[0.9] * n,
+        )
+        tr.mean_area = tr.max_area = 0.5 * h * h
+        tr.mean_speed, tr.max_speed = 0.05, 0.10
+        tr.total_travel = 0.05 * n
+        return tr
+
+    # Four near-side "baseline" tracks; two long near-side duplicates of the early span
+    # (redundant in BOTH time and band); one far-side short track whose time falls inside
+    # the early near-side span — redundant in time, unique in its own depth band.
+    near_base = [make(101, 0.0, 200.0, 0.21), make(102, 0.0, 200.0, 0.21),
+                 make(103, 1000.0, 200.0, 0.21), make(104, 1000.0, 200.0, 0.21)]
+    near_dup = [make(105, 0.0, 200.0, 0.21), make(106, 0.0, 200.0, 0.21)]
+    far_short = make(9, 10.0, 20.0, 0.09)
+    all_tracks = near_base + near_dup + [far_short]
+
+    try:
+        PL._ACTIVE_MAX_TRACKS = 6
+
+        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
+                      boxes=None, aspect=1.7778, size_filter=None):
+            if duration > 500.0:
+                return near_base
+            return list(tracks)
+
+        PL._select_active_players = fake_pick
+        out = PL._select_active_players_windowed(all_tracks, fps, 1500.0, viewpoint="rear",
+                                                  aspect=1.7778)
+        ids = sorted(t.track_id for t in out)
+        check("截断后数量不超过上限", len(out) <= 6, str(ids))
+        check("全片基准轨迹始终保留", {101, 102, 103, 104} <= set(ids), str(ids))
+        check("远侧短轨不被近侧的时间覆盖顶替", 9 in ids, str(ids))
+        check("时间冗余的近侧长轨让位", 105 not in ids and 106 not in ids, str(ids))
+    finally:
+        PL._select_active_players = orig_pick
+        PL._ACTIVE_MAX_TRACKS = orig_cap
+
+
 # ------------------------------------------------------------------ Manual calibration
 
 
@@ -3954,6 +4015,7 @@ def main() -> int:
     test_select_active_players_signature_end_to_end()
     test_select_active_players_depth_bands()
     test_select_active_players_windowed_cap_keeps_unique_coverage()
+    test_cap_band_aware_coverage_keeps_far_short_tracks()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()
