@@ -581,6 +581,13 @@ interface State {
   currentMedia: () => MediaInfo | null
   /** 当前素材的手动场地标定（从工程 ui 里读；没有则 null，表示让 AI 自动识别） */
   currentCourtPoly: () => [number, number][] | null
+  /**
+   * 「还没手动标定场地」的素材（默认看整个工程的素材，传 ids 则只看这些）。
+   *
+   * 手动标定是 AI 分析的硬前置条件：分析入口用它来判断能不能起任务、以及该提示
+   * 用户去补哪些素材的标定，所以判断口径必须和 `currentCourtPoly()` 完全一致。
+   */
+  uncalibratedMedia: (mediaIds?: string[]) => MediaInfo[]
   visibleRallies: () => RallyRef[]
 }
 
@@ -600,6 +607,21 @@ function filterRallies<T extends Rally>(rallies: T[], f: RallyFilter): T[] {
     }
     return true
   })
+}
+
+/**
+ * 读某块素材已保存的手动场地标定。
+ *
+ * 先找新键 `court_polys`；旧工程只有四角的 `court_quads` 继续生效。少于 4 个点不算
+ * 标定（四点是后端能算出「谁离相机更近」的下限，见 court_calib.MIN_POLY_POINTS）。
+ */
+function courtPolyFor(project: Project | null, mid: string | null): [number, number][] | null {
+  if (!project || !mid) return null
+  const ui = project.ui as Record<string, any> | undefined
+  const raw = ui?.court_polys ?? ui?.court_quads
+  const q = raw?.[mid]
+  if (Array.isArray(q) && q.length >= 4) return q as [number, number][]
+  return null
 }
 
 /**
@@ -1222,6 +1244,17 @@ export const useStore = create<State>((set, get) => ({
     // Guided tour: the real GPU pipeline must never run; the tour presents a
     // flagged mock result instead (see tour/mockAnalysis.ts).
     if (useTourStore.getState().active) return runMockAnalysis([mid])
+    // 手动场地标定是 AI 分析的硬前置条件：没标定的素材不许起分析任务。否则后端会退回
+    // 自动识别，而它恰恰是用户标定的原因（多球场 / 地胶异常 / 场地只占一角），
+    // 结果就是整轮分析建在错的场地上却看起来一切正常。
+    if (!get().currentCourtPoly()) {
+      get().toast({
+        kind: 'warn',
+        title: tr('toast.analysisNeedsCourt'),
+        detail: tr('toast.analysisNeedsCourtDetail'),
+      })
+      return
+    }
     try {
       const poly = get().currentCourtPoly()
       const { job_id } = await api.analyze(p.id, {
@@ -1248,6 +1281,17 @@ export const useStore = create<State>((set, get) => ({
       return
     }
     if (useTourStore.getState().active) return runMockAnalysis(ids)
+    // 批量分析同样受「先标定」约束：只要有一块素材没标，就整批不发（否则会出现
+    // 一部分素材结果可信、一部分静默退化的混合状态，比整批失败更难排查）。
+    const missing = get().uncalibratedMedia(ids)
+    if (missing.length) {
+      get().toast({
+        kind: 'warn',
+        title: tr('toast.analysisNeedsCourtBatch', { n: missing.length }),
+        detail: tr('toast.analysisNeedsCourtDetail'),
+      })
+      return
+    }
     try {
       const { job_ids } = await api.analyzeBatch(p.id, {
         media_ids: ids,
@@ -2333,12 +2377,13 @@ export const useStore = create<State>((set, get) => ({
   },
   currentCourtPoly() {
     const s = get()
-    const ui = s.project?.ui as Record<string, any> | undefined
-    // 先找新键；旧工程的 court_quads（只有四角）继续生效
-    const raw = ui?.court_polys ?? ui?.court_quads
-    const q = s.mediaId ? raw?.[s.mediaId] : null
-    if (Array.isArray(q) && q.length >= 4) return q as [number, number][]
-    return null
+    return courtPolyFor(s.project, s.mediaId)
+  },
+  uncalibratedMedia(mediaIds) {
+    const p = get().project
+    if (!p) return []
+    const wanted = mediaIds && mediaIds.length ? new Set(mediaIds) : null
+    return p.media.filter((m) => (!wanted || wanted.has(m.id)) && courtPolyFor(p, m.id) === null)
   },
   visibleRallies() {
     const s = get()

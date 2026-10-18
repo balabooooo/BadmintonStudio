@@ -13,6 +13,7 @@ export const FRAG: [string, string, string][] = [
   ['mediaPicker.notAnalyzed', '未分析', 'Not analyzed'],
   ['mediaPicker.previewHint', '悬停或按空格预览，回车切换', 'Hover or press Space to preview, Enter to switch'],
   ['mediaPicker.deleteBlockedAnalyzing', '分析中的素材不能删除', 'Media being analyzed cannot be deleted'],
+  ['mediaPicker.courtRequired', '选中的素材里有 {n} 个还没标定场地；AI 分析需要先标定', '{n} of the selected media have no court calibration; AI analysis requires it first'],
   ['mediaPicker.empty', '工程中还没有素材', 'No media in this project yet'],
   ['mediaPicker.alreadyCurrent', '该素材已是当前素材', 'This is already the current media'],
 ]

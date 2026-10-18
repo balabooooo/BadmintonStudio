@@ -9,6 +9,7 @@ import SizeFilterPanel from './SizeFilterPanel'
 import { WEIGHT_PRESETS_MAP, useStore } from '../store/useStore'
 import { useT } from '../i18n/useT'
 import { jobStageLabel } from '../i18n/domain'
+import { useTourStore } from '../tour/tourStore'
 
 const VIEWPOINTS: { value: AnalysisParams['viewpoint']; labelKey: string; hintKey: string }[] = [
   { value: 'auto', labelKey: 'analysis.viewpoint.auto', hintKey: 'analysis.viewpoint.autoHint' },
@@ -75,6 +76,10 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
   const refreshPresets = useStore((s) => s.refreshPresets)
   const applyPreset = useStore((s) => s.applyPreset)
   const deletePreset = useStore((s) => s.deletePreset)
+  const uncalibratedMedia = useStore((s) => s.uncalibratedMedia)
+  // 引导模式下主按钮被刻意放开（引导不真正跑 GPU，也就没有场地可标），
+  // 否则第 12b 步点不动、引导会卡住。
+  const tourActive = useTourStore((s) => s.active)
   const [advanced, setAdvanced] = useState(false)
   const [scope, setScope] = useState<'all' | 'current'>('all')
   const confirm = useConfirm()
@@ -115,6 +120,15 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
   )
   const mediaCount = project?.media.length ?? 0
 
+  // 手动标定场地是 AI 分析的硬前置条件：分析范围里只要还有没标定的素材，主按钮就
+  // 不能点。这里把「缺标定的素材」列出来，让用户知道具体要去补哪几块，而不是只看到
+  // 一个灰掉的按钮。
+  const missingCourt = useMemo(
+    () => uncalibratedMedia(scope === 'all' ? project?.media.map((m) => m.id) : media ? [media.id] : []),
+    [uncalibratedMedia, project, scope, media],
+  )
+  const courtBlocked = !tourActive && missingCourt.length > 0
+
   const done = analysis?.status === 'done'
 
   // 开启语音口令但一个短语都没填时，后端会因为 speech_phrases 为空而整段跳过，
@@ -148,7 +162,8 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
               variant="primary"
               data-tour="dlg-run"
               loading={!!activeJob}
-              disabled={!media || !!activeJob || speechInvalid || (scope === 'all' && mediaCount === 0)}
+              disabled={!media || !!activeJob || speechInvalid || courtBlocked || (scope === 'all' && mediaCount === 0)}
+              title={courtBlocked ? tr('analysis.courtRequired.title') : undefined}
               onClick={async () => {
                 if (speechInvalid) {
                   toast({ kind: 'warn', title: tr('analysis.speech.needPhrase') })
@@ -281,6 +296,38 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
           >
             {tr('mediaPicker.change')}
           </Button>
+        </div>
+      )}
+
+      {/* 前置依赖：没有手动标定场地的素材不能起分析（这是主按钮禁用的原因） */}
+      {courtBlocked && (
+        <div className="mb-4 rounded-xl border border-amber-glow/30 bg-amber-glow/[0.08] px-3.5 py-3">
+          <div className="flex items-center gap-1.5 text-[12px] font-medium text-amber-glow">
+            <Crosshair size={13} />
+            {tr('analysis.courtRequired.title')}
+          </div>
+          <div className="mt-1 text-[11px] leading-relaxed text-ink-400">
+            {tr('analysis.courtRequired.desc')}
+            {missingCourt
+              .slice(0, 3)
+              .map((m) => m.name)
+              .join('、')}
+            {missingCourt.length > 3 && tr('analysis.courtRequired.more', { n: missingCourt.length - 3 })}
+          </div>
+          <div className="mt-2">
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={() => {
+                // 先切到第一块缺标定的素材，再打开标定窗口——用户点一下就落在待办上
+                selectMedia(missingCourt[0].id)
+                openCourtEditor(true)
+              }}
+            >
+              <Crosshair size={13} />
+              {tr('analysis.courtRequired.action')}
+            </Button>
+          </div>
         </div>
       )}
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Check, Copy, Crosshair, Minus, Plus, RotateCcw, Spline, Wand2, X } from 'lucide-react'
+import { Check, Copy, Crosshair, Plus, RotateCcw, Wand2 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/format'
 import { Button, Modal, useConfirm } from './ui'
@@ -77,31 +77,14 @@ function insertMidpoint(q: Poly, i: number): { next: Poly; index: number } {
   return { next, index: i + 1 }
 }
 
-/** 每条边插一个中点：给弯边（鱼眼 / 全景）一次补足顶点，比逐条加省事。
- *
- * 加到点数上限就停（上限由后端定），保证存下去的一定是后端能吃的形状。
- */
-function subdivideAll(q: Poly): Poly {
-  const out: Poly = []
-  for (let i = 0; i < q.length; i++) {
-    const [x1, y1] = q[i]
-    const [x2, y2] = q[(i + 1) % q.length]
-    out.push([x1, y1])
-    const remainingOriginal = q.length - i - 1
-    if (out.length + remainingOriginal + 1 <= MAX_POINTS) {
-      out.push([(x1 + x2) / 2, (y1 + y2) / 2])
-    }
-  }
-  return out.slice(0, MAX_POINTS)
-}
-
 /**
  * 手动标定场地：在视频画面上拖点，把场地圈出来。
  *
  * 为什么需要它：自动标定靠「地面颜色 + 逐行分析」找场地，在大多数素材上够用，
  * 但多球场、地胶颜色异常、场地只占画面一角时它会失败（失败时会在分析结果里
- * 写明原因）。这种情况下让用户拖一次，比继续调算法有效得多，而且标定结果会
- * 跟着工程保存，下次分析直接复用。
+ * 写明原因）。这种情况下让用户拖一次，比继续调算法有效得多。而且标定结果是
+ * **AI 分析的前置条件**：没有手动标定的素材不允许起分析任务（前置校验在
+ * `store.runAnalysis` / `runAnalysisBatch`），所以标定不再只是「可选优化」。
  *
  * **为什么支持任意点数**：全景相机 / 鱼眼镜头拍出来的场地边界是弯的
  * （桶形畸变），四个角只能框出一个直线四边形 —— 要么切掉边角，要么把
@@ -109,9 +92,9 @@ function subdivideAll(q: Poly): Poly {
  * 所以这里可以：
  *
  * - 拖任意顶点（点上去直接拖）；
- * - 在边的中点上「+」加一个顶点（弯的地方多加点）；
- * - 选中顶点后按「−」删掉；
- * - 一键「每条边加中点」（`Spline`）——弯边素材最快的一步到位。
+ * - 在边的中点上按「+」加一个顶点（弯的地方多加点），双击空白处同样给最长的边加点。
+ *
+ * 顶部还带素材切换：标完一块直接切下一块，连续标完整个工程再开始分析。
  */
 export default function CourtEditor({ open, onClose }: { open: boolean; onClose: () => void }) {
   const tr = useT()
@@ -123,13 +106,13 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
   const savedPoly = useStore((s) => s.currentCourtPoly())
   const setCourtPoly = useStore((s) => s.setCourtPoly)
   const applyCalibrationTo = useStore((s) => s.applyCalibrationTo)
+  const selectMedia = useStore((s) => s.selectMedia)
   const toast = useStore((s) => s.toast)
   const confirm = useConfirm()
 
   const [poly, setPoly] = useState<Poly>(defaultQuad)
   const [baseline, setBaseline] = useState<Poly>(defaultQuad)
   const [drag, setDrag] = useState<number | null>(null)
-  const [selected, setSelected] = useState<number | null>(null)
   const [applyOpen, setApplyOpen] = useState(false)
   const [targets, setTargets] = useState<Set<string>>(new Set())
   const boxRef = useRef<HTMLDivElement>(null)
@@ -147,7 +130,10 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
     const p = pick()
     setPoly(p)
     setBaseline(p)
-  }, [open, savedPoly, analysis?.calibration?.polygon, analysis?.calibration?.quad])
+    // 依赖里必须带上 media.id：从一块没标过的素材切到另一块也没标过的素材时
+    // savedPoly 前后都是 null、依赖没变化，画布会留着上一块的改动，跟「切换即放弃
+    // 未保存改动」的确认提示自相矛盾（也会把 A 的标定静默留给 B）。
+  }, [open, media?.id, savedPoly, analysis?.calibration?.polygon, analysis?.calibration?.quad])
 
   // 与打开时的初始形状比较，判断有没有未保存的改动。
   const dirty = useMemo(() => JSON.stringify(poly) !== JSON.stringify(baseline), [poly, baseline])
@@ -166,15 +152,6 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
       if (!ok) return
     }
     setPoly(defaultQuad())
-    setSelected(null)
-  }
-
-  const clear = async () => {
-    const ok = await confirm({ title: tr('court.clearConfirmTitle'), desc: tr('court.clearConfirmDesc'), danger: true })
-    if (!ok) return
-    setCourtPoly(null)
-    toast({ kind: 'info', title: tr('court.cleared'), detail: tr('court.clearedDetail') })
-    onClose()
   }
 
   const posterUrl = useMemo(() => {
@@ -213,22 +190,8 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
       toast({ kind: 'warn', title: tr('court.maxPoints', { n: MAX_POINTS }), detail: tr('court.maxPointsDetail') })
       return
     }
-    const { next, index } = insertMidpoint(poly, edgeIndex)
+    const { next } = insertMidpoint(poly, edgeIndex)
     setPoly(next)
-    setSelected(index)
-  }
-
-  const removePoint = (index: number) => {
-    if (poly.length <= MIN_POINTS) {
-      toast({
-        kind: 'warn',
-        title: tr('court.minPoints', { n: MIN_POINTS }),
-        detail: tr('court.minPointsDetail'),
-      })
-      return
-    }
-    setPoly((q) => q.filter((_, i) => i !== index))
-    setSelected(null)
   }
 
   const save = () => {
@@ -260,6 +223,26 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
     (project?.ui as Record<string, any> | undefined)?.court_quads ||
     {}) as Record<string, unknown>
   const hasPoly = (mid: string) => Array.isArray(savedPolys[mid]) && (savedPolys[mid] as unknown[]).length >= MIN_POINTS
+
+  // ------------------------------------------------ 切换素材（连续标定）
+  // 标定按素材分开存，所以固定机位的若干片段要逐块标。这里直接在下拉里换素材，
+  // 不必退出窗口再进来；换过去的瞬间画布会用那块素材的已存标定（或 AI / 默认
+  // 梯形）重新初始化，因为上面的初始化 effect 依赖的就是按素材取的 savedPoly。
+  const mediaList = project?.media ?? []
+  const calibratedCount = mediaList.filter((m) => hasPoly(m.id)).length
+  const switchMedia = async (mid: string) => {
+    if (!mid || mid === media?.id) return
+    if (dirty) {
+      const ok = await confirm({
+        title: tr('court.switchDiscardTitle'),
+        desc: tr('court.switchDiscardDesc'),
+        danger: true,
+      })
+      if (!ok) return
+    }
+    selectMedia(mid)
+  }
+
   const sourceViewpoint = (() => {
     const v = analysis?.calibration?.viewpoint
     return v && v !== 'unknown' ? v : null
@@ -323,29 +306,6 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
               <RotateCcw size={13} /> {tr('court.reset')}
             </Button>
             <Button
-              variant="ghost"
-              disabled={poly.length >= MAX_POINTS}
-              onClick={() => {
-                const next = subdivideAll(poly)
-                setPoly(next)
-                setSelected(null)
-                toast({
-                  kind: 'info',
-                  title: tr('court.subdivideDone'),
-                  detail: tr('court.subdivideDoneDetail', { n: next.length }),
-                })
-              }}
-              title={tr('court.subdivideTooltip')}
-            >
-              <Spline size={13} /> {tr('court.subdivide')}
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => void clear()}
-            >
-              <X size={13} /> {tr('court.clear')}
-            </Button>
-            <Button
               variant={applyOpen ? 'outline' : 'ghost'}
               disabled={otherMedia.length === 0}
               onClick={() => setApplyOpen((v) => !v)}
@@ -354,13 +314,35 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
               <Copy size={13} /> {tr('court.applyOther')}
             </Button>
             <Button variant="primary" onClick={save} disabled={!valid}>
-              <Crosshair size={13} /> {tr('court.saveAndUse')}
+              <Crosshair size={13} /> {tr('court.save')}
             </Button>
           </div>
         </div>
       }
     >
+      {/* 素材切换：标定按素材存，标完一块直接切下一块 */}
+      {mediaList.length > 1 && (
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-[11px] text-ink-400">{tr('court.mediaLabel')}</span>
+          <select
+            className="field w-[260px]"
+            value={media?.id ?? ''}
+            onChange={(e) => void switchMedia(e.target.value)}
+          >
+            {mediaList.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <span className="text-[11px] text-ink-500">
+            {tr('court.mediaProgress', { n: calibratedCount, m: mediaList.length })}
+          </span>
+        </div>
+      )}
+
       <div className="mb-3 rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5 text-[11.5px] leading-relaxed text-ink-400">
+        <span className="text-court-300">{tr('court.infoPrereq')} </span>
         {tr('court.infoIntro')}
         <span className="text-court-300">{tr('court.infoPano')}</span>
         {tr('court.infoRest')}
@@ -461,18 +443,14 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
                 e.preventDefault()
                 e.stopPropagation()
                 setDrag(i)
-                setSelected(i)
               }}
               onDoubleClick={(e) => e.stopPropagation()}
-              onFocus={() => setSelected(i)}
               className={cn(
                 'absolute z-20 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 shadow-lg',
                 'h-6 w-6 cursor-grab active:cursor-grabbing',
                 drag === i
                   ? 'border-white bg-court-400'
-                  : selected === i
-                    ? 'border-white/80 bg-court-500/60'
-                    : 'border-court-300 bg-ink-900/85 hover:bg-court-500/40',
+                  : 'border-court-300 bg-ink-900/85 hover:bg-court-500/40',
               )}
               style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
               title={tr('court.vertexTooltip', { n: i + 1 })}
@@ -490,16 +468,6 @@ export default function CourtEditor({ open, onClose }: { open: boolean; onClose:
         <span className="inline-flex items-center gap-1.5">
           <Plus size={11} /> {tr('court.legendMidpoint')}
         </span>
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled={selected === null || poly.length <= MIN_POINTS}
-          onClick={() => selected !== null && removePoint(selected)}
-          title={tr('court.removePointTooltip')}
-        >
-          <Minus size={12} />
-          {selected === null ? tr('court.removePointDisabled') : tr('court.removePoint', { n: selected + 1 })}
-        </Button>
         <span className="text-ink-600">{tr('court.pointCount', { n: poly.length, max: MAX_POINTS })}</span>
       </div>
 

@@ -126,7 +126,7 @@ export const FRAG: [string, string, string][] = [
   ['studio.confirmRemoveSelectedDesc', '只从工程移除，不会删除磁盘上的原文件。', 'Only removes them from the project; the original files on disk won\'t be deleted.'],
   ['studio.courtCalibrated', '已手动标定球场范围，点击修改', 'Court area calibrated manually; click to edit'],
   ['studio.courtCalibratedShort', '已标定场地', 'Court calibrated'],
-  ['studio.courtCalibrateHint', '在画面上手动标出球场范围（AI 识别不准时用这个，标一次可一直复用）', 'Manually mark the court area on screen (use this when AI detection is off; mark once and reuse it)'],
+  ['studio.courtCalibrateHint', '在画面上手动标出球场范围；这是 AI 分析的前置步骤，未标定无法开始分析', 'Manually mark the court area on screen; this is a prerequisite for AI analysis — analysis cannot start until it is done'],
   ['studio.deselectAll', '取消全选', 'Deselect all'],
   ['studio.done', '完成', 'Done'],
   ['studio.dropVideoHere', '把视频拖到这里', 'Drag videos here'],

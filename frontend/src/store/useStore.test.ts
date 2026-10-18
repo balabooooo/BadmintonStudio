@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useStore, consumeMediaPick } from './useStore'
 import { api } from '../lib/api'
+import type { MediaInfo, Project } from '../lib/types'
 
 // Mock the api module so store actions never hit the network.
 vi.mock('../lib/api', () => ({
@@ -11,6 +12,8 @@ vi.mock('../lib/api', () => ({
     resegment: vi.fn().mockResolvedValue({}),
     rebuildHits: vi.fn().mockResolvedValue({}),
     autoCut: vi.fn().mockResolvedValue({}),
+    analyze: vi.fn().mockResolvedValue({ job_id: 'job-1' }),
+    analyzeBatch: vi.fn().mockResolvedValue({ job_ids: ['job-1'] }),
   },
 }))
 
@@ -135,5 +138,105 @@ describe('optimize job locks segmentation actions', () => {
     useStore.setState({ jobs: { a: optJob('done') } as never })
     await useStore.getState().resegment()
     expect(api.resegment).toHaveBeenCalledTimes(1)
+  })
+})
+
+/* ---------------------------------------------- manual court calibration gate */
+
+const COURT_POLY: [number, number][] = [
+  [0.1, 0.9],
+  [0.9, 0.9],
+  [0.7, 0.5],
+  [0.3, 0.5],
+]
+
+const courtMedia = (id: string): MediaInfo => ({
+  id,
+  path: `/v/${id}.mp4`,
+  name: id,
+  size: 1024,
+  duration: 60,
+  fps: 30,
+  width: 1920,
+  height: 1080,
+  rotation: 0,
+  vcodec: 'h264',
+  acodec: 'aac',
+  has_audio: true,
+  created_at: 0,
+  proxy_path: null,
+  proxy_fps: null,
+  proxy_width: null,
+  proxy_height: null,
+  audio_path: null,
+  poster: null,
+})
+
+function seedCourtProject(polys: Record<string, unknown>) {
+  const project: Project = {
+    id: 'p1',
+    name: 'court',
+    created_at: 0,
+    updated_at: 0,
+    media: [courtMedia('m1'), courtMedia('m2')],
+    analyses: {},
+    timeline: { tracks: [], duration: 60, fps: 30, width: 1920, height: 1080 },
+    ui: { court_polys: polys },
+    version: 1,
+  }
+  useStore.setState({ project, mediaId: 'm1', toasts: [], jobs: {}, busy: {}, lang: 'en' })
+}
+
+describe('manual court calibration gates analysis', () => {
+  const mockedAnalyze = vi.mocked(api.analyze)
+  const mockedAnalyzeBatch = vi.mocked(api.analyzeBatch)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('uncalibratedMedia lists every media without a saved polygon', () => {
+    seedCourtProject({ m1: COURT_POLY })
+    expect(useStore.getState().uncalibratedMedia().map((m) => m.id)).toEqual(['m2'])
+    expect(useStore.getState().uncalibratedMedia(['m1'])).toEqual([])
+    expect(useStore.getState().uncalibratedMedia(['m2']).map((m) => m.id)).toEqual(['m2'])
+  })
+
+  it('a polygon with fewer than four points does not count as calibrated', () => {
+    seedCourtProject({ m1: [[0.1, 0.9], [0.9, 0.9]] })
+    expect(useStore.getState().currentCourtPoly()).toBeNull()
+    expect(useStore.getState().uncalibratedMedia(['m1']).map((m) => m.id)).toEqual(['m1'])
+  })
+
+  it('runAnalysis refuses to start without a calibration and warns', async () => {
+    seedCourtProject({})
+    await useStore.getState().runAnalysis()
+    expect(mockedAnalyze).not.toHaveBeenCalled()
+    const toasts = useStore.getState().toasts
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0].kind).toBe('warn')
+    expect(toasts[0].title).toBe('Court calibration required first')
+  })
+
+  it('runAnalysis starts once the current media is calibrated', async () => {
+    seedCourtProject({ m1: COURT_POLY })
+    await useStore.getState().runAnalysis()
+    expect(mockedAnalyze).toHaveBeenCalledTimes(1)
+  })
+
+  it('runAnalysisBatch refuses the whole batch when any selected media is uncalibrated', async () => {
+    seedCourtProject({ m1: COURT_POLY })
+    await useStore.getState().runAnalysisBatch()
+    expect(mockedAnalyzeBatch).not.toHaveBeenCalled()
+    const toasts = useStore.getState().toasts
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0].kind).toBe('warn')
+    expect(toasts[0].title).toBe('1 media still have no court calibration')
+  })
+
+  it('runAnalysisBatch starts when every selected media is calibrated', async () => {
+    seedCourtProject({ m1: COURT_POLY, m2: COURT_POLY })
+    await useStore.getState().runAnalysisBatch()
+    expect(mockedAnalyzeBatch).toHaveBeenCalledTimes(1)
   })
 })

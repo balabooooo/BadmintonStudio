@@ -1,6 +1,6 @@
 /** i18n fragment: Player + Timeline. [key, 中文, English] */
 export const FRAG: [string, string, string][] = [
-  ['player.aiViewpointHint', 'AI 识别机位：{viewpoint}。识别不准的话点这里手动标一次', 'AI detects viewpoint: {viewpoint}. If it\'s inaccurate, click here to calibrate manually'],
+  ['player.aiViewpointHint', 'AI 识别机位：{viewpoint}。注意：未手动标定场地时无法开始 AI 分析', 'AI detects viewpoint: {viewpoint}. Note: AI analysis cannot start until the court is calibrated manually'],
   ['player.calibrateCourt', '标定场地', 'Calibrate court'],
   ['player.courtOverlayLabel', 'AI 识别场地 · {label}', 'AI court · {label}'],
   ['player.courtPointCount', '{n} 点', '{n} points'],
@@ -15,7 +15,7 @@ export const FRAG: [string, string, string][] = [
   ['player.loopOffHint', '循环播放当前回合', 'Loop current rally'],
   ['player.loopOnHint', '正在循环当前回合 · 点击关闭', 'Looping current rally · click to turn off'],
   ['player.loopingRally', '正在循环 回合 #{index}', 'Looping rally #{index}'],
-  ['player.manualCalibrateHint', '手动标出球场范围（AI 找不准时用这个）', 'Manually mark the court area (use this when AI can\'t find it)'],
+  ['player.manualCalibrateHint', '手动标出球场范围；这是 AI 分析的前置步骤，未标定无法开始分析', 'Manually mark the court area; this is a prerequisite for AI analysis — analysis cannot start without it'],
   ['player.manualCalibrated', '已手动标定场地（{n} 个点），点击可修改', 'Court manually calibrated ({n} points); click to edit'],
   ['player.manualCalibratedBadge', '手动标定 {n} 点', 'Manual calibration · {n} points'],
   ['player.modeSource', '源片', 'Source'],

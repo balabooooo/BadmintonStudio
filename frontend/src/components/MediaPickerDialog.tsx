@@ -134,6 +134,7 @@ export default function MediaPickerDialog() {
   const removeMedia = useStore((s) => s.removeMedia)
   const removeMediaBulk = useStore((s) => s.removeMediaBulk)
   const runAnalysisBatch = useStore((s) => s.runAnalysisBatch)
+  const uncalibratedMedia = useStore((s) => s.uncalibratedMedia)
   const jobs = useStore((s) => s.jobs)
   const confirm = useConfirm()
 
@@ -348,6 +349,10 @@ export default function MediaPickerDialog() {
   const toggleAll = () =>
     setChecked(allCheckableSelected ? new Set() : new Set(checkable.map((m) => m.id)))
 
+  // 手动标定是分析的前置条件：选中集合里只要还有未标定的素材，批量分析就按住
+  // （store 里也有一道同样的校验，这里只是把原因显示在按钮上）。
+  const checkedUncalibrated = uncalibratedMedia([...checked].filter((id) => !analyzeFor(id))).length
+
   const doBulkDelete = async () => {
     const ids = [...checked].filter((id) => !analyzeFor(id))
     if (!ids.length) return
@@ -519,7 +524,13 @@ export default function MediaPickerDialog() {
               {allCheckableSelected ? tr('studio.deselectAll') : tr('studio.selectAll')}
             </button>
             <div className="flex-1" />
-            <Button variant="primary" size="sm" disabled={!checked.size} onClick={() => void doBulkAnalyze()}>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!checked.size || checkedUncalibrated > 0}
+              title={checkedUncalibrated > 0 ? tr('mediaPicker.courtRequired', { n: checkedUncalibrated }) : undefined}
+              onClick={() => void doBulkAnalyze()}
+            >
               <Sparkles size={12} />
               {tr('studio.analyzeSelected')}
             </Button>

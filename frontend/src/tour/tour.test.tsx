@@ -766,11 +766,22 @@ describe('tour analysis interception', () => {
     resetTourStore()
   })
 
+  const COURT_POLY: [number, number][] = [
+    [0.16, 0.99],
+    [0.84, 0.99],
+    [0.62, 0.52],
+    [0.38, 0.52],
+  ]
+
   function seededProject() {
     const m1 = { ...makeMedia('m1', 'match'), duration: 48 }
     const m2 = { ...makeMedia('m2', 'rally'), duration: 16 }
     const project = makeProject()
     project.media = [m1, m2]
+    // Analysis now requires a manual court calibration first. Both media get one so
+    // the "outside the tour" case still reaches api.analyze (in-tour cases bypass the
+    // guard anyway).
+    project.ui = { court_polys: { m1: COURT_POLY, m2: COURT_POLY } }
     useStore.setState({ project, mediaId: 'm1' })
     return { m1, m2 }
   }
