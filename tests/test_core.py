@@ -725,6 +725,77 @@ def test_cap_band_aware_coverage_keeps_far_short_tracks() -> None:
         PL._ACTIVE_MAX_TRACKS = orig_cap
 
 
+def test_cap_uses_window_level_band_truth() -> None:
+    """The cap must bucket tracks by the band that PICKED them (window-level truth), not by
+    whole-video band statistics.
+
+    Measured on clip1: the full-video candidate spectrum (hundreds of spectator tracks at
+    0.036-0.095) drags the whole-video band split down to 0.095, which misclassifies real
+    far-side player fragments (h 0.102-0.105) into the NEAR band; their seconds are then
+    "replaced" by near-side coverage and the band-aware cap still drops them. Window-level
+    banding (no spectator crowd inside one 180 s window) classifies those same tracks as
+    far correctly -- so the pick stamps its band and the cap trusts the stamp.
+    """
+    print("\n球员选人：截断按选人时的带归属（窗口级真值）（回归）")
+    fps = 12.0
+    orig_pick = PL._select_active_players
+    orig_cap = PL._ACTIVE_MAX_TRACKS
+
+    def make(tid: int, t0: float, span_s: float, h: float) -> PL.PlayerTrack:
+        n = int(span_s * fps)
+        tr = PL.PlayerTrack(
+            track_id=tid,
+            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+            times=[t0 + i / fps for i in range(n)],
+            boxes=[(0.45 - 0.25 * h, 0.5 - 0.5 * h, 0.45 + 0.25 * h, 0.5 + 0.5 * h)] * n,
+            speeds=[0.05] * n,
+            confidences=[0.9] * n,
+        )
+        tr.mean_area = tr.max_area = 0.5 * h * h
+        tr.mean_speed, tr.max_speed = 0.05, 0.10
+        tr.total_travel = 0.05 * n
+        return tr
+
+    near_base = [make(101, 0.0, 200.0, 0.21), make(102, 0.0, 200.0, 0.21),
+                 make(103, 1000.0, 200.0, 0.21), make(104, 1000.0, 200.0, 0.21)]
+    near_dup = [make(105, 0.0, 200.0, 0.21), make(106, 0.0, 200.0, 0.21)]
+    far_short = make(9, 10.0, 20.0, 0.10)
+    # A spectator crowd far smaller than the real far player: its only role here is to
+    # drag the WHOLE-VIDEO band split below 0.10, misclassifying the far player as "near".
+    crowd = [make(200 + i, float(i), 10.0 / fps / 10 * 12, 0.04) for i in range(6)]
+    all_tracks = near_base + near_dup + [far_short] + crowd
+
+    try:
+        PL._ACTIVE_MAX_TRACKS = 6
+
+        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
+                      boxes=None, aspect=1.7778, size_filter=None):
+            if duration > 500.0:
+                for t in near_base:
+                    t.band_hint = 1
+                return near_base
+            # Window-level truth: the window's own banding classifies the far player (0.10)
+            # as far (band 0) because the spectator crowd is tiny/absent there.
+            for t in tracks:
+                t.band_hint = 0 if _sz(t, 1.7778) <= 0.13 else 1
+            return list(tracks)
+
+        def _sz(t, aspect):
+            return PL._track_median_size(t, aspect)
+
+        PL._select_active_players = fake_pick
+        out = PL._select_active_players_windowed(all_tracks, fps, 1500.0, viewpoint="rear",
+                                                  aspect=1.7778)
+        ids = sorted(t.track_id for t in out)
+        check("截断后数量不超过上限", len(out) <= 6, str(ids))
+        check("全片基准轨迹始终保留", {101, 102, 103, 104} <= set(ids), str(ids))
+        check("被全片分带误划为近侧的远侧短轨仍幸存", 9 in ids, str(ids))
+        check("时间冗余的近侧长轨让位", 105 not in ids and 106 not in ids, str(ids))
+    finally:
+        PL._select_active_players = orig_pick
+        PL._ACTIVE_MAX_TRACKS = orig_cap
+
+
 # ------------------------------------------------------------------ Manual calibration
 
 
@@ -4016,6 +4087,7 @@ def main() -> int:
     test_select_active_players_depth_bands()
     test_select_active_players_windowed_cap_keeps_unique_coverage()
     test_cap_band_aware_coverage_keeps_far_short_tracks()
+    test_cap_uses_window_level_band_truth()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()

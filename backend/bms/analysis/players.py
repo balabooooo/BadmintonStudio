@@ -131,7 +131,13 @@ class PlayerTrack:
     mean_speed: float = 0.0
     max_speed: float = 0.0
     active_score: float = 0.0   # Combined "activity" 0~1, used to pick out match players
-    total_travel: float = 0.0   # Normalized cumulative travel
+    total_travel: float = 0.0  # Normalized cumulative travel
+    #: Depth band (index into the picker's band list) that PICKED this track, stamped at
+    #: pick time. The windowed cap buckets coverage by this stamp: window-level banding
+    #: classifies players correctly, while whole-video band statistics can be skewed by a
+    #: spectator crowd (measured on clip1: full-video split at 0.095 misclassified real
+    #: far-side player fragments at 0.102-0.105 as "near"). -1 = not stamped (fallback).
+    band_hint: int = -1
 
     @property
     def n(self) -> int:
@@ -1185,16 +1191,22 @@ def _select_active_players(
     manual = size_filter is not None and size_filter.active
     bands = _depth_bands(cand, aspect) if (size is not None and not manual) else None
     if bands is None:
-        return _select_within_band(cand, fps, total_duration, max_players, viewpoint,
-                                   size, aspect, size_filter)
+        picked = _select_within_band(cand, fps, total_duration, max_players, viewpoint,
+                                     size, aspect, size_filter)
+        for t in picked:
+            t.band_hint = 0
+        return picked
 
     # Reserve at least one slot per band so a far-side player is not crowded out by the near side;
     # the floor keeps doubles (up to 4) selectable when there are two bands.
     per_band = max(1, int(np.ceil(max_players / len(bands))))
     out: list[PlayerTrack] = []
-    for band in bands:
-        out.extend(_select_within_band(band, fps, total_duration, per_band, viewpoint,
-                                       _band_size_stats(band, aspect), aspect, size_filter))
+    for bi, band in enumerate(bands):
+        picked = _select_within_band(band, fps, total_duration, per_band, viewpoint,
+                                     _band_size_stats(band, aspect), aspect, size_filter)
+        for t in picked:
+            t.band_hint = bi
+        out.extend(picked)
     # Scores are band-local and therefore not comparable across bands; this ordering only decides
     # the return order (downstream only reads the ids).
     out.sort(key=lambda t: t.active_score, reverse=True)
@@ -1520,17 +1532,26 @@ def _select_active_players_windowed(
         # near-side box at second t cannot stand in for the far-side player's box at second t
         # (measured on clip1: window 0 correctly picked far-side fragments 86/123, and the
         # time-only metric still dropped them as "redundant" against near-side tracks).
+        # The band key is the PICK-TIME stamp (``band_hint``): window-level banding puts a
+        # real far-side player in the far band, while whole-video band statistics can be
+        # skewed by a spectator crowd (measured: full-video split at 0.095 classified the
+        # 0.102-0.105 far-side fragments as "near", and the cap dropped them again).
+
+        def _cap_band(t: PlayerTrack) -> int:
+            b = t.band_hint
+            return b if b >= 0 else _band_of(t)
+
         kept = [t for t in out if t.track_id in base_ids]
         rest = [t for t in out if t.track_id not in base_ids]
         frame_sets = {t.track_id: set(t.frames) for t in rest}
         covered_by_band: dict[int, set[int]] = {}
         for t in kept:
-            covered_by_band.setdefault(_band_of(t), set()).update(t.frames)
+            covered_by_band.setdefault(_cap_band(t), set()).update(t.frames)
         rest.sort(key=lambda t: (-t.n, t.track_id))
         while len(kept) < _ACTIVE_MAX_TRACKS and rest:
             best_i, best_gain = 0, -1
             for i, t in enumerate(rest):
-                gain = len(frame_sets[t.track_id] - covered_by_band.get(_band_of(t), set()))
+                gain = len(frame_sets[t.track_id] - covered_by_band.get(_cap_band(t), set()))
                 if gain > best_gain:
                     best_i, best_gain = i, gain
             if best_gain <= 0:
@@ -1538,7 +1559,7 @@ def _select_active_players_windowed(
             t = rest.pop(best_i)
             frame_sets.pop(t.track_id, None)
             kept.append(t)
-            covered_by_band.setdefault(_band_of(t), set()).update(t.frames)
+            covered_by_band.setdefault(_cap_band(t), set()).update(t.frames)
         out = sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
     return out
 
