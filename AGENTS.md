@@ -65,6 +65,34 @@ signal and most gotchas; read the relevant section before changing `analysis/`.
 - **Stable codes, translated at display**: rally tags are canonical ASCII codes (`scoring.TAG_*`, e.g. `many_shots`), not localized strings. `scoring.migrate_tags()` maps legacy Chinese tags on project load. Export preset `id`s, job `stage`/`status`/`kind`, and viewpoint codes are likewise stable; only their display names are translated. `speech_phrases` tags are user data and pass through untranslated.
 - `tests/test_core.py::test_i18n_catalogs` asserts backend zh/en key-set parity, interpolation/fallback, and the tag-code behavior. Keep catalog key sets equal. The frontend equivalent is `frontend/src/i18n/catalog.test.ts`, which asserts fragment tuple structure, non-empty translations, and zh/en key-set parity across all `fragments/*.ts`.
 
+## Explaining algorithms to the user (teaching style)
+When the user asks to **explain how an algorithm, signal, or design works** (analysis/understanding
+requests, not code-change requests), answer as a teacher would — principle first, not an engineering
+dump. Structure: (1) start from the problem — which naive assumption/prior the design replaces and how
+it fails silently; (2) build up the core concepts (geometry, statistics, ML) together with their
+capability limits (what the tool can and cannot recover, and why); (3) present design decisions as
+trade-offs (asymmetric misclassification costs, decoupling of hard filtering from soft inference,
+"prefer unknown over a guessed measurement"); (4) trace how errors propagate through the pipeline
+(modules degrade silently, so a calibration/detection error surfaces as quietly degraded downstream
+quality); (5) close with transferable takeaways.
+
+You may **cite code along the way** — link files/functions/line ranges and name key constants — so the
+user can map each principle to its implementation, but code is supporting evidence: the narrative
+stays on principles (no code blocks or line-by-line walkthroughs unless asked). Prefer precise academic
+terms over internal jargon, answer in the user's language, and use diagrams when they genuinely aid
+understanding.
+
+**No abrupt concepts (defining context on first use).** In any explanation, report, or analysis you
+write, **every professional term, internal variable/constant name, and domain concept must be
+introduced with a one-sentence background before it is first used** — what it is, why it exists, and
+what role it plays here — so a reader never meets an undefined term. This applies to jargon-heavy
+deliverables (root-cause reports, optimization write-ups, design notes) as well as to spoken answers:
+either add a short glossary/notation section up front, or weave a defining clause into the first
+mention. A vague or telegraphic phrase that names a mechanism without defining it (e.g. "the far/near
+asymmetry disappears") is treated as incomplete and must be expanded into definition, cause, and
+concrete manifestation. Never assume the reader shares the author's implicit context.
+
+
 ## Guide Mode (interactive feature walkthrough)
 Guide Mode maintenance rule: whenever a feature module is added or modified, the Guide Mode
 documentation must be updated in lockstep so that the user-facing guidance stays consistent with
