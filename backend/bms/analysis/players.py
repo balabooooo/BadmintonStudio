@@ -92,6 +92,12 @@ TRACK_INTERP_MAX_GAP = 2.0
 #: Size filtering: histogram bin count and upper bound (box height in frame-height units; above 0.5 is basically a close-up)
 SIZE_HIST_BINS = 24
 SIZE_HIST_MAX = 0.50
+#: Depth banding: minimum ratio between the largest and smallest candidate track size for the scene to
+#: count as having a real depth spread. Below it the candidates are treated as a single band, so the size
+#: gate stays global and behaviour is identical to before. This is what makes same-size viewpoints
+#: (sideline / overhead, where both players are the same distance from the lens) a no-op: equal players
+#: never band. Under a rear camera the near half is ~2.5-3.5x the far half, far above this ratio.
+_BAND_MIN_SIZE_RATIO = 2.0
 #: Size filtering: upper bound on the number of samples sent with the statistics (the UI uses them to preview threshold drags in real time)
 SIZE_SAMPLE_MAX = 600
 #: Outward expansion of the court polygon ROI (normalized units; every edge gives way outward by this much).
@@ -1089,6 +1095,58 @@ def _track_median_size(track: PlayerTrack, aspect: float = 1.7778) -> float:
     return float(np.median(np.asarray(vals, dtype=np.float64)))
 
 
+def _depth_bands(cand: list[PlayerTrack], aspect: float) -> list[list[PlayerTrack]] | None:
+    """Partition candidates into depth bands by pixel size, or return ``None`` for a single band.
+
+    Under any fixed camera a player's pixel size is monotonic in distance from the lens
+    (size ~ 1/distance), so grouping tracks by size groups them by depth. This makes the split
+    viewpoint-agnostic: it does not assume the far side is "up" or "to one side" in the frame.
+
+    Bands only when the size spread reaches :data:`_BAND_MIN_SIZE_RATIO`, so a sideline clip whose
+    two players are the same distance from the lens stays a single band — which reproduces the old
+    global-threshold behaviour exactly and is why no ``side`` branch is needed anywhere.
+
+    Returns two groups (near = large boxes, far = small boxes) or ``None``.
+    """
+    sizes = [_track_median_size(t, aspect) for t in cand]
+    pos = [s for s in sizes if s > 0.0]
+    if len(pos) < 4:
+        return None
+    if max(pos) / max(min(pos), 1e-6) < _BAND_MIN_SIZE_RATIO:
+        return None
+    ordered = sorted(cand, key=lambda t: _track_median_size(t, aspect))
+    ss = [_track_median_size(t, aspect) for t in ordered]
+    # Split at the widest size gap (the natural near/far separation); fall back to the geometric
+    # midpoint of the size range when no single gap reaches the ratio.
+    split, best_gap = 0, 1.0
+    for i in range(1, len(ordered)):
+        gap = ss[i] / max(ss[i - 1], 1e-6)
+        if gap > best_gap:
+            best_gap, split = gap, i
+    if best_gap < _BAND_MIN_SIZE_RATIO:
+        thr = float(np.sqrt(max(ss[0], 1e-9) * max(ss[-1], 1e-9)))
+        split = int(np.searchsorted(ss, thr))
+    if split <= 0 or split >= len(ordered):
+        return None
+    return [ordered[:split], ordered[split:]]
+
+
+def _band_size_stats(band: list[PlayerTrack], aspect: float = 1.7778) -> dict[str, float]:
+    """Reference size for one depth band, with the same meaning as :func:`_box_size_stats`.
+
+    ``ref`` is the 90th percentile of the band's own track sizes, so a far band is judged against
+    far-side scale instead of the near side's — this is the whole point of banding (a global
+    ``min_abs`` of ~0.12 would still kill every far-side track).
+    """
+    hs = [s for s in (_track_median_size(t, aspect) for t in band) if s > 0.0]
+    if len(hs) < 2:
+        return {"ref": 0.0, "min_abs": 0.0, "max_abs": 1.0}
+    ref = float(np.percentile(np.asarray(hs, dtype=np.float64), 90))
+    if ref < 0.06:
+        return {"ref": 0.0, "min_abs": 0.0, "max_abs": 1.0}
+    return {"ref": ref, "min_abs": max(0.03, ref * 0.42), "max_abs": min(1.0, ref * 4.0)}
+
+
 def _select_active_players(
     tracks: list[PlayerTrack],
     fps: float,
@@ -1096,6 +1154,60 @@ def _select_active_players(
     max_players: int = 4,
     viewpoint: str = "unknown",
     boxes: list | None = None,
+    aspect: float = 1.7778,
+    size_filter: SizeFilter | None = None,
+) -> list[PlayerTrack]:
+    """Pick "the players currently in a match", splitting the scene by depth first.
+
+    A low rear camera makes the far half of the court roughly 2.5-3.5x smaller than the near half,
+    so a single global size gate calibrated on the near side silently drops every far-side player
+    (the "far/near asymmetry"). Here the candidates are first partitioned into depth bands by pixel
+    size (see :func:`_depth_bands`), and each band is then scored on its own terms by
+    :func:`_select_within_band` — its own size reference, its own speed/area references. This fixes
+    both the absolute size gate and the band-relative "moving" gate at once.
+
+    Under a flat-depth viewpoint (sideline / overhead, or any clip whose candidates show no size
+    spread) ``_depth_bands`` returns ``None`` and this delegates to a single whole-set pass, so the
+    behaviour is byte-for-byte the old one. A user-activated ``size_filter`` also forces a single
+    pass: an explicit manual threshold must not be second-guessed by automatic banding.
+    """
+    if not tracks:
+        return []
+    # Tracks that are too short (under about 0.4 seconds) are not candidates at all
+    min_frames = max(3, int(round(0.4 * fps)))
+    cand = [t for t in tracks if t.n >= min_frames]
+    if not cand:
+        cand = sorted(tracks, key=lambda t: t.n, reverse=True)[:2]
+    if not cand:
+        return []
+
+    size = _box_size_stats(boxes, aspect) if boxes else None
+    manual = size_filter is not None and size_filter.active
+    bands = _depth_bands(cand, aspect) if (size is not None and not manual) else None
+    if bands is None:
+        return _select_within_band(cand, fps, total_duration, max_players, viewpoint,
+                                   size, aspect, size_filter)
+
+    # Reserve at least one slot per band so a far-side player is not crowded out by the near side;
+    # the floor keeps doubles (up to 4) selectable when there are two bands.
+    per_band = max(1, int(np.ceil(max_players / len(bands))))
+    out: list[PlayerTrack] = []
+    for band in bands:
+        out.extend(_select_within_band(band, fps, total_duration, per_band, viewpoint,
+                                       _band_size_stats(band, aspect), aspect, size_filter))
+    # Scores are band-local and therefore not comparable across bands; this ordering only decides
+    # the return order (downstream only reads the ids).
+    out.sort(key=lambda t: t.active_score, reverse=True)
+    return out
+
+
+def _select_within_band(
+    cand: list[PlayerTrack],
+    fps: float,
+    total_duration: float,
+    max_players: int = 4,
+    viewpoint: str = "unknown",
+    size: dict[str, float] | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
 ) -> list[PlayerTrack]:
@@ -1127,9 +1239,11 @@ def _select_active_players(
     everyone else: in measured footage a real player's box height is about 0.16~0.22 (16%~22% of
     the frame height), while spectators and people on neighboring courts are only 0.02~0.06. With a
     weighted sum alone, a track with a "tiny box but always moving" (spectators walking, warm-ups on
-    a neighboring court) could squeeze into the top few on speed score. When ``boxes`` (per-frame
-    boxes) is given, a "typical player size" is computed — the median of the largest cluster of box
-    heights across all tracks — and tracks that are clearly too small are excluded outright.
+    a neighboring court) could squeeze into the top few on speed score. When ``size`` (per-band size
+    statistics, see :func:`_band_size_stats`) is given, a "typical player size" reference is used —
+    the 90th percentile of the track sizes in this band — and tracks that are clearly too small are
+    excluded outright. The reference is band-local on purpose: a far-side player must be judged
+    against the far side's scale, not against the near side's (which would kill them outright).
 
     **Camera dependent**: "largest box = closest to camera" only holds for a low rear/side camera.
     With a high camera or overhead shot, everyone is roughly the same size in the frame, and then
@@ -1143,25 +1257,14 @@ def _select_active_players(
     a fragment is included only when it clearly extends this player's time coverage (otherwise the
     player would "vanish" during some periods and downstream cropping would have nothing to follow).
     """
-    if not tracks:
-        return []
     top_view = viewpoint in ("overhead", "elevated")
     w_area, w_speed, w_dur = ((0.20, 0.65, 0.15) if top_view else (0.45, 0.40, 0.15))
-
-    # Tracks that are too short (under about 0.4 seconds) are not candidates at all
-    min_frames = max(3, int(round(0.4 * fps)))
-    cand = [t for t in tracks if t.n >= min_frames]
-    if not cand:
-        cand = sorted(tracks, key=lambda t: t.n, reverse=True)[:2]
-    if not cand:
-        return []
 
     feats: dict[int, _Feat] = {t.track_id: _track_feat(t, fps) for t in cand}
 
     # ---- Size hard threshold: exclude "too small to be a match player" early.
     # The reference size uses "the largest cluster of box heights among candidates" — match players
     # are the largest people in the frame, so this reference points at the real players' scale under any camera angle.
-    size = _box_size_stats(boxes, aspect) if boxes else None
     size_ref = float(size["ref"]) if size else 0.0
     if size_filter is not None and size_filter.active:
         # The user explicitly specified size filtering: it takes priority over the adaptive threshold
@@ -1315,9 +1418,10 @@ def _select_active_players_windowed(
 
     Approach: slice into windows of ``_ACTIVE_WINDOW_S`` (step half, so nothing is missed at the
     boundaries); each window ranks only the tracks that **overlap in time with that window**, then
-    the selected ids from all windows are unioned. The whole-video pass still runs: its ``size_ref``
-    is the global reference of "how big the largest person in the frame is", used as the final size
-    gate to keep a window from selecting distant spectators.
+    the selected ids from all windows are unioned. The whole-video pass still runs: its per-depth-band
+    reference scale ("how big the largest person is on this side of the court") is used as the final
+    size gate to keep a window from selecting distant spectators, while a legitimate far-side player is
+    judged against the far side's own scale rather than the near side's.
 
     When ``duration`` is shorter than one window, behavior is exactly the same as the old implementation.
     """
@@ -1338,8 +1442,20 @@ def _select_active_players_windowed(
     g_ref = float(gsize["ref"]) if gsize else 0.0
     g_min = float(gsize["min_abs"]) if gsize else 0.0
     # Tracks picked per window must also pass the same "big enough" gate: discard only when they are
-    # clearly smaller than the whole-video reference size (meaning distant spectators / people on a neighboring court).
+    # clearly smaller than their own depth band's reference scale (meaning distant spectators / people
+    # on a neighboring court). The floor is depth-aware on purpose: a flat global floor calibrated on
+    # the near side would throw away every far-side window pick, which is exactly the bug we fix.
     size_floor = max(g_min, g_ref * 0.45) if g_ref > 0 else 0.0
+    floor_by_track: dict[int, float] = {}
+    if size_floor > 0:
+        full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
+        for band in (_depth_bands(full, aspect) or []):
+            bstat = _band_size_stats(band, aspect)
+            if bstat["ref"] <= 0:
+                continue
+            bfloor = max(bstat["min_abs"], bstat["ref"] * 0.45)
+            for t in band:
+                floor_by_track[t.track_id] = bfloor
 
     n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S)
                                / _ACTIVE_WINDOW_STEP_S))) + 1
@@ -1368,15 +1484,41 @@ def _select_active_players_windowed(
         for t in picked:
             if t.track_id in chosen:
                 continue
-            if size_floor > 0 and _track_median_size(t, aspect) < size_floor:
+            floor = floor_by_track.get(t.track_id, size_floor)
+            if floor > 0 and _track_median_size(t, aspect) < floor:
                 continue
             chosen[t.track_id] = t
 
     out = sorted(chosen.values(), key=lambda t: (t.times[0] if t.n else 0.0))
     if len(out) > _ACTIVE_MAX_TRACKS:
-        # Too many means background false detections mixed in: prefer keeping the whole-video baseline + the longest-appearing ones
-        out = sorted(out, key=lambda t: (t.track_id not in base_ids, -t.n))
-        out = out[: _ACTIVE_MAX_TRACKS]
+        # Too many means background false detections mixed in. Keep the whole-video baseline
+        # first, then admit tracks by GREEDY NEW-TIME-COVERAGE instead of raw length: the old
+        # "longest first" rule silently erased short fragments that were the ONLY coverage of
+        # some time range -- measured on clip1, the far-side player's whole first 230 s
+        # vanished from ``frame_boxes`` this way, because every early far-side window pick
+        # was a short fragment that lost the length sort to long tracks elsewhere in an
+        # 82-minute multi-game video. With the greedy rule a short track covering otherwise
+        # uncovered seconds is always admitted before any redundant duplicate.
+        kept = [t for t in out if t.track_id in base_ids]
+        rest = [t for t in out if t.track_id not in base_ids]
+        frame_sets = {t.track_id: set(t.frames) for t in rest}
+        covered: set[int] = set()
+        for t in kept:
+            covered.update(t.frames)
+        rest.sort(key=lambda t: (-t.n, t.track_id))
+        while len(kept) < _ACTIVE_MAX_TRACKS and rest:
+            best_i, best_gain = 0, -1
+            for i, t in enumerate(rest):
+                gain = len(frame_sets[t.track_id] - covered)
+                if gain > best_gain:
+                    best_i, best_gain = i, gain
+            if best_gain <= 0:
+                break
+            t = rest.pop(best_i)
+            frame_sets.pop(t.track_id, None)
+            kept.append(t)
+            covered.update(t.frames)
+        out = sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
     return out
 
 

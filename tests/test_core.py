@@ -546,6 +546,124 @@ def test_select_active_players_signature_end_to_end() -> None:
     check("真实球员被选中", 1 in ids, str(ids))
 
 
+def test_select_active_players_depth_bands() -> None:
+    """Depth banding: a far-side player must survive the size gate, and equal-size scenes must not band.
+
+    Regression for the "far/near asymmetry": the picker used a single global size reference
+    calibrated on the near half, so every far-side track (roughly 2.5-3.5x smaller under a rear
+    camera) was silently dropped from ``frame_boxes`` -- detection and tracking were fine, only the
+    picker discarded them, which surfaced as "the far player has a raw detection box but no track".
+    Banding candidates by pixel size (monotonic in distance from the lens, hence viewpoint-agnostic)
+    lets the far half be scored on its own scale, while a sideline clip (both players the same
+    distance from the lens) keeps behaving exactly as before, i.e. never bands.
+    """
+    print("\n球员选人：按纵深分带（回归）")
+    fps, n = 12.0, 200
+
+    def make(tid: int, h: float, cx: float) -> PL.PlayerTrack:
+        tr = PL.PlayerTrack(
+            track_id=tid,
+            frames=list(range(n)),
+            times=[i / fps for i in range(n)],
+            boxes=[(cx - 0.25 * h, 0.5 - 0.5 * h, cx + 0.25 * h, 0.5 + 0.5 * h)] * n,
+            speeds=[0.05] * n,
+            confidences=[0.9] * n,
+        )
+        tr.mean_area = tr.max_area = 0.5 * h * h
+        tr.mean_speed, tr.max_speed = 0.05, 0.10
+        tr.total_travel = 0.05 * n
+        return tr
+
+    # A real clip always yields fragments, so each side contributes several tracks; banding needs a
+    # few candidates for the size split to be stable.
+    tracks = [
+        make(1, 0.220, 0.35), make(2, 0.210, 0.45), make(3, 0.215, 0.40),   # near side (large boxes)
+        make(4, 0.075, 0.70), make(5, 0.070, 0.60), make(6, 0.068, 0.65),   # far side (small boxes)
+    ]
+    boxes = [[(1, 0.30, 0.40, 0.40, 0.62), (4, 0.70, 0.47, 0.75, 0.545)]] * 60
+    st = PL._box_size_stats(boxes, 1.7778)
+    check("全局门限高于远侧尺寸（远侧会被全局门限误杀）",
+          max(st["min_abs"], st["ref"] * 0.42) > 0.075, str(st))
+
+    far_ids = {4, 5, 6}
+    picked = PL._select_active_players(tracks, fps, 200.0, viewpoint="rear",
+                                       boxes=boxes, aspect=1.7778)
+    ids = [t.track_id for t in picked]
+    check("远侧球员不再被尺寸门限误杀", any(i in far_ids for i in ids), str(ids))
+    check("近侧球员仍被选中", any(i in (1, 2, 3) for i in ids), str(ids))
+
+    # Flat-depth viewpoints must stay a no-op: equal sizes never reach the banding ratio.
+    same = [make(1, 0.180, 0.30), make(2, 0.190, 0.50), make(3, 0.185, 0.70), make(4, 0.180, 0.40)]
+    check("尺寸相同时不分带（侧视/俯视行为不变）", PL._depth_bands(same, 1.7778) is None)
+    check("候选过少时不分带", PL._depth_bands(tracks[:2], 1.7778) is None)
+
+    # An explicit user threshold must win: automatic banding is bypassed, so a manual min-height
+    # really excludes the far side instead of being second-guessed.
+    sf = PL.size_filter_from({"mode": "absolute", "min_height": 0.12})
+    ids2 = [t.track_id for t in PL._select_active_players(
+        tracks, fps, 200.0, viewpoint="rear", boxes=boxes, aspect=1.7778, size_filter=sf)]
+    check("手动尺寸筛选优先于自动分带", all(i not in far_ids for i in ids2), str(ids2))
+
+
+def test_select_active_players_windowed_cap_keeps_unique_coverage() -> None:
+    """The windowed cap must not drop a short track that is the only coverage of some time range.
+
+    Regression for the clip1 symptom "the far player is tracked again from ~229 s but the first
+    230 s still show nothing": with banding enabled, windows pick far-side fragments in every
+    window, but an 82-minute multi-game video yields more window picks than
+    ``_ACTIVE_MAX_TRACKS``. The old truncation kept the longest tracks, so short early
+    far-side fragments lost the length sort and their time ranges lost ALL active coverage.
+    The cap now admits tracks by greedy new-time-coverage, so a short track covering
+    otherwise-uncovered seconds survives while redundant duplicates are dropped first.
+    """
+    print("\n球员选人：截断不得丢弃独占时段的短轨迹（回归）")
+    fps = 12.0
+    orig_pick = PL._select_active_players
+    orig_cap = PL._ACTIVE_MAX_TRACKS
+
+    def make(tid: int, t0: float, span_s: float) -> PL.PlayerTrack:
+        n = int(span_s * fps)
+        tr = PL.PlayerTrack(
+            track_id=tid,
+            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+            times=[t0 + i / fps for i in range(n)],
+            boxes=[(0.4, 0.5, 0.6, 0.7)] * n,
+            speeds=[0.05] * n,
+            confidences=[0.9] * n,
+        )
+        return tr
+
+    # 8 long "near-side" tracks all covering the same late range, plus 1 short track uniquely
+    # covering the first 20 s (the early far-side fragment in the real failure).
+    long_tracks = [make(100 + i, 1000.0, 200.0) for i in range(8)]
+    short = make(9, 0.0, 20.0)
+    all_tracks = long_tracks + [short]
+
+    try:
+        PL._ACTIVE_MAX_TRACKS = 6
+
+        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
+                      boxes=None, aspect=1.7778, size_filter=None):
+            # Whole-video base pass: only the long tracks look "global".
+            if duration > 500.0:
+                return long_tracks[:4]
+            # Per-window passes: return everything that overlaps the window.
+            return list(tracks)
+
+        PL._select_active_players = fake_pick
+        out = PL._select_active_players_windowed(
+            all_tracks, fps, 1500.0, viewpoint="rear",
+        )
+        ids = sorted(t.track_id for t in out)
+        check("截断后数量不超过上限", len(out) <= 6, str(ids))
+        check("全片基准轨迹始终保留", {100, 101, 102, 103} <= set(ids), str(ids))
+        check("独占开头的短轨迹不再被截断丢弃", 9 in ids, str(ids))
+        check("冗余长轨迹让位给独占覆盖", len(ids) == 5, str(ids))
+    finally:
+        PL._select_active_players = orig_pick
+        PL._ACTIVE_MAX_TRACKS = orig_cap
+
+
 # ------------------------------------------------------------------ Manual calibration
 
 
@@ -3834,6 +3952,8 @@ def main() -> int:
     test_polygon_geometry()
     test_polygon_calibration()
     test_select_active_players_signature_end_to_end()
+    test_select_active_players_depth_bands()
+    test_select_active_players_windowed_cap_keeps_unique_coverage()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()
