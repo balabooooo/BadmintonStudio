@@ -643,7 +643,8 @@ def test_select_active_players_windowed_cap_keeps_unique_coverage() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None,
+                      roi_poly=None):
             # Whole-video base pass: only the long tracks look "global".
             if duration > 500.0:
                 return long_tracks[:4]
@@ -707,7 +708,8 @@ def test_cap_band_aware_coverage_keeps_far_short_tracks() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None,
+                      roi_poly=None):
             if duration > 500.0:
                 return near_base
             return list(tracks)
@@ -769,7 +771,8 @@ def test_cap_uses_window_level_band_truth() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None,
+                      roi_poly=None):
             if duration > 500.0:
                 for t in near_base:
                     t.band_hint = 1
@@ -800,14 +803,15 @@ def test_cap_uses_window_level_band_truth() -> None:
 
 
 def _mk_track(tid: int, t0: float, span_s: float, h: float, cx: float, *,
-              fps: float = 12.0, speed: float = 0.12, max_speed: float = 0.20) -> PL.PlayerTrack:
+              cy: float = 0.5, fps: float = 12.0,
+              speed: float = 0.12, max_speed: float = 0.20) -> PL.PlayerTrack:
     """Test utility for the mode-engine fixtures: constant box, constant speed profile."""
     n = max(1, int(span_s * fps))
     tr = PL.PlayerTrack(
         track_id=tid,
         frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
         times=[t0 + i / fps for i in range(n)],
-        boxes=[(cx - 0.25 * h, 0.5 - 0.5 * h, cx + 0.25 * h, 0.5 + 0.5 * h)] * n,
+        boxes=[(cx - 0.25 * h, cy - 0.5 * h, cx + 0.25 * h, cy + 0.5 * h)] * n,
         speeds=[speed] * n,
         confidences=[0.9] * n,
     )
@@ -934,10 +938,12 @@ def test_mode_engine_blip_no_switch() -> None:
     calls: list = []
 
     def recording(tracks_, fps_, duration_, max_players=4, viewpoint="unknown",
-                  boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
+                  boxes=None, aspect=1.7778, size_filter=None, strict_tier=None,
+                  roi_poly=None):
         calls.append((duration_, max_players))
         return orig_pick(tracks_, fps_, duration_, max_players=max_players, viewpoint=viewpoint,
-                         boxes=boxes, aspect=aspect, size_filter=size_filter, strict_tier=strict_tier)
+                         boxes=boxes, aspect=aspect, size_filter=size_filter,
+                         strict_tier=strict_tier, roi_poly=roi_poly)
 
     try:
         PL._select_active_players = recording
@@ -977,6 +983,121 @@ def test_singles_quota_keeps_same_person_fragments() -> None:
     check("远侧球员最好碎片入选", 2 in ids, str(sorted(ids)))
     check("同人第二碎片经分组扩展入选", 3 in ids, str(sorted(ids)))
     check("更弱的第三「人」不挤占名额", 4 not in ids, str(sorted(ids)))
+
+
+# ------------------------------------------------------------------ L2 spatial prior (court polygon)
+
+#: clip1-shaped court polygon (normalized): bottom edge at y=1.0 is the near baseline,
+#: the y=0.55-0.6 chain is the far baseline.
+_POLY = [(0.2, 1.0), (0.7, 1.0), (0.9, 0.6), (0.4, 0.55), (0.2, 0.6)]
+
+
+def test_spatial_hard_exclusion_never_enters() -> None:
+    """L2: a bench person whose foot never enters the court polygon and who barely moves is
+    excluded from the picker's candidates outright. The fixture is a slow band (everyone
+    speed 0.04), where the RELATIVE moving gate cannot tell player from bench — without the
+    polygon the bench person scores past the tier and gets picked; with the polygon they
+    are gone before scoring. Both directions are asserted."""
+    print("\n球员选人：L2 静止贴边硬剔除")
+    fps = 12.0
+    near = [_mk_track(1, 0.0, 360.0, 0.21, 0.35, cy=0.65),
+            _mk_track(2, 0.0, 360.0, 0.205, 0.65, cy=0.65)]
+    player = _mk_track(3, 0.0, 360.0, 0.08, 0.50, cy=0.76, speed=0.04, max_speed=0.06)
+    bench = _mk_track(4, 0.0, 360.0, 0.075, 0.60, cy=0.495, speed=0.04, max_speed=0.06)
+    tracks = near + [player, bench]
+    poly = np.asarray(_POLY, dtype=np.float64)
+    d_med_b, d_max_b = PL._track_court_depth(bench, poly)
+    d_med_p, d_max_p = PL._track_court_depth(player, poly)
+    check("候场者脚点钉在边界外(d_med<0)", d_med_b < -0.02, f"{d_med_b:.4f}")
+    check("候场者从未入场(d_max<0.08)", d_max_b < 0.08, f"{d_max_b:.4f}")
+    check("真球员脚点深入场内", d_med_p > 0.12, f"{d_med_p:.4f}")
+    frame = [(1, 0.2975, 0.545, 0.4025, 0.755), (2, 0.59875, 0.5475, 0.70125, 0.7525),
+             (3, 0.48, 0.72, 0.52, 0.80), (4, 0.58125, 0.4575, 0.61875, 0.5325)]
+    boxes = [frame] * int(360 * fps)
+    no_poly = PL._select_active_players(tracks, fps, 360.0, viewpoint="rear",
+                                        boxes=boxes, aspect=1.7778)
+    check("无多边形时相对 moving 门限放行候场者（对照）",
+          {t.track_id for t in no_poly} == {1, 2, 3, 4},
+          str(sorted(t.track_id for t in no_poly)))
+    with_poly = PL._select_active_players(tracks, fps, 360.0, viewpoint="rear",
+                                         boxes=boxes, aspect=1.7778, roi_poly=poly)
+    ids = {t.track_id for t in with_poly}
+    check("静止贴边且从不入场者被硬剔除", ids == {1, 2, 3}, str(sorted(ids)))
+
+
+def test_spatial_hard_exclusion_keeps_baseline_player() -> None:
+    """L2: a player who hugs the far baseline (foot median pressed ON the boundary line) but
+    DOES enter the court on some frames (d_max ~ 0.13) must NOT be hard-excluded — the d_max
+    clause is what separates real players from bench staff (measured clip1: real far player
+    reached 0.13, the bench person never exceeded 0.043). The fixture satisfies every OTHER
+    exclusion clause (static, long, d_med on the line), so only d_max can save it."""
+    print("\n球员选人：L2 贴底线但会入场的真球员保留")
+    fps = 12.0
+    near = [_mk_track(1, 0.0, 360.0, 0.21, 0.35, cy=0.65),
+            _mk_track(2, 0.0, 360.0, 0.205, 0.65, cy=0.65)]
+    hugger = _mk_track(3, 0.0, 360.0, 0.08, 0.60, cy=0.558, speed=0.04, max_speed=0.06)
+    # 90% of frames the foot rests on the baseline (d ~= +0.028); every 10th frame the
+    # player is deep inside the court (d ~= +0.129) — same cx, same box size.
+    n = len(hugger.boxes)
+    base_box = (0.58, 0.518, 0.62, 0.598)
+    deep_box = (0.58, 0.62, 0.62, 0.70)
+    hugger.boxes = [base_box] * n
+    for i in range(0, n, 10):
+        hugger.boxes[i] = deep_box
+    bench = _mk_track(4, 0.0, 360.0, 0.075, 0.30, cy=0.4925, speed=0.04, max_speed=0.06)
+    tracks = near + [hugger, bench]
+    poly = np.asarray(_POLY, dtype=np.float64)
+    d_med_h, d_max_h = PL._track_court_depth(hugger, poly)
+    d_med_b, d_max_b = PL._track_court_depth(bench, poly)
+    check("贴底线者脚点中值压在边界线上(0<d_med<=0.04)",
+          0.0 < d_med_h <= 0.04, f"{d_med_h:.4f}")
+    check("贴底线者曾深入场内(d_max>0.10)", d_max_h > 0.10, f"{d_max_h:.4f}")
+    check("候场者脚点在边界外且从不入场",
+          d_med_b < -0.02 and d_max_b < 0.08, f"{d_med_b:.4f}/{d_max_b:.4f}")
+    frame = [(1, 0.2975, 0.545, 0.4025, 0.755), (2, 0.59875, 0.5475, 0.70125, 0.7525),
+             (3, 0.58, 0.518, 0.62, 0.598), (4, 0.28125, 0.455, 0.31875, 0.53)]
+    boxes = [frame] * int(360 * fps)
+    no_poly = PL._select_active_players(tracks, fps, 360.0, viewpoint="rear",
+                                        boxes=boxes, aspect=1.7778)
+    check("无多边形时候场者凭相对门限入选（对照）",
+          {t.track_id for t in no_poly} == {1, 2, 3, 4},
+          str(sorted(t.track_id for t in no_poly)))
+    with_poly = PL._select_active_players(tracks, fps, 360.0, viewpoint="rear",
+                                         boxes=boxes, aspect=1.7778, roi_poly=poly)
+    ids = {t.track_id for t in with_poly}
+    check("贴底线但会入场者不被剔除(d_max 救回)", ids == {1, 2, 3}, str(sorted(ids)))
+
+
+def test_spatial_prior_skipped_without_poly() -> None:
+    """L2 off-switch: with roi_poly=None the spatial layer must vanish entirely — no hard
+    exclusion AND no boundary scoring prior. The flip fixture proves the prior part: two far
+    players equal in everything except court depth; with the polygon the deeper one wins the
+    singles-band quota via the +0.10 prior, without it the slightly longer-lasting
+    shallower one wins, exactly as under L1."""
+    print("\n球员选人：L2 无多边形时整层跳过")
+    fps = 12.0
+    near = [_mk_track(1, 0.0, 360.0, 0.21, 0.35, cy=0.65),
+            _mk_track(2, 0.0, 360.0, 0.205, 0.65, cy=0.65)]
+    deep = _mk_track(3, 0.0, 252.0, 0.08, 0.50, cy=0.76)          # shorter, stands deep
+    shallow = _mk_track(4, 0.0, 360.0, 0.08, 0.78, cy=0.565)      # longer, hugs the line
+    tracks = near + [deep, shallow]
+    poly = np.asarray(_POLY, dtype=np.float64)
+    d_med_d, _ = PL._track_court_depth(deep, poly)
+    d_med_s, d_max_s = PL._track_court_depth(shallow, poly)
+    check("deep 球员脚点深入场内", d_med_d > 0.15, f"{d_med_d:.4f}")
+    check("shallow 球员脚点贴近边界(0<d_med<=0.04)",
+          0.0 < d_med_s <= 0.04, f"{d_med_s:.4f}")
+    frame = [(1, 0.2975, 0.545, 0.4025, 0.755), (2, 0.59875, 0.5475, 0.70125, 0.7525),
+             (3, 0.48, 0.72, 0.52, 0.80), (4, 0.77, 0.565, 0.79, 0.605)]
+    boxes = [frame] * int(360 * fps)
+    with_poly = PL._select_active_players(tracks, fps, 360.0, max_players=2, viewpoint="rear",
+                                         boxes=boxes, aspect=1.7778, roi_poly=poly)
+    ids_w = {t.track_id for t in with_poly}
+    check("有先验时深入场内者优先入选", ids_w == {1, 3}, str(sorted(ids_w)))
+    no_poly = PL._select_active_players(tracks, fps, 360.0, max_players=2, viewpoint="rear",
+                                        boxes=boxes, aspect=1.7778)
+    ids_n = {t.track_id for t in no_poly}
+    check("无多边形时无先验（shallow 按时长胜出，行为同 L1）", ids_n == {1, 4}, str(sorted(ids_n)))
 
 
 # ------------------------------------------------------------------ Manual calibration
@@ -4276,6 +4397,9 @@ def main() -> int:
     test_mode_engine_doubles_plus_edge_static()
     test_mode_engine_blip_no_switch()
     test_singles_quota_keeps_same_person_fragments()
+    test_spatial_hard_exclusion_never_enters()
+    test_spatial_hard_exclusion_keeps_baseline_player()
+    test_spatial_prior_skipped_without_poly()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()

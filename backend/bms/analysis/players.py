@@ -108,6 +108,11 @@ SIZE_SAMPLE_MAX = 600
 #: mode-2 quotas, where competing for a second slot means "the player vanishes between
 #: fragments") without merging players from different eras.
 _SAME_PERSON_GAP_S = 30.0
+#: L2 spatial prior: weight of the band-normalized court-depth bonus in the picker's score.
+#: Small on purpose — it is a tie-breaker between otherwise comparable candidates ("stands
+#: inside the court" is evidence of being a match player), never a gate that overrides the
+#: size/motion criteria.
+_BOUNDARY_W = 0.10
 #: Outward expansion of the court polygon ROI (normalized units; every edge gives way outward by this much).
 #: Matches the old rectangular ROI expansion of 0.04. A player standing exactly on the boundary line must count as "in court":
 #: the cost of erring in one direction is asymmetric — keeping one extra person is just noise (size filtering and activity scoring come later),
@@ -1161,6 +1166,61 @@ def _band_size_stats(band: list[PlayerTrack], aspect: float = 1.7778) -> dict[st
     return {"ref": ref, "min_abs": max(0.03, ref * 0.42), "max_abs": min(1.0, ref * 4.0)}
 
 
+def _feet_signed_dists(feet: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Vectorized signed distance from every foot point to the polygon's nearest edge
+    (positive inside, negative outside) — the engine behind :func:`_foot_signed_dist`."""
+    p = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    pts = np.asarray(feet, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] == 0 or p.shape[0] < 3:
+        return np.zeros(pts.shape[0], dtype=np.float64)
+    best = np.full(pts.shape[0], np.inf)
+    n = p.shape[0]
+    for i in range(n):
+        a = p[i]
+        b = p[(i + 1) % n]
+        e = b - a
+        seg2 = max(float(e @ e), 1e-12)
+        t = np.clip(((pts - a) @ e) / seg2, 0.0, 1.0)
+        q = a[None, :] + t[:, None] * e[None, :]
+        best = np.minimum(best, np.hypot(pts[:, 0] - q[:, 0], pts[:, 1] - q[:, 1]))
+    inside = point_in_poly(pts.astype(np.float32), p.astype(np.float32))
+    return np.where(inside, best, -best)
+
+
+def _foot_signed_dist(foot: tuple[float, float], poly: np.ndarray) -> float:
+    """Signed distance from a foot point (box bottom-center, normalized coords) to the court
+    polygon's nearest edge: positive inside, negative outside.
+
+    This is L2's basic quantity — "how deep into the court is this person's footing". The
+    magnitude is the distance to the nearest edge SEGMENT (so corners behave correctly, not
+    the distance to the infinite edge line); the sign is a plain point-in-polygon test
+    (:func:`court_calib.point_in_poly` with margin 0 — :data:`ROI_POLY_MARGIN` is a threshold
+    applied TO this distance by the picker, not part of its definition).
+    """
+    return float(_feet_signed_dists(np.asarray([[float(foot[0]), float(foot[1])]],
+                                                dtype=np.float64), poly)[0])
+
+
+def _track_court_depth(track: PlayerTrack, poly: np.ndarray) -> tuple[float, float]:
+    """Track-level court depth: ``(d_med, d_max)`` of the per-observation foot signed
+    distances (box bottom-center vs the polygon).
+
+    ``d_med`` says where the person USUALLY stands; ``d_max`` is the deepest they ever got
+    in. A baseline-hugging real player has a small ``d_med`` but a real ``d_max`` (measured
+    on clip1: a real far player reached ~0.13 while the bench person outside the baseline
+    never exceeded 0.043) — the PAIR is what separates "player resting on the line" from
+    "bench staff who never enter the court".
+    """
+    if not track.boxes:
+        return (0.0, 0.0)
+    feet = np.asarray([[0.5 * (float(b[0]) + float(b[2])), float(b[3])] for b in track.boxes],
+                      dtype=np.float64)
+    if feet.shape[0] == 0:
+        return (0.0, 0.0)
+    ds = _feet_signed_dists(feet, poly)
+    return (float(np.median(ds)), float(ds.max()))
+
+
 def _select_active_players(
     tracks: list[PlayerTrack],
     fps: float,
@@ -1171,6 +1231,7 @@ def _select_active_players(
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
     strict_tier: float | None = None,
+    roi_poly: np.ndarray | list | None = None,
 ) -> list[PlayerTrack]:
     """Pick "the players currently in a match", splitting the scene by depth first.
 
@@ -1189,6 +1250,9 @@ def _select_active_players(
     ``strict_tier`` tightens :func:`_select_within_band`'s same-tier gate for "a second different
     person" (0.80 in singles mode vs the default 0.55), so under a mode-2 quota only a genuinely
     comparable second person is admitted; the windowed picker passes it per window.
+
+    ``roi_poly`` (normalized court polygon) enables the L2 spatial layer inside
+    :func:`_select_within_band`; without it the whole layer is skipped.
     """
     if not tracks:
         return []
@@ -1205,7 +1269,7 @@ def _select_active_players(
     bands = _depth_bands(cand, aspect) if (size is not None and not manual) else None
     if bands is None:
         picked = _select_within_band(cand, fps, total_duration, max_players, viewpoint,
-                                     size, aspect, size_filter, strict_tier)
+                                     size, aspect, size_filter, strict_tier, roi_poly)
         for t in picked:
             t.band_hint = 0
         return picked
@@ -1217,7 +1281,7 @@ def _select_active_players(
     for bi, band in enumerate(bands):
         picked = _select_within_band(band, fps, total_duration, per_band, viewpoint,
                                      _band_size_stats(band, aspect), aspect, size_filter,
-                                     strict_tier)
+                                     strict_tier, roi_poly)
         for t in picked:
             t.band_hint = bi
         out.extend(picked)
@@ -1237,6 +1301,7 @@ def _select_within_band(
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
     strict_tier: float | None = None,
+    roi_poly: np.ndarray | list | None = None,
 ) -> list[PlayerTrack]:
     """Pick out "the players currently in a match" and write each one's ``active_score``.
 
@@ -1289,6 +1354,12 @@ def _select_within_band(
     fragments — the extension only has to add appreciable NEW time coverage and pass the same
     moving gate. ``strict_tier`` tightens the same-tier gate for "a different person" beyond the
     first (0.80 in singles mode vs the default 0.55).
+
+    With a court polygon (``roi_poly``) the L2 spatial layer applies: candidates whose foot
+    never enters the polygon and who stand still for most of the window are hard-excluded
+    (bench staff; see :func:`_track_court_depth` for the measured separation), and survivors
+    get a small band-normalized "how deep inside the court do they usually stand" bonus
+    (:data:`_BOUNDARY_W`). Without a polygon the whole layer is skipped.
     """
     top_view = viewpoint in ("overhead", "elevated")
     w_area, w_speed, w_dur = ((0.20, 0.65, 0.15) if top_view else (0.45, 0.40, 0.15))
@@ -1317,6 +1388,40 @@ def _select_within_band(
                 cand = sized
                 feats = {t.track_id: _track_feat(t, fps) for t in cand}
 
+    # ---- L2 spatial prior (needs a court polygon; the whole layer is skipped without one).
+    depths: dict[int, tuple[float, float]] = {}
+    d_ref = 0.0
+    poly_arr = np.asarray(roi_poly, dtype=np.float64).reshape(-1, 2) \
+        if roi_poly is not None else None
+    if poly_arr is not None and poly_arr.shape[0] >= 3:
+        # Hard exclusion: "lives on the ROI edge and never really enters the court" — ALL
+        # clauses must hold together. d_med <= ROI_POLY_MARGIN: the foot's median position
+        # is pressed on/behind the boundary line; d_max < 2*ROI_POLY_MARGIN: the track never
+        # got meaningfully inside (measured clip1: bench person max 0.043 vs real
+        # baseline-hugging players 0.13 — comfortable separation); static_ratio >= 0.90 and
+        # duration >= 30% of the window: a LONG, still presence, not a player transiting the
+        # line mid-rally. The moving gate alone cannot catch this in a slow band, where the
+        # RELATIVE thresholds let a bench person through (the exclusion's whole purpose).
+        kept: list[PlayerTrack] = []
+        for t in cand:
+            dep = _track_court_depth(t, poly_arr)
+            depths[t.track_id] = dep
+            f = feats[t.track_id]
+            if (dep[0] <= ROI_POLY_MARGIN and dep[1] < 2.0 * ROI_POLY_MARGIN
+                    and f.static_ratio >= 0.90
+                    and f.duration >= 0.30 * max(total_duration, 1e-6)):
+                continue
+            kept.append(t)
+        if kept:
+            cand = kept
+        # Soft-prior reference: the band's own median d_med. A non-positive median means
+        # nobody in this band really stands inside the polygon, so the prior is meaningless
+        # and stays off ("prefer unknown over a guessed measurement").
+        meds = [depths[t.track_id][0] for t in cand if t.track_id in depths]
+        if meds:
+            m = float(np.median(np.asarray(meds, dtype=np.float64)))
+            d_ref = m if m > 0.0 else 0.0
+
     areas = np.asarray([feats[t.track_id].area_p90 for t in cand], dtype=np.float64)
     speeds = np.asarray([t.mean_speed for t in cand], dtype=np.float64)
     peaks = np.asarray([t.max_speed for t in cand], dtype=np.float64)
@@ -1341,11 +1446,18 @@ def _select_within_band(
         # With a high camera / overhead shot the court may naturally be off to one side of the frame, so being at the edge does not mean spectator
         edge = _clip01((abs(f.cx_mean - 0.5) - 0.42) / 0.08)             # pinned to the frame edge
         penalty_edge = 0.0 if top_view else 0.30 * edge
+        # L2 soft prior: prefer players who stand deeper inside the court, band-normalized
+        # (the far band compares against the far band — a far player is not punished for
+        # perspective). Deeper footing is evidence of "on court" vs "at the edge"; small
+        # weight by design (see :data:`_BOUNDARY_W`).
+        prior = (_BOUNDARY_W * _clip01(depths[t.track_id][0] / d_ref)
+                 if d_ref > 0.0 and t.track_id in depths else 0.0)
 
         score = (
             w_area * area_score
             + w_speed * speed_score
             + w_dur * duration_score
+            + prior
             - penalty_static
             - penalty_fixed
             - penalty_edge
@@ -1609,6 +1721,7 @@ def _select_active_players_windowed(
     boxes: list | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
+    roi_poly: np.ndarray | list | None = None,
 ) -> list[PlayerTrack]:
     """Pick match players **window by window in time**, then merge the results.
 
@@ -1646,7 +1759,7 @@ def _select_active_players_windowed(
     if duration <= _ACTIVE_WINDOW_S:
         return _select_active_players(tracks, fps, duration, max_players=max_players,
                                       viewpoint=viewpoint, boxes=boxes, aspect=aspect,
-                                      size_filter=size_filter)
+                                      size_filter=size_filter, roi_poly=roi_poly)
 
     gsize = _box_size_stats(boxes, aspect) if boxes else None
     g_ref = float(gsize["ref"]) if gsize else 0.0
@@ -1709,7 +1822,8 @@ def _select_active_players_windowed(
     base = _select_active_players(tracks, fps, duration, max_players=base_quota,
                                   viewpoint=viewpoint, boxes=boxes, aspect=aspect,
                                   size_filter=size_filter,
-                                  strict_tier=(0.80 if base_quota == 2 else None))
+                                  strict_tier=(0.80 if base_quota == 2 else None),
+                                  roi_poly=roi_poly)
     base_ids = {t.track_id for t in base}
 
     chosen: dict[int, PlayerTrack] = {t.track_id: t for t in base}
@@ -1733,7 +1847,8 @@ def _select_active_players_windowed(
                                             max_players=quota, viewpoint=viewpoint,
                                             boxes=sub_boxes, aspect=aspect,
                                             size_filter=size_filter,
-                                            strict_tier=(0.80 if quota == 2 else None))
+                                            strict_tier=(0.80 if quota == 2 else None),
+                                            roi_poly=roi_poly)
         except Exception:
             continue
         for t in picked:
@@ -2150,7 +2265,7 @@ def analyze_players(
     # at all (measured: frame_boxes is empty 58% of the time).
     active = _select_active_players_windowed(tracks, eff_fps, duration, viewpoint=viewpoint,
                                              boxes=det_frames, aspect=aspect,
-                                             size_filter=sf)
+                                             size_filter=sf, roi_poly=poly_arr)
     active_ids = [t.track_id for t in active]
 
     # ---- assemble the timeline (length = ceil(duration * sample_fps); index i corresponds to i/sample_fps) ----
