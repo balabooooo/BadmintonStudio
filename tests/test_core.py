@@ -643,7 +643,7 @@ def test_select_active_players_windowed_cap_keeps_unique_coverage() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
             # Whole-video base pass: only the long tracks look "global".
             if duration > 500.0:
                 return long_tracks[:4]
@@ -707,7 +707,7 @@ def test_cap_band_aware_coverage_keeps_far_short_tracks() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
             if duration > 500.0:
                 return near_base
             return list(tracks)
@@ -769,7 +769,7 @@ def test_cap_uses_window_level_band_truth() -> None:
         PL._ACTIVE_MAX_TRACKS = 6
 
         def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
+                      boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
             if duration > 500.0:
                 for t in near_base:
                     t.band_hint = 1
@@ -794,6 +794,189 @@ def test_cap_uses_window_level_band_truth() -> None:
     finally:
         PL._select_active_players = orig_pick
         PL._ACTIVE_MAX_TRACKS = orig_cap
+
+
+# ------------------------------------------------------------------ L1 mode engine (singles / doubles)
+
+
+def _mk_track(tid: int, t0: float, span_s: float, h: float, cx: float, *,
+              fps: float = 12.0, speed: float = 0.12, max_speed: float = 0.20) -> PL.PlayerTrack:
+    """Test utility for the mode-engine fixtures: constant box, constant speed profile."""
+    n = max(1, int(span_s * fps))
+    tr = PL.PlayerTrack(
+        track_id=tid,
+        frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+        times=[t0 + i / fps for i in range(n)],
+        boxes=[(cx - 0.25 * h, 0.5 - 0.5 * h, cx + 0.25 * h, 0.5 + 0.5 * h)] * n,
+        speeds=[speed] * n,
+        confidences=[0.9] * n,
+    )
+    tr.mean_area = tr.max_area = 0.5 * h * h
+    tr.mean_speed, tr.max_speed = speed, max_speed
+    tr.total_travel = speed * n
+    return tr
+
+
+def _window_band_map(tracks: list, fps: float = 12.0, aspect: float = 1.7778) -> dict:
+    """Test utility: the track -> depth-band map, built the way the windowed picker builds it
+    (no banding scene maps every candidate to the single virtual band 0)."""
+    cand = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))]
+    bands = PL._depth_bands(cand, aspect)
+    out: dict[int, int] = {}
+    if bands:
+        for bi, band in enumerate(bands):
+            for t in band:
+                out[t.track_id] = bi
+    else:
+        for t in cand:
+            out[t.track_id] = 0
+    return out
+
+
+def test_mode_engine_doubles_quota() -> None:
+    """L1 mode engine: a doubles fixture (2 near + 2 far, all moving) must resolve to mode 4
+    in every window and keep all four players selected. Before L1 there is no mode concept
+    at all, so the mode-sequence assertion fails on the missing helper."""
+    print("\n球员选人：模式引擎——双打配额")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 360.0, 0.21, 0.30),   # near side (large boxes)
+        _mk_track(2, 0.0, 360.0, 0.21, 0.70),
+        _mk_track(3, 0.0, 360.0, 0.08, 0.40),   # far side (small boxes)
+        _mk_track(4, 0.0, 360.0, 0.08, 0.60),
+    ]
+    bmap = _window_band_map(tracks, fps)
+    check("双打夹具分出两带", len(set(bmap.values())) == 2, str(sorted(set(bmap.values()))))
+    modes = PL._window_modes(tracks, fps, 360.0, bmap, 1.7778)
+    check("各窗模式均为双打(4)", modes == [4, 4, 4], str(modes))
+    frame = [(1, 0.26, 0.395, 0.34, 0.60), (2, 0.66, 0.395, 0.74, 0.60),
+             (3, 0.47, 0.46, 0.53, 0.54), (4, 0.57, 0.46, 0.63, 0.54)]
+    boxes = [frame] * int(360 * fps)
+    out = PL._select_active_players_windowed(tracks, fps, 360.0, viewpoint="rear",
+                                             boxes=boxes, aspect=1.7778)
+    ids = {t.track_id for t in out}
+    check("四名球员全部入选", ids == {1, 2, 3, 4}, str(sorted(ids)))
+
+
+def test_mode_engine_singles_rejects_waiter() -> None:
+    """L1: a singles fixture (1 near + 1 far real player, plus one static far-side bench
+    person) must resolve to mode 2 and the bench person must stay out. The real players are
+    fragmented (id switch mid-video) to prove their fragments share one person-slot under
+    the singles quota instead of competing for a second slot."""
+    print("\n球员选人：模式引擎——单打并拒绝候场人员")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 200.0, 0.21, 0.35), _mk_track(2, 220.0, 140.0, 0.21, 0.35),  # near, 1 person
+        _mk_track(3, 0.0, 200.0, 0.08, 0.55), _mk_track(4, 220.0, 140.0, 0.08, 0.55),  # far, 1 person
+        _mk_track(5, 0.0, 360.0, 0.075, 0.80, speed=0.01, max_speed=0.02),            # far-side bench person
+    ]
+    bmap = _window_band_map(tracks, fps)
+    check("夹具分出两带且候场者在远带",
+          len(set(bmap.values())) == 2 and bmap[5] == 0, str(bmap))
+    modes = PL._window_modes(tracks, fps, 360.0, bmap, 1.7778)
+    check("各窗模式均为单打(2)", modes == [2, 2, 2], str(modes))
+    frame = [(1, 0.31, 0.395, 0.39, 0.60), (3, 0.51, 0.46, 0.59, 0.54),
+             (5, 0.76, 0.4625, 0.84, 0.5375)]
+    boxes = [frame] * int(360 * fps)
+    out = PL._select_active_players_windowed(tracks, fps, 360.0, viewpoint="rear",
+                                             boxes=boxes, aspect=1.7778)
+    ids = {t.track_id for t in out}
+    check("两名真球员的碎片全部入选", ids == {1, 2, 3, 4}, str(sorted(ids)))
+    check("静止候场者被拒", 5 not in ids, str(sorted(ids)))
+
+
+def test_mode_engine_doubles_plus_edge_static() -> None:
+    """L1: doubles plus one static far-side hanger-on: mode stays 4, all four players stay
+    in and the static track stays out (the existing static/moving penalties suffice; the
+    L2 spatial layer is not needed for this)."""
+    print("\n球员选人：模式引擎——双打不受静止者干扰")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 360.0, 0.21, 0.30), _mk_track(2, 0.0, 360.0, 0.21, 0.70),
+        _mk_track(3, 0.0, 360.0, 0.08, 0.40), _mk_track(4, 0.0, 360.0, 0.08, 0.60),
+        _mk_track(5, 0.0, 360.0, 0.075, 0.85, speed=0.01, max_speed=0.02),
+    ]
+    bmap = _window_band_map(tracks, fps)
+    modes = PL._window_modes(tracks, fps, 360.0, bmap, 1.7778)
+    check("各窗模式保持双打(4)", modes == [4, 4, 4], str(modes))
+    frame = [(1, 0.26, 0.395, 0.34, 0.60), (2, 0.66, 0.395, 0.74, 0.60),
+             (3, 0.47, 0.46, 0.53, 0.54), (4, 0.57, 0.46, 0.63, 0.54),
+             (5, 0.81, 0.4625, 0.89, 0.5375)]
+    boxes = [frame] * int(360 * fps)
+    out = PL._select_active_players_windowed(tracks, fps, 360.0, viewpoint="rear",
+                                             boxes=boxes, aspect=1.7778)
+    ids = {t.track_id for t in out}
+    check("四名球员全部入选", ids == {1, 2, 3, 4}, str(sorted(ids)))
+    check("静止闲杂人员被拒", 5 not in ids, str(sorted(ids)))
+
+
+def test_mode_engine_blip_no_switch() -> None:
+    """L1: a one-window person dip (players briefly off court, e.g. picking up shuttles)
+    must not flip the mode: the 3-window median filter erases the blip and every window
+    keeps its doubles quota."""
+    print("\n球员选人：模式引擎——拣球假象不切换")
+    fps = 12.0
+    dur = 720.0
+    # Doubles (2 near + 2 far). One player per side stays on court throughout; the other
+    # near/far pair leaves during [400, 500) s -- a between-games pickup break.
+    tracks = [
+        _mk_track(1, 0.0, 660.0, 0.21, 0.30),                                    # near, continuous
+        _mk_track(2, 0.0, 400.0, 0.21, 0.60), _mk_track(3, 500.0, 160.0, 0.21, 0.60),
+        _mk_track(4, 0.0, 660.0, 0.08, 0.45),                                    # far, continuous
+        _mk_track(5, 0.0, 400.0, 0.08, 0.75), _mk_track(6, 500.0, 160.0, 0.08, 0.75),
+    ]
+    bmap = _window_band_map(tracks, fps)
+    check("拣球夹具分出两带", len(set(bmap.values())) == 2, str(sorted(set(bmap.values()))))
+    modes = PL._window_modes(tracks, fps, dur, bmap, 1.7778)
+    check("单窗人数骤降不切换模式（各窗仍为4）", modes == [4] * 7, str(modes))
+
+    orig_pick = PL._select_active_players
+    calls: list = []
+
+    def recording(tracks_, fps_, duration_, max_players=4, viewpoint="unknown",
+                  boxes=None, aspect=1.7778, size_filter=None, strict_tier=None):
+        calls.append((duration_, max_players))
+        return orig_pick(tracks_, fps_, duration_, max_players=max_players, viewpoint=viewpoint,
+                         boxes=boxes, aspect=aspect, size_filter=size_filter, strict_tier=strict_tier)
+
+    try:
+        PL._select_active_players = recording
+        frame = [(1, 0.26, 0.395, 0.34, 0.60), (2, 0.56, 0.395, 0.64, 0.60),
+                 (4, 0.42, 0.46, 0.48, 0.54), (5, 0.72, 0.46, 0.78, 0.54)]
+        boxes = [frame] * int(dur * fps)
+        out = PL._select_active_players_windowed(tracks, fps, dur, viewpoint="rear",
+                                                 boxes=boxes, aspect=1.7778)
+        ids = {t.track_id for t in out}
+        win_quotas = [mp for d, mp in calls if d < 500.0]
+        check("每个分窗调用的配额保持4（拣球窗不塌缩）",
+              len(win_quotas) == 7 and all(q == 4 for q in win_quotas), str(calls))
+        check("四名球员的全部碎片都有覆盖", ids == {1, 2, 3, 4, 5, 6}, str(sorted(ids)))
+    finally:
+        PL._select_active_players = orig_pick
+
+
+def test_singles_quota_keeps_same_person_fragments() -> None:
+    """Under a singles quota (per-band quota 1) a real player's serial fragments must share
+    that player's single person-slot via same-person group extension, not compete for a
+    second slot the quota would deny. This is the mode-2 counterpart of the clip1
+    failure: without it the far player would 'vanish' between two id-switch fragments
+    even though the mode engine correctly detects singles."""
+    print("\n球员选人：单打配额下同人碎片共享名额")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 360.0, 0.21, 0.35),                              # near player
+        _mk_track(2, 0.0, 12.0, 0.08, 0.60),                               # far player, best fragment
+        _mk_track(3, 27.0, 10.0, 0.08, 0.60),                              # far player, 15 s later
+        _mk_track(4, 100.0, 260.0, 0.078, 0.80, speed=0.05, max_speed=0.10),  # weaker far person
+    ]
+    boxes = [[(1, 0.31, 0.395, 0.39, 0.60), (2, 0.57, 0.46, 0.63, 0.54)]] * int(360 * fps)
+    picked = PL._select_active_players(tracks, fps, 360.0, max_players=2, viewpoint="rear",
+                                       boxes=boxes, aspect=1.7778)
+    ids = {t.track_id for t in picked}
+    check("近侧球员入选", 1 in ids, str(sorted(ids)))
+    check("远侧球员最好碎片入选", 2 in ids, str(sorted(ids)))
+    check("同人第二碎片经分组扩展入选", 3 in ids, str(sorted(ids)))
+    check("更弱的第三「人」不挤占名额", 4 not in ids, str(sorted(ids)))
 
 
 # ------------------------------------------------------------------ Manual calibration
@@ -4088,6 +4271,11 @@ def main() -> int:
     test_select_active_players_windowed_cap_keeps_unique_coverage()
     test_cap_band_aware_coverage_keeps_far_short_tracks()
     test_cap_uses_window_level_band_truth()
+    test_mode_engine_doubles_quota()
+    test_mode_engine_singles_rejects_waiter()
+    test_mode_engine_doubles_plus_edge_static()
+    test_mode_engine_blip_no_switch()
+    test_singles_quota_keeps_same_person_fragments()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()

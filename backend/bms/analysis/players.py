@@ -100,6 +100,14 @@ SIZE_HIST_MAX = 0.50
 _BAND_MIN_SIZE_RATIO = 2.0
 #: Size filtering: upper bound on the number of samples sent with the statistics (the UI uses them to preview threshold drags in real time)
 SIZE_SAMPLE_MAX = 600
+#: Same-person grouping: two tracks count as fragments of ONE player when they overlap in
+#: time, or sit no further apart than this gap (seconds). Occlusion/id-switch fragments of
+#: one player are seconds-to-tens-of-seconds apart (measured on clip1, the far player's
+#: serial fragments were ~15 s apart), while substitutions / next-game arrivals are minutes
+#: apart, so a small gap keeps one player's fragments inside one person-slot (crucial under
+#: mode-2 quotas, where competing for a second slot means "the player vanishes between
+#: fragments") without merging players from different eras.
+_SAME_PERSON_GAP_S = 30.0
 #: Outward expansion of the court polygon ROI (normalized units; every edge gives way outward by this much).
 #: Matches the old rectangular ROI expansion of 0.04. A player standing exactly on the boundary line must count as "in court":
 #: the cost of erring in one direction is asymmetric — keeping one extra person is just noise (size filtering and activity scoring come later),
@@ -1162,6 +1170,7 @@ def _select_active_players(
     boxes: list | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
+    strict_tier: float | None = None,
 ) -> list[PlayerTrack]:
     """Pick "the players currently in a match", splitting the scene by depth first.
 
@@ -1176,6 +1185,10 @@ def _select_active_players(
     spread) ``_depth_bands`` returns ``None`` and this delegates to a single whole-set pass, so the
     behaviour is byte-for-byte the old one. A user-activated ``size_filter`` also forces a single
     pass: an explicit manual threshold must not be second-guessed by automatic banding.
+
+    ``strict_tier`` tightens :func:`_select_within_band`'s same-tier gate for "a second different
+    person" (0.80 in singles mode vs the default 0.55), so under a mode-2 quota only a genuinely
+    comparable second person is admitted; the windowed picker passes it per window.
     """
     if not tracks:
         return []
@@ -1192,7 +1205,7 @@ def _select_active_players(
     bands = _depth_bands(cand, aspect) if (size is not None and not manual) else None
     if bands is None:
         picked = _select_within_band(cand, fps, total_duration, max_players, viewpoint,
-                                     size, aspect, size_filter)
+                                     size, aspect, size_filter, strict_tier)
         for t in picked:
             t.band_hint = 0
         return picked
@@ -1203,7 +1216,8 @@ def _select_active_players(
     out: list[PlayerTrack] = []
     for bi, band in enumerate(bands):
         picked = _select_within_band(band, fps, total_duration, per_band, viewpoint,
-                                     _band_size_stats(band, aspect), aspect, size_filter)
+                                     _band_size_stats(band, aspect), aspect, size_filter,
+                                     strict_tier)
         for t in picked:
             t.band_hint = bi
         out.extend(picked)
@@ -1222,6 +1236,7 @@ def _select_within_band(
     size: dict[str, float] | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
+    strict_tier: float | None = None,
 ) -> list[PlayerTrack]:
     """Pick out "the players currently in a match" and write each one's ``active_score``.
 
@@ -1268,6 +1283,12 @@ def _select_within_band(
     split into multiple tracks, they count as one person**, leaving the slot for another player;
     a fragment is included only when it clearly extends this player's time coverage (otherwise the
     player would "vanish" during some periods and downstream cropping would have nothing to follow).
+    The quota counts PERSONS (groups), never their fragments: a fragment of an already-picked
+    person is admitted by group extension without consuming a slot, so a singles-mode quota
+    (``max_players=2``, one slot per band) never starves a player between two id-switch
+    fragments — the extension only has to add appreciable NEW time coverage and pass the same
+    moving gate. ``strict_tier`` tightens the same-tier gate for "a different person" beyond the
+    first (0.80 in singles mode vs the default 0.55).
     """
     top_view = viewpoint in ("overhead", "elevated")
     w_area, w_speed, w_dur = ((0.20, 0.65, 0.15) if top_view else (0.45, 0.40, 0.15))
@@ -1349,50 +1370,72 @@ def _select_within_band(
     if best <= 1e-6:
         return ranked[:1]
 
-    def _same_player(a: PlayerTrack, b: PlayerTrack) -> bool:
-        """Whether two tracks are "the same player" (overlap in time + close in position/scale)."""
-        fa, fb = feats[a.track_id], feats[b.track_id]
-        overlap = min(a.times[-1], b.times[-1]) - max(a.times[0], b.times[0])
-        if overlap <= 0.0:
-            return False
+    tier = 0.55 if strict_tier is None else float(strict_tier)
+
+    def _same_player_group(t: PlayerTrack, g: dict[str, Any]) -> bool:
+        """Whether ``t`` is another fragment of the person represented by group ``g``.
+
+        Two kinds of time evidence tie fragments to one person: actual overlap, or a short
+        id-switch gap no larger than :data:`_SAME_PERSON_GAP_S` (occlusions re-id a player
+        within seconds; measured clip1 far-side fragments sit ~15 s apart, substitutions are
+        minutes apart). The gap is measured against the group's EXTENDED time range so
+        fragment chains (A1 -> A2 -> A3) stay one person. Position and scale must also
+        match (same court spot, same depth).
+        """
+        rep = g["rep"]
+        fa, fb = feats[t.track_id], feats[rep.track_id]
+        t0, t1 = t.times[0], t.times[-1]
+        if min(g["t1"], t1) - max(g["t0"], t0) <= 0.0:
+            if max(g["t0"], t0) - min(g["t1"], t1) > _SAME_PERSON_GAP_S:
+                return False
         if abs(fa.cx_mean - fb.cx_mean) > 0.08:
             return False
         return max(fa.area_p90, fb.area_p90) / max(1e-9, min(fa.area_p90, fb.area_p90)) <= 2.5
 
-    # "Player groups": the same player may be split into multiple tracks, but they still count as
-    # one person. A fragment is included only when it is mostly "new time coverage" (periods when
-    # this player was not tracked before) — so the player does not "vanish" during some period and
-    # downstream crop tracking does not lose them midway.
+    # "Player groups": the same player may be split into multiple tracks, but they still count
+    # as one person. A fragment is included only when it is mostly "new time coverage" (periods
+    # when this player was not tracked before) — so the player does not "vanish" during some
+    # period and downstream crop tracking does not lose them midway.
     EXTEND_MIN = 2.0
     groups: list[dict[str, Any]] = []
     picked: list[PlayerTrack] = []
     for t in ranked:
-        if len(picked) >= max_players:
-            break
         f = feats[t.track_id]
         t0, t1 = t.times[0], t.times[-1]
-        grp = next((g for g in groups if _same_player(t, g["rep"])), None)
+        grp = next((g for g in groups if _same_player_group(t, g)), None)
         if grp is not None:
+            # Same-person fragment: admitted by group EXTENSION, never by person quota —
+            # one player's fragments share their person's single slot instead of competing
+            # for a second one (which a mode-2 quota would deny, making the player
+            # "vanish" between fragments).
             gain = max(0.0, grp["t0"] - t0) + max(0.0, t1 - grp["t1"])
             span = max(1e-6, t1 - t0)
             # It must add appreciable time and also cover more than half of this track's own
-            # duration; otherwise it is just a duplicate fragment of the same player and should not
-            # take up a "player slot".
+            # duration; otherwise it is just a duplicate fragment of the same player and
+            # should not be counted at all.
             if gain < EXTEND_MIN or gain < 0.5 * span:
                 continue
+            # Moving + non-small box stays a necessary condition even for extensions.
+            moving = (t.mean_speed / speed_ref) >= 0.20 and (f.area_p90 / area_ref) >= 0.20
+            if not moving:
+                continue
+            picked.append(t)
+            grp["t0"] = min(grp["t0"], t0)
+            grp["t1"] = max(grp["t1"], t1)
+            continue
+        # A NEW person: the quota counts persons (groups), never their fragments.
+        if len(groups) >= max_players:
+            break
         # Moving + non-small box is a necessary condition for a "match player"
         moving = (t.mean_speed / speed_ref) >= 0.20 and (f.area_p90 / area_ref) >= 0.20
         if not moving:
             continue
-        # From the 2nd on: must be in the same tier as the 1st (0.55x or more) and the absolute score must not be too low
-        if picked and t.active_score < max(0.55 * best, 0.30):
+        # From the 2nd person on: must be in the same tier as the 1st and the absolute score
+        # must not be too low; singles-mode passes tighten the tier via ``strict_tier``.
+        if picked and t.active_score < max(tier * best, 0.30):
             break
         picked.append(t)
-        if grp is None:
-            groups.append({"rep": t, "t0": t0, "t1": t1})
-        else:
-            grp["t0"] = min(grp["t0"], t0)
-            grp["t1"] = max(grp["t1"], t1)
+        groups.append({"rep": t, "t0": t0, "t1": t1})
     return picked
 
 
@@ -1403,6 +1446,158 @@ _ACTIVE_WINDOW_S = 180.0
 _ACTIVE_WINDOW_STEP_S = 90.0
 #: Maximum number of tracks allowed to remain after per-window merging (safety valve to keep background false detections from blowing up frame_boxes).
 _ACTIVE_MAX_TRACKS = 64
+
+#: Mode engine: raw person counts are clamped to this range before filtering — below 2 a rally
+#: cannot be happening (counting noise), above 4 means duplicated tracks / bench staff leaked
+#: past the moving gate.
+_MODE_CLAMP = (2, 4)
+#: Mode engine: a filtered value must disagree with the current mode for this many consecutive
+#: windows before the mode switches (one deviating window is a pickup break, not a format change).
+_MODE_SWITCH_WINDOWS = 2
+#: Mode engine: after a switch the mode must dwell at least this long (seconds) before the next
+#: switch is allowed, so the sequence cannot oscillate at window rate.
+_MODE_MIN_DWELL_S = 180.0
+
+
+def _window_person_counts(
+    sub: list[PlayerTrack],
+    fps: float,
+    t0: float,
+    t1: float,
+    band_of_track: dict[int, int],
+) -> dict[int, float]:
+    """Per depth band: the median over the window's frames of "distinct moving tracks with a
+    box in this frame".
+
+    This is the mode engine's counting signal, deliberately fragment-immune: serial fragments
+    of one player never share a frame (when the tracker re-ids a player the old id is already
+    gone), and duplicated overlapping tracks shift only a minority of frames, which the
+    median absorbs. The moving gate (speed ratio >= 0.20 AND area ratio >= 0.20 against this
+    window's own per-band p90 references — the same formula :func:`_select_within_band` uses,
+    but computed independently for this window) keeps waiters and bench staff out of the
+    count, so the engine counts "persons on court", not "tracks in frame". Tracks missing
+    from ``band_of_track`` are sub-minimum-length noise and are never counted.
+
+    Returns ``{band: median_count}``; bands with no moving candidates are omitted.
+    """
+    if not sub or t1 <= t0:
+        return {}
+    feats = {t.track_id: _track_feat(t, fps) for t in sub}
+    by_band: dict[int, list[PlayerTrack]] = {}
+    for t in sub:
+        b = band_of_track.get(t.track_id)
+        if b is None:
+            continue
+        by_band.setdefault(b, []).append(t)
+    i0 = int(np.ceil(t0 * fps))
+    i1 = int(np.floor(t1 * fps))
+    if i1 < i0:
+        return {}
+    out: dict[int, float] = {}
+    for b, members in by_band.items():
+        speeds = np.asarray([t.mean_speed for t in members], dtype=np.float64)
+        areas = np.asarray([feats[t.track_id].area_p90 for t in members], dtype=np.float64)
+        speed_ref = max(_pct(speeds, 90), 1e-6)
+        area_ref = max(_pct(areas, 90), 1e-6)
+        moving = [t for t in members
+                  if (t.mean_speed / speed_ref) >= 0.20
+                  and (feats[t.track_id].area_p90 / area_ref) >= 0.20]
+        if not moving:
+            continue
+        counts = np.zeros(i1 - i0 + 1, dtype=np.int32)
+        for t in moving:
+            fs = np.asarray(t.frames, dtype=np.int64)
+            fs = fs[(fs >= i0) & (fs <= i1)]
+            counts[fs - i0] += 1
+        out[b] = float(np.median(counts))
+    return out
+
+
+def _window_modes(
+    tracks: list[PlayerTrack],
+    fps: float,
+    duration: float,
+    band_of_track: dict[int, int],
+    aspect: float = 1.7778,
+) -> list[int]:
+    """Per-window match mode (the picker's singles/doubles quota), one entry per window.
+
+    Decision chain, each step immunizing against one measured failure mode:
+
+    1. Per window, sum the per-band median on-court person counts (see
+       :func:`_window_person_counts`) and clamp to ``[_MODE_CLAMP]`` — a pickup break with
+       two people still on court must not read as "singles", and four is the ceiling anyway.
+    2. 3-window median filter (endpoint windows: mean of self and the single neighbour; empty
+       windows carry the nearest valid value first). Erases single-window dips: a 10-30 s
+       shuttle pickup inside a doubles match shows up as one low window.
+    3. Switch hysteresis: a deviating filtered value must persist
+       ``_MODE_SWITCH_WINDOWS`` consecutive windows to switch, and a fresh mode must dwell
+       ``_MODE_MIN_DWELL_S`` before the next switch — so mixed-format footage switches for
+       real, and oscillation is impossible.
+
+    ``aspect`` is accepted for interface stability (the L3 band-consolidation pass threads it
+    through); the count itself only needs ``band_of_track``.
+    """
+    n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S) / _ACTIVE_WINDOW_STEP_S))) + 1
+    raw: list[float | None] = []
+    for w in range(n_win):
+        t0 = w * _ACTIVE_WINDOW_STEP_S
+        t1 = min(duration, t0 + _ACTIVE_WINDOW_S)
+        if t1 - t0 < 8.0:
+            raw.append(None)  # mirror the picker loop: too-short tail windows are skipped
+            continue
+        sub = [t for t in tracks
+               if t.n > 0 and t.times[-1] >= t0 and t.times[0] <= t1]
+        counts = _window_person_counts(sub, fps, t0, t1, band_of_track) if sub else {}
+        if not counts:
+            raw.append(None)  # empty window: carry the nearest valid value
+            continue
+        total = sum(counts.values())
+        raw.append(min(max(total, _MODE_CLAMP[0]), _MODE_CLAMP[1]))
+    # Empty windows carry the nearest valid value (forward fill, then back-fill leading gaps).
+    filled: list[float] = []
+    last: float | None = None
+    for v in raw:
+        if v is None:
+            filled.append(last if last is not None else float("nan"))
+        else:
+            last = v
+            filled.append(v)
+    first_valid = next((v for v in filled if v == v), None)
+    if first_valid is None:
+        return [4] * n_win  # no evidence anywhere: stay permissive (old fixed-quota behaviour)
+    for w in range(n_win):
+        if filled[w] != filled[w]:
+            filled[w] = first_valid
+        else:
+            break
+    # 3-window median filter; endpoint windows use the mean of self and the single neighbour.
+    filtered: list[int] = []
+    for w in range(n_win):
+        vals = [filled[j] for j in (w - 1, w, w + 1) if 0 <= j < n_win]
+        if len(vals) >= 3:
+            filtered.append(int(np.median(vals)))
+        else:
+            filtered.append(int(np.floor(sum(vals) / len(vals) + 0.5)))
+    # Switch hysteresis.
+    modes: list[int] = []
+    cur = filtered[0]
+    last_switch = 0
+    pending: int | None = None
+    pending_len = 0
+    for w in range(n_win):
+        f = filtered[w]
+        if f != cur:
+            pending_len = pending_len + 1 if f == pending else 1
+            pending = f
+            dwell_ok = (w - last_switch) * _ACTIVE_WINDOW_STEP_S >= _MODE_MIN_DWELL_S
+            if pending_len >= _MODE_SWITCH_WINDOWS and dwell_ok:
+                cur, last_switch = f, w
+                pending, pending_len = None, 0
+        else:
+            pending, pending_len = None, 0
+        modes.append(cur)
+    return modes
 
 
 def _select_active_players_windowed(
@@ -1435,6 +1630,15 @@ def _select_active_players_windowed(
     size gate to keep a window from selecting distant spectators, while a legitimate far-side player is
     judged against the far side's own scale rather than the near side's.
 
+    The L1 mode engine makes the picker singles/doubles aware: each window's on-court person
+    count (per depth band, median over frames, moving-gated — see :func:`_window_modes`)
+    becomes that window's quota (2 in singles, 4 in doubles), and the whole-video baseline
+    uses the modal quota. A mode-2 window also tightens the "second different person"
+    same-tier gate (``strict_tier=0.80``), so a waiter cannot ride a weak 0.55-tier score
+    into the singles quota. One player's serial fragments share their person's slot via
+    same-person group extension (see :func:`_select_within_band`), so a mode-2 quota never
+    starves the far player between two id-switch fragments.
+
     When ``duration`` is shorter than one window, behavior is exactly the same as the old implementation.
     """
     if not tracks:
@@ -1443,12 +1647,6 @@ def _select_active_players_windowed(
         return _select_active_players(tracks, fps, duration, max_players=max_players,
                                       viewpoint=viewpoint, boxes=boxes, aspect=aspect,
                                       size_filter=size_filter)
-
-    # Whole-video pass: get the "reference size" and a set of baseline ids
-    base = _select_active_players(tracks, fps, duration, max_players=max_players,
-                                  viewpoint=viewpoint, boxes=boxes, aspect=aspect,
-                                  size_filter=size_filter)
-    base_ids = {t.track_id for t in base}
 
     gsize = _box_size_stats(boxes, aspect) if boxes else None
     g_ref = float(gsize["ref"]) if gsize else 0.0
@@ -1459,9 +1657,9 @@ def _select_active_players_windowed(
     # the near side would throw away every far-side window pick, which is exactly the bug we fix.
     size_floor = max(g_min, g_ref * 0.45) if g_ref > 0 else 0.0
     floor_by_track: dict[int, float] = {}
-    # The band partition is computed once and consumed by both the floor and the final cap.
-    # The cap's redundancy test is band-aware: a near-side box at second t does NOT replace
-    # a far-side player's box at second t, so "covered" must be tracked per depth band.
+    # The band partition is computed once and consumed by the floor, the mode engine and the
+    # final cap. The cap's redundancy test is band-aware: a near-side box at second t does NOT
+    # replace a far-side player's box at second t, so "covered" must be tracked per depth band.
     band_of_track: dict[int, int] = {}
     full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
     all_bands = _depth_bands(full, aspect)
@@ -1474,6 +1672,10 @@ def _select_active_players_windowed(
                     floor_by_track[t.track_id] = bfloor
             for t in band:
                 band_of_track[t.track_id] = bi
+    else:
+        # Flat-depth scene: one virtual band so the mode engine still counts persons.
+        for t in full:
+            band_of_track[t.track_id] = 0
 
     def _band_of(t: PlayerTrack) -> int:
         """Depth band of a track; unmapped (sub-min_frames fallback) tracks go to the nearest band."""
@@ -1488,6 +1690,28 @@ def _select_active_players_windowed(
 
     n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S)
                                / _ACTIVE_WINDOW_STEP_S))) + 1
+    # ---- L1 mode engine: per-window quota from the detected match mode.
+    modes = _window_modes(tracks, fps, duration, band_of_track, aspect)
+    mode_counts: dict[int, int] = {}
+    for m in modes:
+        mode_counts[m] = mode_counts.get(m, 0) + 1
+    if mode_counts:
+        top = max(mode_counts.values())
+        tied = [m for m, c in mode_counts.items() if c == top]
+        # Ties resolve toward 4: the baseline is insurance (a too-small baseline quota could
+        # not be topped up later), while windows still quota by their own detected mode.
+        base_quota = 4 if 4 in tied else max(tied)
+    else:
+        base_quota = max_players
+    base_quota = min(base_quota, max_players)
+
+    # Whole-video pass: the "reference size", a set of baseline ids, and the modal quota.
+    base = _select_active_players(tracks, fps, duration, max_players=base_quota,
+                                  viewpoint=viewpoint, boxes=boxes, aspect=aspect,
+                                  size_filter=size_filter,
+                                  strict_tier=(0.80 if base_quota == 2 else None))
+    base_ids = {t.track_id for t in base}
+
     chosen: dict[int, PlayerTrack] = {t.track_id: t for t in base}
     for w in range(n_win):
         t0 = w * _ACTIVE_WINDOW_STEP_S
@@ -1498,6 +1722,7 @@ def _select_active_players_windowed(
                if t.n > 0 and t.times[-1] >= t0 and t.times[0] <= t1]
         if not sub:
             continue
+        quota = min(modes[w], max_players) if w < len(modes) else base_quota
         sub_boxes = None
         if boxes:
             i0 = max(0, int(t0 * fps))
@@ -1505,9 +1730,10 @@ def _select_active_players_windowed(
             sub_boxes = boxes[i0:i1]
         try:
             picked = _select_active_players(sub, fps, t1 - t0,
-                                            max_players=max_players, viewpoint=viewpoint,
+                                            max_players=quota, viewpoint=viewpoint,
                                             boxes=sub_boxes, aspect=aspect,
-                                            size_filter=size_filter)
+                                            size_filter=size_filter,
+                                            strict_tier=(0.80 if quota == 2 else None))
         except Exception:
             continue
         for t in picked:
