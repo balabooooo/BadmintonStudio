@@ -1103,6 +1103,44 @@ def test_spatial_prior_skipped_without_poly() -> None:
     check("无多边形时无先验（shallow 按时长胜出，行为同 L1）", ids_n == {1, 4}, str(sorted(ids_n)))
 
 
+def test_mode_engine_counts_only_on_court_people() -> None:
+    """L1 counting must mean "persons ON COURT": a warm-up / practising person behind the
+    baseline is as mobile as a real player, so the RELATIVE moving gate cannot exclude them.
+    Measured on clip1 (user-confirmed singles): the engine resolved to mode 4 in 52 of 54
+    windows because off-court mobile people were counted, so the quota never tightened while
+    the footage was singles — a silent mis-detection of the match format.
+
+    With a court polygon the count only includes tracks whose TYPICAL (median) foot position
+    is inside the court; without one the counting is unchanged (backward compatible).
+    """
+    print("\n球员选人：在场人数只计场内（多边形）")
+    fps = 12.0
+    dur = 360.0
+    near_real = _mk_track(1, 0.0, dur, 0.21, 0.35, cy=0.65)   # near half, feet inside
+    far_real = _mk_track(2, 0.0, dur, 0.080, 0.50, cy=0.76)   # far half, feet inside
+    warm_a = _mk_track(3, 0.0, dur, 0.075, 0.60, cy=0.495)    # behind the far baseline, mobile
+    warm_b = _mk_track(4, 0.0, dur, 0.072, 0.72, cy=0.495)    # behind the far baseline, mobile
+    tracks = [near_real, far_real, warm_a, warm_b]
+    bmap = {1: 1, 2: 0, 3: 0, 4: 0}
+    poly = np.asarray(_POLY, dtype=np.float64)
+    check("真球员脚点中值在场地内",
+          PL._track_court_depth(near_real, poly)[0] > 0.0
+          and PL._track_court_depth(far_real, poly)[0] > 0.0,
+          f"{PL._track_court_depth(near_real, poly)[0]:.4f}/"
+          f"{PL._track_court_depth(far_real, poly)[0]:.4f}")
+    check("场外热身者脚点中值在场地外",
+          PL._track_court_depth(warm_a, poly)[0] < 0.0
+          and PL._track_court_depth(warm_b, poly)[0] < 0.0,
+          f"{PL._track_court_depth(warm_a, poly)[0]:.4f}/"
+          f"{PL._track_court_depth(warm_b, poly)[0]:.4f}")
+    on_court = PL._on_court_ids(tracks, poly)
+    check("在场集合只含脚点在场内的轨迹", on_court == {1, 2}, str(sorted(on_court)))
+    without = PL._window_modes(tracks, fps, dur, bmap, 1.7778)
+    check("无多边形时计数不变（场外热身者被计入→模式4）", without == [4, 4, 4], str(without))
+    with_poly = PL._window_modes(tracks, fps, dur, bmap, 1.7778, on_court)
+    check("有多边形时只计场内人员（单打模式2）", with_poly == [2, 2, 2], str(with_poly))
+
+
 # ------------------------------------------------------------------ L3 shared banding + observability
 
 
@@ -4468,6 +4506,7 @@ def main() -> int:
     test_spatial_hard_exclusion_never_enters()
     test_spatial_hard_exclusion_keeps_baseline_player()
     test_spatial_prior_skipped_without_poly()
+    test_mode_engine_counts_only_on_court_people()
     test_band_assignment_shared_consistency()
     test_player_trace_mode_fields()
     test_manual_quad_parsing()

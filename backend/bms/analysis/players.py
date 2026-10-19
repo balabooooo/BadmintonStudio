@@ -1576,12 +1576,36 @@ _MODE_SWITCH_WINDOWS = 2
 _MODE_MIN_DWELL_S = 180.0
 
 
+def _on_court_ids(tracks: list[PlayerTrack], poly: np.ndarray | list) -> set[int]:
+    """Track ids whose TYPICAL (median) foot position lies inside the court polygon.
+
+    The L1 counting signal must mean "persons ON COURT": a warm-up / practising person behind
+    the baseline is as mobile as a real player, so the relative moving gate cannot exclude
+    them (measured on clip1, user-confirmed singles: the engine resolved to mode 4 in 52 of 54
+    windows — the format was silently mis-detected and the quota never tightened). The polygon
+    supplies the missing physical criterion.
+
+    The test is on the MEDIAN foot position rather than "inside at any frame": a real player
+    steps out of the court between rallies and behind the baseline to serve, so transient
+    excursions say nothing about whether they are a match player — where the foot typically is
+    does. Symmetrically, a bench / warm-up person is outside for nearly every frame. The
+    threshold is a plain ``> 0`` ON the polygon (not :data:`ROI_POLY_MARGIN`): a stricter
+    inside-by-margin test would drop real players who spend most of the window resting on the
+    baseline, which under-counts and would collapse a genuine doubles match to mode 2.
+    """
+    p = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return set()
+    return {t.track_id for t in tracks if _track_court_depth(t, p)[0] > 0.0}
+
+
 def _window_person_counts(
     sub: list[PlayerTrack],
     fps: float,
     t0: float,
     t1: float,
     band_of_track: dict[int, int],
+    on_court_ids: set[int] | None = None,
 ) -> dict[int, float]:
     """Per depth band: the median over the window's frames of "distinct moving tracks with a
     box in this frame".
@@ -1591,11 +1615,18 @@ def _window_person_counts(
     gone), and duplicated overlapping tracks shift only a minority of frames, which the
     median absorbs. The moving gate (speed ratio >= 0.20 AND area ratio >= 0.20 against this
     window's own per-band p90 references — the same formula :func:`_select_within_band` uses,
-    but computed independently for this window) keeps waiters and bench staff out of the
-    count, so the engine counts "persons on court", not "tracks in frame". Tracks missing
-    from ``band_of_track`` are sub-minimum-length noise and are never counted.
+    but computed independently for this window) keeps immobile waiters and bench staff out of
+    the count. Tracks missing from ``band_of_track`` are sub-minimum-length noise and are
+    never counted.
 
-    Returns ``{band: median_count}``; bands with no moving candidates are omitted.
+    ``on_court_ids`` (see :func:`_on_court_ids`) restricts the count further to people whose
+    typical foot position is inside the court polygon — mobile off-court people (warm-ups,
+    practice partners behind the baseline) pass the moving gate but are not on court. The
+    filter also narrows the per-band references, which is correct: the "moving" scale should
+    describe the on-court population. ``None`` (no polygon available) keeps the old counting
+    exactly.
+
+    Returns ``{band: median_count}``; bands with no counting candidates are omitted.
     """
     if not sub or t1 <= t0:
         return {}
@@ -1604,6 +1635,8 @@ def _window_person_counts(
     for t in sub:
         b = band_of_track.get(t.track_id)
         if b is None:
+            continue
+        if on_court_ids is not None and t.track_id not in on_court_ids:
             continue
         by_band.setdefault(b, []).append(t)
     i0 = int(np.ceil(t0 * fps))
@@ -1636,14 +1669,17 @@ def _window_modes(
     duration: float,
     band_of_track: dict[int, int],
     aspect: float = 1.7778,
+    on_court_ids: set[int] | None = None,
 ) -> list[int]:
     """Per-window match mode (the picker's singles/doubles quota), one entry per window.
 
     Decision chain, each step immunizing against one measured failure mode:
 
-    1. Per window, sum the per-band median on-court person counts (see
-       :func:`_window_person_counts`) and clamp to ``[_MODE_CLAMP]`` — a pickup break with
-       two people still on court must not read as "singles", and four is the ceiling anyway.
+    1. Per window, sum the per-band median ON-COURT person counts (see
+       :func:`_window_person_counts`; when a court polygon is available ``on_court_ids``
+       restricts the count to people who actually stand inside it) and clamp to
+       ``[_MODE_CLAMP]`` — a pickup break with two people still on court must not read as
+       "singles", and four is the ceiling anyway.
     2. 3-window median filter (endpoint windows: mean of self and the single neighbour; empty
        windows carry the nearest valid value first). Erases single-window dips: a 10-30 s
        shuttle pickup inside a doubles match shows up as one low window.
@@ -1653,7 +1689,7 @@ def _window_modes(
        real, and oscillation is impossible.
 
     ``aspect`` is accepted for interface stability (the L3 band-consolidation pass threads it
-    through); the count itself only needs ``band_of_track``.
+    through); the count itself only needs ``band_of_track`` and ``on_court_ids``.
     """
     n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S) / _ACTIVE_WINDOW_STEP_S))) + 1
     raw: list[float | None] = []
@@ -1665,7 +1701,8 @@ def _window_modes(
             continue
         sub = [t for t in tracks
                if t.n > 0 and t.times[-1] >= t0 and t.times[0] <= t1]
-        counts = _window_person_counts(sub, fps, t0, t1, band_of_track) if sub else {}
+        counts = (_window_person_counts(sub, fps, t0, t1, band_of_track, on_court_ids)
+                  if sub else {})
         if not counts:
             raw.append(None)  # empty window: carry the nearest valid value
             continue
@@ -1714,6 +1751,8 @@ def _window_modes(
         else:
             pending, pending_len = None, 0
         modes.append(cur)
+    logger.debug("mode engine: n_win={} on_court={} raw_counts={} filtered={} modes={}",
+                 n_win, None if on_court_ids is None else len(on_court_ids), raw, filtered, modes)
     return modes
 
 
@@ -1784,13 +1823,14 @@ def _select_active_players_windowed(
     judged against the far side's own scale rather than the near side's.
 
     The L1 mode engine makes the picker singles/doubles aware: each window's on-court person
-    count (per depth band, median over frames, moving-gated — see :func:`_window_modes`)
-    becomes that window's quota (2 in singles, 4 in doubles), and the whole-video baseline
-    uses the modal quota. A mode-2 window also tightens the "second different person"
-    same-tier gate (``strict_tier=0.80``), so a waiter cannot ride a weak 0.55-tier score
-    into the singles quota. One player's serial fragments share their person's slot via
-    same-person group extension (see :func:`_select_within_band`), so a mode-2 quota never
-    starves the far player between two id-switch fragments.
+    count (per depth band, median over frames, moving-gated, and — when a court polygon is
+    available — restricted to people whose typical foot position is inside it, see
+    :func:`_on_court_ids`) becomes that window's quota (2 in singles, 4 in doubles), and the
+    whole-video baseline uses the modal quota. A mode-2 window also tightens the "second
+    different person" same-tier gate (``strict_tier=0.80``), so a waiter cannot ride a weak
+    0.55-tier score into the singles quota. One player's serial fragments share their person's
+    slot via same-person group extension (see :func:`_select_within_band`), so a mode-2 quota
+    never starves the far player between two id-switch fragments.
 
     When ``duration`` is shorter than one window, behavior is exactly the same as the old
     implementation (the mode engine is not used; ``trace`` then reports mode 0 and an empty
@@ -1851,7 +1891,13 @@ def _select_active_players_windowed(
     n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S)
                                / _ACTIVE_WINDOW_STEP_S))) + 1
     # ---- L1 mode engine: per-window quota from the detected match mode.
-    modes = _window_modes(tracks, fps, duration, band_of_track, aspect)
+    # The count only includes people who stand inside the court polygon when one is available:
+    # a mobile warm-up / practice person behind the baseline passes the relative moving gate
+    # but is not a match player (measured on clip1: without this the singles footage resolved
+    # to mode 4 in 52 of 54 windows). Computed once for the whole clip — the polygon depth of
+    # a track does not depend on the window.
+    on_court_ids = _on_court_ids(tracks, roi_poly) if roi_poly is not None else None
+    modes = _window_modes(tracks, fps, duration, band_of_track, aspect, on_court_ids)
     _fill_trace(0, [])  # provisional defaults; overwritten below once the modal quota is known
     mode_counts: dict[int, int] = {}
     for m in modes:
