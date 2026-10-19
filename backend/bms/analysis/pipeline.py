@@ -349,6 +349,10 @@ def run_analysis(
                         # Measured distribution of size filtering: the UI uses it to draw a histogram and preview threshold effects in real time
                         "size_filter": dict(getattr(player_sig, "size_stats", {}) or {}),
                         "roi_poly_points": len(eff_poly or []),
+                        # L1 mode-engine verdicts (picker quotas): modal mode + per-window sequence.
+                        # Additive keys — the frontend ignores unknown player_trace entries.
+                        "mode": int(getattr(player_sig, "mode", 0) or 0),
+                        "mode_windows": list(getattr(player_sig, "mode_windows", []) or []),
                     }
                 except Exception as e:  # a player-module failure should not interrupt the whole analysis
                     player_trace = {"error": f"{type(e).__name__}: {e}"}

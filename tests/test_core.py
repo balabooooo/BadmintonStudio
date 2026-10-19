@@ -362,6 +362,9 @@ def test_analyze_players_smoke_empty_detections() -> None:
                   f"fps={sig.fps} duration={sig.duration}")
             check("无检测时无活跃球员且有帧行", sig.active_player_ids == []
                   and len(sig.frame_boxes) >= 1)
+            check("空检测时模式字段存在且为默认值（静默安全）",
+                  getattr(sig, "mode", None) == 0 and getattr(sig, "mode_windows", None) == [],
+                  f"mode={getattr(sig, 'mode', None)} windows={getattr(sig, 'mode_windows', None)}")
         except Exception as exc:
             check("空检测桩下完整跑通", False, f"{type(exc).__name__}: {exc}")
         finally:
@@ -1098,6 +1101,71 @@ def test_spatial_prior_skipped_without_poly() -> None:
                                         boxes=boxes, aspect=1.7778)
     ids_n = {t.track_id for t in no_poly}
     check("无多边形时无先验（shallow 按时长胜出，行为同 L1）", ids_n == {1, 4}, str(sorted(ids_n)))
+
+
+# ------------------------------------------------------------------ L3 shared banding + observability
+
+
+def test_band_assignment_shared_consistency() -> None:
+    """L3: the depth-band partition is computed ONCE by ``_band_assignment`` and consumed by
+    the size floor, the mode engine and the cap fallback — structural round-trip between
+    bands / band_of_track / stats, plus a spy proving the windowed picker computes it exactly
+    once per run (not once per window)."""
+    print("\n球员选人：共享分带一致性（L3）")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 360.0, 0.21, 0.30), _mk_track(2, 0.0, 360.0, 0.205, 0.70),
+        _mk_track(3, 0.0, 360.0, 0.08, 0.40), _mk_track(4, 0.0, 360.0, 0.075, 0.60),
+    ]
+    bands, bmap, stats = PL._band_assignment(tracks, fps, 1.7778)
+    check("分带场景返回两带", bands is not None and len(bands) == 2,
+          str(None if bands is None else [len(b) for b in bands]))
+    check("band_of_track 与分带互为镜像",
+          all(bmap.get(t.track_id) == bi for bi, band in enumerate(bands or []) for t in band)
+          and {t.track_id for b in (bands or []) for t in b} == set(bmap), str(bmap))
+    check("每带附带尺寸统计", len(stats) == 2, str(stats))
+    flat = [_mk_track(11, 0.0, 360.0, 0.18, 0.30), _mk_track(12, 0.0, 360.0, 0.19, 0.50),
+            _mk_track(13, 0.0, 360.0, 0.185, 0.70), _mk_track(14, 0.0, 360.0, 0.18, 0.40)]
+    bands2, bmap2, stats2 = PL._band_assignment(flat, fps, 1.7778)
+    check("不分带场景退化为虚拟带0", bands2 is None and set(bmap2.values()) == {0}, str(bmap2))
+    check("不分带时无带统计", stats2 == [], str(stats2))
+    orig = PL._band_assignment
+    calls: list = []
+
+    def spy(tracks_, fps_, aspect=1.7778):
+        calls.append(1)
+        return orig(tracks_, fps_, aspect)
+
+    try:
+        PL._band_assignment = spy
+        frame = [(1, 0.26, 0.395, 0.34, 0.60), (3, 0.47, 0.46, 0.53, 0.54)]
+        boxes = [frame] * int(360 * fps)
+        PL._select_active_players_windowed(tracks, fps, 360.0, viewpoint="rear",
+                                           boxes=boxes, aspect=1.7778)
+        check("窗口选择器整次运行只计算一次分带", len(calls) == 1, f"calls={len(calls)}")
+    finally:
+        PL._band_assignment = orig
+
+
+def test_player_trace_mode_fields() -> None:
+    """L3 observability: the windowed picker must export its mode-engine verdicts (modal
+    quota + per-window modes) via the ``trace`` out-dict, so ``analyze_players`` can put
+    them on ``PlayerSignal`` and pipeline.py can copy them into ``stats.player_trace``."""
+    print("\n球员选人：player_trace 模式字段")
+    fps = 12.0
+    tracks = [
+        _mk_track(1, 0.0, 360.0, 0.21, 0.30), _mk_track(2, 0.0, 360.0, 0.21, 0.70),
+        _mk_track(3, 0.0, 360.0, 0.08, 0.40), _mk_track(4, 0.0, 360.0, 0.08, 0.60),
+    ]
+    trace: dict = {}
+    frame = [(1, 0.26, 0.395, 0.34, 0.60), (2, 0.66, 0.395, 0.74, 0.60),
+             (3, 0.47, 0.46, 0.53, 0.54), (4, 0.57, 0.46, 0.63, 0.54)]
+    boxes = [frame] * int(360 * fps)
+    PL._select_active_players_windowed(tracks, fps, 360.0, viewpoint="rear",
+                                       boxes=boxes, aspect=1.7778, trace=trace)
+    check("众数配额写入 trace", trace.get("mode") == 4, str(trace.get("mode")))
+    check("各窗模式序列写入 trace", trace.get("mode_windows") == [4, 4, 4],
+          str(trace.get("mode_windows")))
 
 
 # ------------------------------------------------------------------ Manual calibration
@@ -4400,6 +4468,8 @@ def main() -> int:
     test_spatial_hard_exclusion_never_enters()
     test_spatial_hard_exclusion_keeps_baseline_player()
     test_spatial_prior_skipped_without_poly()
+    test_band_assignment_shared_consistency()
+    test_player_trace_mode_fields()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()

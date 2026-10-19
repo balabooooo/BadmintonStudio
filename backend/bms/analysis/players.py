@@ -179,6 +179,11 @@ class PlayerSignal:
     size_stats: dict[str, Any] = field(default_factory=dict)
     #: Cache tag of the persisted per-frame box npz (empty when caching failed/was skipped); not part of any derived signal
     cache_tag: str = ""
+    #: L1 mode-engine verdict for observability: the modal quota the picker's baseline pass used
+    #: (2 = singles, 4 = doubles; 0 = engine not used / no evidence — short clips, empty input).
+    mode: int = 0
+    #: Per-window mode sequence behind ``mode`` (one entry per 90 s step; empty when ``mode`` is 0).
+    mode_windows: list[int] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------ match format (singles / doubles)
@@ -1712,6 +1717,40 @@ def _window_modes(
     return modes
 
 
+def _band_assignment(
+    tracks: list[PlayerTrack],
+    fps: float,
+    aspect: float = 1.7778,
+) -> tuple[list[list[PlayerTrack]] | None, dict[int, int], list[dict[str, float]]]:
+    """One depth-band computation, shared by every consumer in the windowed picker (the size
+    floor, the L1 mode engine's counting, the cap's fallback banding).
+
+    Returns ``(bands, band_of_track, per_band_stats)``:
+
+    * ``bands``: the :func:`_depth_bands` partition, or ``None`` for a flat-depth scene;
+    * ``band_of_track``: track id -> band index; a flat-depth scene maps every candidate to
+      the single virtual band 0 so the mode engine still counts persons;
+    * ``per_band_stats``: :func:`_band_size_stats` per band (empty when ``bands is None``).
+
+    The candidate filter mirrors the picker's: sub-minimum-length tracks (under ~0.4 s) are
+    noise and stay unmapped (banded case) — they must not be counted as on-court persons.
+    """
+    full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
+    bands = _depth_bands(full, aspect)
+    band_of_track: dict[int, int] = {}
+    stats: list[dict[str, float]] = []
+    if bands:
+        for bi, band in enumerate(bands):
+            stats.append(_band_size_stats(band, aspect))
+            for t in band:
+                band_of_track[t.track_id] = bi
+    else:
+        # Flat-depth scene: one virtual band so the mode engine still counts persons.
+        for t in full:
+            band_of_track[t.track_id] = 0
+    return bands, band_of_track, stats
+
+
 def _select_active_players_windowed(
     tracks: list[PlayerTrack],
     fps: float,
@@ -1722,6 +1761,7 @@ def _select_active_players_windowed(
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
     roi_poly: np.ndarray | list | None = None,
+    trace: dict | None = None,
 ) -> list[PlayerTrack]:
     """Pick match players **window by window in time**, then merge the results.
 
@@ -1752,11 +1792,25 @@ def _select_active_players_windowed(
     same-person group extension (see :func:`_select_within_band`), so a mode-2 quota never
     starves the far player between two id-switch fragments.
 
-    When ``duration`` is shorter than one window, behavior is exactly the same as the old implementation.
+    When ``duration`` is shorter than one window, behavior is exactly the same as the old
+    implementation (the mode engine is not used; ``trace`` then reports mode 0 and an empty
+    window list — the picker's verdicts are unknown, not guessed).
+
+    ``trace`` (optional out-dict) receives the mode-engine verdicts for observability:
+    ``mode`` (the modal quota the baseline pass used) and ``mode_windows`` (the per-window
+    mode sequence). ``analyze_players`` copies these onto ``PlayerSignal`` and pipeline.py
+    surfaces them in ``stats.player_trace``; unknown keys are ignored downstream.
     """
+    def _fill_trace(mode: int, windows: list[int]) -> None:
+        if trace is not None:
+            trace["mode"] = mode
+            trace["mode_windows"] = windows
+
     if not tracks:
+        _fill_trace(0, [])
         return []
     if duration <= _ACTIVE_WINDOW_S:
+        _fill_trace(0, [])
         return _select_active_players(tracks, fps, duration, max_players=max_players,
                                       viewpoint=viewpoint, boxes=boxes, aspect=aspect,
                                       size_filter=size_filter, roi_poly=roi_poly)
@@ -1770,25 +1824,18 @@ def _select_active_players_windowed(
     # the near side would throw away every far-side window pick, which is exactly the bug we fix.
     size_floor = max(g_min, g_ref * 0.45) if g_ref > 0 else 0.0
     floor_by_track: dict[int, float] = {}
-    # The band partition is computed once and consumed by the floor, the mode engine and the
-    # final cap. The cap's redundancy test is band-aware: a near-side box at second t does NOT
-    # replace a far-side player's box at second t, so "covered" must be tracked per depth band.
-    band_of_track: dict[int, int] = {}
-    full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
-    all_bands = _depth_bands(full, aspect)
+    # One shared band computation (see :func:`_band_assignment`), consumed by the floor, the
+    # mode engine's counting and the cap's unmapped-track fallback. The cap's redundancy test
+    # is band-aware and normally trusts the pick-time ``band_hint`` stamps instead (window-level
+    # truth; whole-video statistics can be skewed by a spectator crowd).
+    all_bands, band_of_track, band_stats = _band_assignment(tracks, fps, aspect)
     if all_bands:
         for bi, band in enumerate(all_bands):
-            bstat = _band_size_stats(band, aspect)
+            bstat = band_stats[bi]
             if size_floor > 0 and bstat["ref"] > 0:
                 bfloor = max(bstat["min_abs"], bstat["ref"] * 0.45)
                 for t in band:
                     floor_by_track[t.track_id] = bfloor
-            for t in band:
-                band_of_track[t.track_id] = bi
-    else:
-        # Flat-depth scene: one virtual band so the mode engine still counts persons.
-        for t in full:
-            band_of_track[t.track_id] = 0
 
     def _band_of(t: PlayerTrack) -> int:
         """Depth band of a track; unmapped (sub-min_frames fallback) tracks go to the nearest band."""
@@ -1805,6 +1852,7 @@ def _select_active_players_windowed(
                                / _ACTIVE_WINDOW_STEP_S))) + 1
     # ---- L1 mode engine: per-window quota from the detected match mode.
     modes = _window_modes(tracks, fps, duration, band_of_track, aspect)
+    _fill_trace(0, [])  # provisional defaults; overwritten below once the modal quota is known
     mode_counts: dict[int, int] = {}
     for m in modes:
         mode_counts[m] = mode_counts.get(m, 0) + 1
@@ -1817,6 +1865,7 @@ def _select_active_players_windowed(
     else:
         base_quota = max_players
     base_quota = min(base_quota, max_players)
+    _fill_trace(base_quota, list(modes))
 
     # Whole-video pass: the "reference size", a set of baseline ids, and the modal quota.
     base = _select_active_players(tracks, fps, duration, max_players=base_quota,
@@ -1851,13 +1900,18 @@ def _select_active_players_windowed(
                                             roi_poly=roi_poly)
         except Exception:
             continue
+        floor_drop = 0
         for t in picked:
             if t.track_id in chosen:
                 continue
             floor = floor_by_track.get(t.track_id, size_floor)
             if floor > 0 and _track_median_size(t, aspect) < floor:
+                floor_drop += 1
                 continue
             chosen[t.track_id] = t
+        logger.debug("select win={} mode={} quota={} picks={} floor_drop={}",
+                     w, modes[w] if w < len(modes) else base_quota, quota,
+                     [t.track_id for t in picked], floor_drop)
 
     out = sorted(chosen.values(), key=lambda t: (t.times[0] if t.n else 0.0))
     if len(out) > _ACTIVE_MAX_TRACKS:
@@ -1902,6 +1956,7 @@ def _select_active_players_windowed(
             kept.append(t)
             covered_by_band.setdefault(_cap_band(t), set()).update(t.frames)
         out = sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
+        logger.debug("select cap kept={} redundant={}", len(out), len(rest))
     return out
 
 
@@ -2263,9 +2318,11 @@ def analyze_players(
     # Window-by-window identification: in long videos a player gets split into many tracks, and
     # picking only once for the whole video leaves "time outside the middle" with no player signal
     # at all (measured: frame_boxes is empty 58% of the time).
+    mode_trace: dict = {}
     active = _select_active_players_windowed(tracks, eff_fps, duration, viewpoint=viewpoint,
                                              boxes=det_frames, aspect=aspect,
-                                             size_filter=sf, roi_poly=poly_arr)
+                                             size_filter=sf, roi_poly=poly_arr,
+                                             trace=mode_trace)
     active_ids = [t.track_id for t in active]
 
     # ---- assemble the timeline (length = ceil(duration * sample_fps); index i corresponds to i/sample_fps) ----
@@ -2359,6 +2416,8 @@ def analyze_players(
         frame_boxes=frame_boxes,
         size_stats=size_stats,
         cache_tag=cache_tag,
+        mode=int(mode_trace.get("mode", 0) or 0),
+        mode_windows=list(mode_trace.get("mode_windows", []) or []),
     )
 
 
