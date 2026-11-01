@@ -29,6 +29,8 @@ from bms.analysis import players as PL             # noqa: E402
 from bms.analysis import rally as RA               # noqa: E402
 from bms.analysis import rally_vision as RV        # noqa: E402
 from bms.analysis import annotation as AN          # noqa: E402
+from bms.analysis import scoring as SC             # noqa: E402
+from bms.analysis import visual_shots as VS        # noqa: E402
 from bms.core.models import AnalysisParams, AnalysisResult  # noqa: E402
 
 FAILURES: list[str] = []
@@ -362,6 +364,13 @@ def test_analyze_players_smoke_empty_detections() -> None:
                   f"fps={sig.fps} duration={sig.duration}")
             check("无检测时无活跃球员且有帧行", sig.active_player_ids == []
                   and len(sig.frame_boxes) >= 1)
+            # The format decision is part of the signal contract: both arrays must line up with
+            # the timeline (a shorter array would silently detach the report from the runtime read).
+            check("格式计数/模式与时间轴等长",
+                  sig.format_count.size == len(sig.frame_boxes)
+                  and sig.format_mode.size == len(sig.frame_boxes),
+                  f"count={sig.format_count.size} mode={sig.format_mode.size} "
+                  f"frames={len(sig.frame_boxes)}")
         except Exception as exc:
             check("空检测桩下完整跑通", False, f"{type(exc).__name__}: {exc}")
         finally:
@@ -605,195 +614,295 @@ def test_select_active_players_depth_bands() -> None:
     check("手动尺寸筛选优先于自动分带", all(i not in far_ids for i in ids2), str(ids2))
 
 
-def test_select_active_players_windowed_cap_keeps_unique_coverage() -> None:
-    """The windowed cap must not drop a short track that is the only coverage of some time range.
+def _player_track(tid: int, t0: float, span_s: float, height: float, fps: float = 12.0,
+                  speed: float = 0.05) -> "PL.PlayerTrack":
+    """Synthetic track: normalized box with the given height, starting at ``t0`` for ``span_s``."""
+    n = max(1, int(span_s * fps))
+    return PL.PlayerTrack(
+        track_id=tid,
+        frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+        times=[t0 + i / fps for i in range(n)],
+        boxes=[(0.4, 0.9 - height, 0.4 + height * 0.4, 0.9)] * n,
+        speeds=[speed] * n,
+        confidences=[0.9] * n,
+    )
 
-    Regression for the clip1 symptom "the far player is tracked again from ~229 s but the first
-    230 s still show nothing": with banding enabled, windows pick far-side fragments in every
-    window, but an 82-minute multi-game video yields more window picks than
-    ``_ACTIVE_MAX_TRACKS``. The old truncation kept the longest tracks, so short early
-    far-side fragments lost the length sort and their time ranges lost ALL active coverage.
-    The cap now admits tracks by greedy new-time-coverage, so a short track covering
-    otherwise-uncovered seconds survives while redundant duplicates are dropped first.
-    """
-    print("\n球员选人：截断不得丢弃独占时段的短轨迹（回归）")
+
+def _player_track_at(tid: int, t0: float, span_s: float, height: float, foot: tuple[float, float],
+                     fps: float = 12.0, speed: float = 0.05) -> "PL.PlayerTrack":
+    """Synthetic track parked at a given foot point (bottom-edge center)."""
+    n = max(1, int(span_s * fps))
+    x1, x2 = foot[0] - height * 0.2, foot[0] + height * 0.2
+    return PL.PlayerTrack(
+        track_id=tid,
+        frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
+        times=[t0 + i / fps for i in range(n)],
+        boxes=[(x1, foot[1] - height, x2, foot[1])] * n,
+        speeds=[speed] * n,
+        confidences=[0.9] * n,
+    )
+
+
+def test_cap_by_coverage_keeps_unique_time_range() -> None:
+    """The union cap must never drop a short track that is the only coverage of some time range."""
+    print("\n球员选人：并集截断保留独占时段（回归）")
     fps = 12.0
-    orig_pick = PL._select_active_players
-    orig_cap = PL._ACTIVE_MAX_TRACKS
+    long_tracks = [_player_track(100 + i, 1000.0, 200.0, 0.22) for i in range(8)]
+    short = _player_track(9, 0.0, 20.0, 0.10)
+    out = PL._cap_by_coverage(long_tracks + [short], max_tracks=6,
+                              base_ids={100, 101, 102, 103})
+    ids = sorted(t.track_id for t in out)
+    check("截断后数量不超过上限", len(out) <= 6, str(ids))
+    check("基准轨迹保留", {100, 101, 102, 103} <= set(ids), str(ids))
+    check("独占开头的短轨迹保留", 9 in ids, str(ids))
+    check("冗余长轨迹让位给独占覆盖", len(out) == 5, str(ids))
 
-    def make(tid: int, t0: float, span_s: float) -> PL.PlayerTrack:
+
+def test_select_players_per_frame_keeps_far_player() -> None:
+    """Per-frame selection must keep the far-side player even when his motion is tiny.
+
+    Regression for clip1's first 10 s: the far player has a full-length track (2985 frames) but his
+    perspective-shrunk pixel motion made him lose the window quota to 87- and 127-frame fragments.
+    The per-frame rule applies the format quota to the boxes present *now*, and when the ROI holds
+    no more boxes than the quota every box is a player — no motion competition at all.
+    """
+    print("\n球员选人：逐帧选人保住远侧球员（回归）")
+    fps, sample_fps = 12.0, 12.0
+    # Two depth bands: near h=0.22, far band 0.066..0.09 (ratio 3.3 > the 2.0 banding gate).
+    near_a = _player_track(1, 0.0, 200.0, 0.22, fps, speed=0.06)
+    near_b = _player_track(128, 40.0, 120.0, 0.22, fps, speed=0.05)
+    far_a = _player_track(2, 0.0, 200.0, 0.083, fps, speed=0.010)     # tiny motion, long span
+    far_b = _player_track(47, 20.0, 150.0, 0.066, fps, speed=0.010)
+    # Short high-speed fragment somewhere else on court (a passer-by / warm-up swing), so it is a
+    # genuinely distinct visible person rather than a duplicate box of the far player.
+    far_frag = _player_track_at(49, 6.0, 4.0, 0.090, (0.70, 0.60), fps, speed=0.060)
+    tracks = [near_a, near_b, far_a, far_b, far_frag]
+    n = int(200.0 * sample_fps)
+
+    sel = PL._select_players_per_frame(
+        tracks, fps, 200.0, sample_fps=sample_fps, viewpoint="rear",
+        aspect=4.0 / 3.0, n_frames=n,
+    )
+    ids_per_frame = sel.ids_per_frame
+    union_ids = {t.track_id for t in sel.tracks}
+
+    def at(sec: float) -> set[int]:
+        return ids_per_frame[min(n - 1, int(round(sec * sample_fps)))]
+
+    check("开头只有两条长轨迹时两者都被选中", at(0.0) == {1, 2}, str(at(0.0)))
+    check("远侧长轨迹没有被短碎片挤掉", 2 in at(8.0), str(at(8.0)))
+    check("4 秒碎片不占球员名额", 49 not in at(8.0), str(at(8.0)))
+    check("并集包含远侧长轨迹", 2 in union_ids, str(sorted(union_ids)))
+    check("并集包含近侧主轨迹", 1 in union_ids, str(sorted(union_ids)))
+    # The format decision is returned alongside the selection so callers can report the runtime
+    # verdict instead of re-deriving it from the selected boxes.
+    check("格式计数与时间轴等长", len(sel.counts) == n, str(len(sel.counts)))
+    check("格式模式与时间轴等长", len(sel.modes) == n, str(len(sel.modes)))
+    check("开头可见人数=2（两个完整轨迹）", sel.counts[0] == 2.0, str(sel.counts[0]))
+    # The 4 s fragment is a *visible person* now (the count is "who is on court"), so it raises the
+    # count to 3 — below the doubles threshold, so the mode stays singles and the fragment still
+    # does not take a player slot.
+    check("碎片计入可见人数但不改变单打判定",
+          sel.counts[int(7.0 * sample_fps)] == 3.0
+          and sel.modes[int(7.0 * sample_fps)] == 2,
+          f"count={sel.counts[int(7.0 * sample_fps)]} mode={sel.modes[int(7.0 * sample_fps)]}")
+    check("模式取值只允许 2/4", set(sel.modes) <= {2, 4}, str(sorted(set(sel.modes))))
+
+
+def test_visible_people_survive_id_churn() -> None:
+    """Doubles must be recognised even when every player's track id is short-lived.
+
+    Regression for clip1 at 21:34: four people were on court, but each one's ByteTrack id restarted
+    every 30-60 s, so a span-weighted track tally added up to ~2.7 and the video was judged singles
+    for its full 82 minutes. The count must be "distinct visible boxes", with duplicate ids of the
+    same person collapsed.
+    """
+    print("\n球员选人：轨迹频繁换 id 也会判为双打（回归）")
+    fps = 12.0
+    dur = 30.0
+    n = int(dur * fps)
+    # Four players, all on court for the whole clip, but each track lasts only 20 s (< the old
+    # 30 s full-weight threshold).
+    tracks = [
+        _player_track_at(1, 0.0, 20.0, 0.21, (0.40, 0.90), fps),
+        _player_track_at(2, 0.0, 20.0, 0.21, (0.55, 0.88), fps),
+        _player_track_at(3, 0.0, 20.0, 0.08, (0.38, 0.58), fps),
+        _player_track_at(4, 0.0, 20.0, 0.08, (0.47, 0.57), fps),
+    ]
+    # A stale duplicate id of player 1 (old track still inside its buffer) must not add a person.
+    boxes = [t.boxes[0] for t in tracks] + [tracks[0].boxes[0]]
+    check("重复 id 的重叠框只算一个人", PL._distinct_boxes(boxes) == 4,
+          str(PL._distinct_boxes(boxes)))
+    sel = PL._select_players_per_frame(
+        tracks, fps, dur, sample_fps=fps, viewpoint="rear",
+        aspect=4.0 / 3.0, n_frames=n,
+    )
+    check("四人在场时计数为 4", sel.counts[0] == 4.0, str(sel.counts[0]))
+    check("四人在场 -> 双打模式", sel.modes[0] == 4, str(sel.modes[0]))
+    check("四人全被选中", {1, 2, 3, 4} <= {t.track_id for t in sel.tracks},
+          str(sorted(t.track_id for t in sel.tracks)))
+
+
+def test_mode_sequence_trailing_median() -> None:
+    """The format verdict follows a trailing median, not a consecutive-run counter.
+
+    Regression for clip1: a real doubles stretch dips below the threshold for a few seconds every
+    minute, which reset the old "must hold for 180 consecutive seconds" counter, so the switch never
+    happened. A trailing 3-minute median has the same inertia without that reset.
+    """
+    print("\n单/双打判定：尾随窗口中值 + 迟滞")
+    fps = 12.0
+    seconds = 420
+
+    def seq(counts_per_second: list[float]) -> list[int]:
+        counts = [v for v in counts_per_second for _ in range(int(fps))]
+        return PL._mode_sequence(counts, fps)[: len(counts)]
+
+    counts = ([2.0] * 60 + [4.0] * 180 + [2.0] * 30 + [4.0] * 150)
+    modes = seq(counts)
+    at = lambda s: modes[int(s * fps)]  # noqa: E731
+    check("长度与时间轴一致", len(modes) == seconds * int(fps), str(len(modes)))
+    check("开头两人 -> 单打", at(0) == 2 and at(19) == 2, f"{at(0)},{at(19)}")
+    check("双打持续后切到双打", at(200) == 4, str(at(200)))
+    check("30 秒短暂回落不切回单打（捡球保护）", at(245) == 4 and at(269) == 4,
+          f"{at(245)},{at(269)}")
+    check("结尾仍是双打", at(419) == 4, str(at(419)))
+    # Symmetric: dropping to two people for good does switch back after the window has turned over.
+    modes2 = seq([4.0] * 240 + [2.0] * 180)
+    check("长期只剩两人 -> 切回单打", modes2[int(419 * fps)] == 2, str(modes2[int(419 * fps)]))
+    check("空输入安全降级", PL._mode_sequence([], fps) == [])
+
+
+def test_stitch_orphan_detections() -> None:
+    """Recurring detections that no track covers must become a track.
+
+    Regression for clip1 at 6:31: the far doubles pair stands side by side and the detector reports
+    the second one in alternating frames (NMS merges the pair), so ByteTrack never confirms a track
+    for him; the overlay shows a box that is never tracked.
+    """
+    print("\n球员跟踪：把长期未被跟踪的检测拼成轨迹（回归）")
+    fps = 15.0
+    n = int(40 * fps)
+    times = [k / fps for k in range(n)]
+    aspect = 4.0 / 3.0
+
+    def box(cx: float, cy: float, h: float = 0.07) -> tuple[float, float, float, float]:
+        return (cx - h * 0.2, cy - h, cx + h * 0.2, cy)
+
+    # One real track covering every frame at (0.30, 0.58).
+    trk = PL._TrackBuf(1, aspect)
+    for k in range(n):
+        trk.observe(k, times[k], box(0.30, 0.58, 0.09), 0.8)
+
+    raw: list[list[tuple[tuple[float, float, float, float], float]]] = [[] for _ in range(n)]
+    for k in range(n):
+        raw[k].append((box(0.30, 0.58, 0.09), 0.8))          # covered by the track
+    for k in range(int(5 * fps), int(30 * fps), 2):           # every other frame, 25 s
+        raw[k].append((box(0.40, 0.56), 0.40))
+    for k in (int(32 * fps), int(33 * fps), int(34 * fps)):   # three scattered positives
+        raw[k].append((box(0.82, 0.40), 0.35))
+
+    orphans = PL._stitch_orphan_detections(raw, times, [trk], aspect, next_id=2)
+    check("长期未覆盖的检测被拼成一条轨迹", len(orphans) == 1, str(len(orphans)))
+    if orphans:
+        o = orphans[0]
+        check("拼接轨迹的观测数足够", o.n >= PL._ORPHAN_MIN_HITS, str(o.n))
+        check("拼接轨迹跨度够长", o.times[-1] - o.times[0] >= PL._ORPHAN_MIN_SPAN_S,
+              f"{o.times[-1] - o.times[0]:.1f}")
+        check("拼接轨迹位置正确",
+              abs(o.boxes[0][3] - 0.56) < 1e-6, str(o.boxes[0]))
+        check("拼接轨迹不会被已有轨迹吸走", o.n < n, str(o.n))
+    check("零散误检不成轨迹",
+          all(abs(o.boxes[0][2] - 0.82) > 0.1 for o in orphans), str(len(orphans)))
+    # Duplicate detections of an already tracked person are not orphans at all.
+    raw2 = [[(box(0.30, 0.58, 0.09), 0.8)] * 3 for _ in range(n)]
+    check("已被跟踪的检测不算孤儿",
+          PL._stitch_orphan_detections(raw2, times, [trk], aspect, next_id=2) == [])
+
+
+def test_foot_in_court_exact_boundary() -> None:
+    """Admission must use the calibrated boundary literally (no outward allowance).
+
+    Regression for clip1: with the old 0.04 margin a person walking behind the far sideline
+    (foot at (0.210, 0.651), ~0.03 outside) passed admission, entered ByteTrack and — because the
+    tracker has no appearance model — took over the far player's track id at 5 s. The measured
+    boxes below are the real ones from that analysis.
+    """
+    print("\n球员选人：标定边界严格过滤（回归）")
+    poly = np.asarray([[0.26829, 1.0], [0.62222, 0.9976], [0.95244, 0.68201],
+                       [0.45732, 0.55193], [0.23049, 0.56819]], dtype=np.float32)
+    check("标定边界不外扩", PL.ROI_POLY_MARGIN == 0.0, str(PL.ROI_POLY_MARGIN))
+
+    def box_with_foot(bcx: float, by: float, h: float = 0.07) -> tuple[float, float, float, float]:
+        return (bcx - h * 0.2, by - h, bcx + h * 0.2, by)
+
+    check("远侧球员（5s 实测脚点）仍被接纳",
+          PL._foot_in_court(box_with_foot(0.359, 0.583), poly, None))
+    check("场边走动者（5s 实测脚点）被拒",
+          not PL._foot_in_court(box_with_foot(0.210, 0.651), poly, None))
+    check("场外等候者（13s 实测脚点）被拒",
+          not PL._foot_in_court(box_with_foot(0.321, 0.545), poly, None))
+    check("场地内部点被接纳",
+          PL._foot_in_court(box_with_foot(0.50, 0.80), poly, None))
+    # Rectangle fallback (no polygon): plain containment, same strictness.
+    check("矩形回退：外点被拒",
+          not PL._foot_in_court(box_with_foot(0.10, 0.50), None, (0.2, 0.3, 0.8, 0.95)))
+    check("矩形回退：内点接纳",
+          PL._foot_in_court(box_with_foot(0.50, 0.50), None, (0.2, 0.3, 0.8, 0.95)))
+    check("无 ROI 时全部接纳", PL._foot_in_court(box_with_foot(0.01, 0.01), None, None))
+    # Signed depth: positive inside, negative outside, larger deeper in.
+    check("有符号深度：场内为正",
+          PL._poly_signed_depth((0.50, 0.80), poly) > 0.0)
+    check("有符号深度：场外为负",
+          PL._poly_signed_depth((0.210, 0.651), poly) < -0.01,
+          f"{PL._poly_signed_depth((0.210, 0.651), poly):.4f}")
+    check("有符号深度：越靠场内越大",
+          PL._poly_signed_depth((0.50, 0.78), poly)
+          > PL._poly_signed_depth((0.50, 0.60), poly))
+
+
+def test_space_prior_ranks_central_track() -> None:
+    """When candidates compete for a slot, the more on-court one must win."""
+    print("\n球员选人：场内深度先验排序")
+    fps = 12.0
+    poly = np.asarray([[0.2, 0.95], [0.8, 0.95], [0.8, 0.3], [0.2, 0.3]], dtype=np.float32)
+
+    def track_at(tid: int, foot: tuple[float, float], h: float = 0.20,
+                 span_s: float = 200.0) -> "PL.PlayerTrack":
         n = int(span_s * fps)
-        tr = PL.PlayerTrack(
+        x1, x2 = foot[0] - h * 0.2, foot[0] + h * 0.2
+        return PL.PlayerTrack(
             track_id=tid,
-            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
-            times=[t0 + i / fps for i in range(n)],
-            boxes=[(0.4, 0.5, 0.6, 0.7)] * n,
+            frames=[int(round(i / fps * fps)) for i in range(n)],
+            times=[i / fps for i in range(n)],
+            boxes=[(x1, foot[1] - h, x2, foot[1])] * n,
             speeds=[0.05] * n,
             confidences=[0.9] * n,
         )
-        return tr
 
-    # 8 long "near-side" tracks all covering the same late range, plus 1 short track uniquely
-    # covering the first 20 s (the early far-side fragment in the real failure).
-    long_tracks = [make(100 + i, 1000.0, 200.0) for i in range(8)]
-    short = make(9, 0.0, 20.0)
-    all_tracks = long_tracks + [short]
-
-    try:
-        PL._ACTIVE_MAX_TRACKS = 6
-
-        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
-            # Whole-video base pass: only the long tracks look "global".
-            if duration > 500.0:
-                return long_tracks[:4]
-            # Per-window passes: return everything that overlaps the window.
-            return list(tracks)
-
-        PL._select_active_players = fake_pick
-        out = PL._select_active_players_windowed(
-            all_tracks, fps, 1500.0, viewpoint="rear",
-        )
-        ids = sorted(t.track_id for t in out)
-        check("截断后数量不超过上限", len(out) <= 6, str(ids))
-        check("全片基准轨迹始终保留", {100, 101, 102, 103} <= set(ids), str(ids))
-        check("独占开头的短轨迹不再被截断丢弃", 9 in ids, str(ids))
-        check("冗余长轨迹让位给独占覆盖", len(ids) == 5, str(ids))
-    finally:
-        PL._select_active_players = orig_pick
-        PL._ACTIVE_MAX_TRACKS = orig_cap
-
-
-def test_cap_band_aware_coverage_keeps_far_short_tracks() -> None:
-    """The cap's redundancy test must be depth-band-aware: a far-side short track whose TIME
-    is already covered by kept near-side tracks is NOT redundant — a near-side box at
-    second t does not replace the far-side player's box at second t.
-
-    Regression for clip1's 229 s cliff: windows 0-1 picked far-side fragments (86/123),
-    but the time-only coverage metric scored them as redundant against near-side tracks
-    and the cap silently dropped them, erasing the far player from the first ~4 minutes
-    even though the windowed picks were correct.
-    """
-    print("\n球员选人：截断冗余判定按纵深带（回归）")
-    fps = 12.0
-    orig_pick = PL._select_active_players
-    orig_cap = PL._ACTIVE_MAX_TRACKS
-
-    def make(tid: int, t0: float, span_s: float, h: float) -> PL.PlayerTrack:
-        n = int(span_s * fps)
-        tr = PL.PlayerTrack(
-            track_id=tid,
-            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
-            times=[t0 + i / fps for i in range(n)],
-            boxes=[(0.45 - 0.25 * h, 0.5 - 0.5 * h, 0.45 + 0.25 * h, 0.5 + 0.5 * h)] * n,
-            speeds=[0.05] * n,
-            confidences=[0.9] * n,
-        )
-        tr.mean_area = tr.max_area = 0.5 * h * h
-        tr.mean_speed, tr.max_speed = 0.05, 0.10
-        tr.total_travel = 0.05 * n
-        return tr
-
-    # Four near-side "baseline" tracks; two long near-side duplicates of the early span
-    # (redundant in BOTH time and band); one far-side short track whose time falls inside
-    # the early near-side span — redundant in time, unique in its own depth band.
-    near_base = [make(101, 0.0, 200.0, 0.21), make(102, 0.0, 200.0, 0.21),
-                 make(103, 1000.0, 200.0, 0.21), make(104, 1000.0, 200.0, 0.21)]
-    near_dup = [make(105, 0.0, 200.0, 0.21), make(106, 0.0, 200.0, 0.21)]
-    far_short = make(9, 10.0, 20.0, 0.09)
-    all_tracks = near_base + near_dup + [far_short]
-
-    try:
-        PL._ACTIVE_MAX_TRACKS = 6
-
-        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
-            if duration > 500.0:
-                return near_base
-            return list(tracks)
-
-        PL._select_active_players = fake_pick
-        out = PL._select_active_players_windowed(all_tracks, fps, 1500.0, viewpoint="rear",
-                                                  aspect=1.7778)
-        ids = sorted(t.track_id for t in out)
-        check("截断后数量不超过上限", len(out) <= 6, str(ids))
-        check("全片基准轨迹始终保留", {101, 102, 103, 104} <= set(ids), str(ids))
-        check("远侧短轨不被近侧的时间覆盖顶替", 9 in ids, str(ids))
-        check("时间冗余的近侧长轨让位", 105 not in ids and 106 not in ids, str(ids))
-    finally:
-        PL._select_active_players = orig_pick
-        PL._ACTIVE_MAX_TRACKS = orig_cap
-
-
-def test_cap_uses_window_level_band_truth() -> None:
-    """The cap must bucket tracks by the band that PICKED them (window-level truth), not by
-    whole-video band statistics.
-
-    Measured on clip1: the full-video candidate spectrum (hundreds of spectator tracks at
-    0.036-0.095) drags the whole-video band split down to 0.095, which misclassifies real
-    far-side player fragments (h 0.102-0.105) into the NEAR band; their seconds are then
-    "replaced" by near-side coverage and the band-aware cap still drops them. Window-level
-    banding (no spectator crowd inside one 180 s window) classifies those same tracks as
-    far correctly -- so the pick stamps its band and the cap trusts the stamp.
-    """
-    print("\n球员选人：截断按选人时的带归属（窗口级真值）（回归）")
-    fps = 12.0
-    orig_pick = PL._select_active_players
-    orig_cap = PL._ACTIVE_MAX_TRACKS
-
-    def make(tid: int, t0: float, span_s: float, h: float) -> PL.PlayerTrack:
-        n = int(span_s * fps)
-        tr = PL.PlayerTrack(
-            track_id=tid,
-            frames=[int(round((t0 + i / fps) * fps)) for i in range(n)],
-            times=[t0 + i / fps for i in range(n)],
-            boxes=[(0.45 - 0.25 * h, 0.5 - 0.5 * h, 0.45 + 0.25 * h, 0.5 + 0.5 * h)] * n,
-            speeds=[0.05] * n,
-            confidences=[0.9] * n,
-        )
-        tr.mean_area = tr.max_area = 0.5 * h * h
-        tr.mean_speed, tr.max_speed = 0.05, 0.10
-        tr.total_travel = 0.05 * n
-        return tr
-
-    near_base = [make(101, 0.0, 200.0, 0.21), make(102, 0.0, 200.0, 0.21),
-                 make(103, 1000.0, 200.0, 0.21), make(104, 1000.0, 200.0, 0.21)]
-    near_dup = [make(105, 0.0, 200.0, 0.21), make(106, 0.0, 200.0, 0.21)]
-    far_short = make(9, 10.0, 20.0, 0.10)
-    # A spectator crowd far smaller than the real far player: its only role here is to
-    # drag the WHOLE-VIDEO band split below 0.10, misclassifying the far player as "near".
-    crowd = [make(200 + i, float(i), 10.0 / fps / 10 * 12, 0.04) for i in range(6)]
-    all_tracks = near_base + near_dup + [far_short] + crowd
-
-    try:
-        PL._ACTIVE_MAX_TRACKS = 6
-
-        def fake_pick(tracks, fps_, duration, max_players=4, viewpoint="unknown",
-                      boxes=None, aspect=1.7778, size_filter=None):
-            if duration > 500.0:
-                for t in near_base:
-                    t.band_hint = 1
-                return near_base
-            # Window-level truth: the window's own banding classifies the far player (0.10)
-            # as far (band 0) because the spectator crowd is tiny/absent there.
-            for t in tracks:
-                t.band_hint = 0 if _sz(t, 1.7778) <= 0.13 else 1
-            return list(tracks)
-
-        def _sz(t, aspect):
-            return PL._track_median_size(t, aspect)
-
-        PL._select_active_players = fake_pick
-        out = PL._select_active_players_windowed(all_tracks, fps, 1500.0, viewpoint="rear",
-                                                  aspect=1.7778)
-        ids = sorted(t.track_id for t in out)
-        check("截断后数量不超过上限", len(out) <= 6, str(ids))
-        check("全片基准轨迹始终保留", {101, 102, 103, 104} <= set(ids), str(ids))
-        check("被全片分带误划为近侧的远侧短轨仍幸存", 9 in ids, str(ids))
-        check("时间冗余的近侧长轨让位", 105 not in ids and 106 not in ids, str(ids))
-    finally:
-        PL._select_active_players = orig_pick
-        PL._ACTIVE_MAX_TRACKS = orig_cap
+    # Five candidates visible -> doubles quota (4), so exactly one must lose the slot.
+    tracks = [
+        track_at(11, (0.50, 0.60)),    # deep on court -> space 1.0
+        track_at(14, (0.60, 0.60)),    # deep on court -> space 1.0
+        track_at(12, (0.50, 0.315)),   # 0.015 inside the far line -> space 0.75
+        track_at(15, (0.55, 0.318)),   # 0.018 inside -> space 0.9
+        track_at(13, (0.205, 0.60)),   # 0.005 inside the sideline -> space 0.25 (worst)
+    ]
+    n = int(200.0 * fps)
+    sel = PL._select_players_per_frame(
+        tracks, fps, 200.0, sample_fps=fps, viewpoint="rear",
+        aspect=4.0 / 3.0, roi_poly=poly, n_frames=n,
+    )
+    picked = sel.ids_per_frame[0]
+    check("双打配额只留四条", len(picked) == 4, str(sorted(picked)))
+    check("最靠场内的轨迹优先", {11, 14} <= picked, str(sorted(picked)))
+    check("贴边的轨迹被挤出", 13 not in picked, str(sorted(picked)))
+    # Without a polygon the spatial prior is a constant, so the ranking falls back to the other
+    # terms (all equal here) and only the quota matters.
+    no_poly = PL._select_players_per_frame(
+        tracks, fps, 200.0, sample_fps=fps, aspect=4.0 / 3.0, n_frames=n,
+    ).ids_per_frame[0]
+    check("无多边形时先验为常数、只受配额约束", len(no_poly) == 4, str(sorted(no_poly)))
 
 
 # ------------------------------------------------------------------ Manual calibration
@@ -912,6 +1021,47 @@ def test_match_format_stats() -> None:
     check("稳定 code 集合",
           {PL.MATCH_FORMAT_SINGLE, PL.MATCH_FORMAT_DOUBLES, PL.MATCH_FORMAT_UNKNOWN}
           == {"single", "doubles", "unknown"})
+    # The runtime input: the number of **distinct people visible** per frame (integers).
+    ws = PL.match_format_stats(np.full(n, 2.0, dtype=np.float32), fps=12.0,
+                               source=PL.MATCH_SOURCE_VISIBLE_PEOPLE)
+    check("可见人数恒为 2 -> single", ws["format"] == PL.MATCH_FORMAT_SINGLE,
+          f"{ws['format']} ge3={ws['frac_ge3']}")
+    check("来源标注 visible_people", ws["source"] == "visible_people", ws["source"])
+    wd = PL.match_format_stats(np.full(n, 4.0, dtype=np.float32), fps=12.0,
+                               source=PL.MATCH_SOURCE_VISIBLE_PEOPLE)
+    check("可见人数恒为 4 -> doubles", wd["format"] == PL.MATCH_FORMAT_DOUBLES,
+          wd["format"])
+    # Runtime modes: the report must echo the verdict the selector actually used.
+    modes = np.full(n, 2, dtype=np.int16)
+    modes[: int(n * 0.7)] = 4
+    mo = PL.match_format_stats(np.full(n, 3.0, dtype=np.float32), fps=12.0, modes=modes,
+                               source=PL.MATCH_SOURCE_VISIBLE_PEOPLE)
+    check("运行期模式主导双打 -> doubles", mo["format"] == PL.MATCH_FORMAT_DOUBLES, mo["format"])
+    check("运行期模式占比 (70% 双打)", abs(mo["mode_doubles_frac"] - 0.7) < 0.02,
+          str(mo["mode_doubles_frac"]))
+    check("运行期模式占比 (30% 单打)", abs(mo["mode_single_frac"] - 0.3) < 0.02,
+          str(mo["mode_single_frac"]))
+    check("模式切换次数", mo["mode_switches"] == 1, str(mo["mode_switches"]))
+    check("模式区间切分",
+          len(mo["segments"]) == 2 and mo["segments"][0]["mode"] == "doubles"
+          and abs(mo["segments"][0]["end"] - 0.7 * n / 12.0) < 0.5, str(mo["segments"]))
+    check("模式等长的空输入安全降级",
+          PL.match_format_stats(np.zeros(0, dtype=np.float32), modes=np.zeros(0))["format"]
+          == PL.MATCH_FORMAT_UNKNOWN)
+    check("长度不匹配的 modes 被忽略",
+          PL.match_format_stats(np.full(600, 4, dtype=np.float32), fps=12.0,
+                                modes=np.full(10, 2, dtype=np.int16))["format"]
+          == PL.MATCH_FORMAT_DOUBLES)
+    half = np.full(n, 2, dtype=np.int16)
+    half[: n // 2] = 4
+    check("运行期模式五五开 -> unknown",
+          PL.match_format_stats(np.full(n, 3.0, dtype=np.float32), fps=12.0, modes=half)["format"]
+          == PL.MATCH_FORMAT_UNKNOWN)
+    check("模式区间时间轴对齐",
+          PL._mode_segments(np.array([2, 2, 4, 4], dtype=np.int16), 2.0)
+          == [{"start": 0.0, "end": 1.0, "mode": "single"},
+              {"start": 1.0, "end": 2.0, "mode": "doubles"}],
+          str(PL._mode_segments(np.array([2, 2, 4, 4], dtype=np.int16), 2.0)))
 
 
 def test_join_abutting() -> None:
@@ -1968,7 +2118,7 @@ def _hit_gate_result(threshold: float = 0.22):
     res = AnalysisResult(
         media_id="m_gate", status="done",
         params=AnalysisParams(min_rally_seconds=2.0, pre_roll=0.5, post_roll=0.5,
-                              pose_gate_threshold=threshold),
+                              use_audio=True, pose_gate_threshold=threshold),
         signals=sig, stats={"audio_reliability": 0.8})
     return res, peaks, neighbors
 
@@ -2034,17 +2184,148 @@ def test_resegment_respects_use_audio() -> None:
     check("原始击球序列未被改写",
           list(off.signals.get("hit_times_raw") or []) == sorted(peaks + neighbors),
           str(off.signals.get("hit_times_raw")))
-    check("关音频后回合不带拍数",
-          all(r.features.shot_count == 0 for r in off.rallies),
+    visual = off.stats.get("visual_shots") or {}
+    check("关音频后评分改用视觉击球来源", visual.get("source") == "pose", str(visual))
+    check("关音频后回合仍有拍数（不再全为 0）",
+          all(r.features.shot_count > 0 for r in off.rallies),
           str([r.features.shot_count for r in off.rallies]))
+    check("关音频后评分不是零拍低分口径",
+          all(r.scores.total > 10 for r in off.rallies),
+          str([round(r.scores.total, 1) for r in off.rallies]))
     check("门控诊断标记 audio_off",
           (off.stats.get("pose_trace") or {}).get("regate") == "audio_off",
           str(off.stats.get("pose_trace")))
+
+    # Pose off must not silently reuse the stored pose curves: scoring degrades to the duration prior.
+    no_pose = params_off.model_copy(deep=True)
+    no_pose.use_pose = False
+    prior = P.resegment(res, no_pose)
+    check("关姿态后不再使用已存姿态曲线",
+          (prior.stats.get("visual_shots") or {}).get("source") == "duration_prior",
+          str(prior.stats.get("visual_shots")))
+    check("关姿态后仍有兜底拍数",
+          all(r.features.shot_count > 0 for r in prior.rallies),
+          str([r.features.shot_count for r in prior.rallies]))
+    check("时长先验不伪造扣杀/连续对抗语义",
+          all(r.features.smash_proxy == 0 and r.features.confrontation_streak == 1
+              for r in prior.rallies),
+          str([(r.features.smash_proxy, r.features.confrontation_streak)
+               for r in prior.rallies]))
 
     back = P.resegment(off, params_on)
     check("切回开音频后恢复门控序列",
           list(back.signals.get("hit_times") or []) == kept_on,
           f"{back.signals.get('hit_times')}")
+
+
+def test_pose_and_detection_use_yolo26_weights() -> None:
+    """Pose defaults to YOLO26n-pose; detection defaults to YOLO26n."""
+    print("\n模型：检测 YOLO26n / 姿态 YOLO26n-pose")
+    from bms.analysis import pose as POSE
+
+    pose_default = inspect.signature(POSE.analyze_pose).parameters["model_name"].default
+    cache_default = inspect.signature(POSE.pose_cache_path).parameters["model_name"].default
+    det_default = inspect.signature(PL.analyze_players).parameters["model_name"].default
+    probe_default = inspect.signature(PL.probe_boxes).parameters["model_name"].default
+    tag_default = inspect.signature(PL.boxes_cache_tag).parameters["model_name"].default
+    check("姿态模型默认 YOLO26n-pose", str(pose_default) == "yolo26n-pose.pt", str(pose_default))
+    check("姿态缓存路径默认同一模型", str(cache_default) == str(pose_default), str(cache_default))
+    check("球员检测默认 YOLO26n", str(det_default) == "yolo26n.pt", str(det_default))
+    check("尺寸探测默认 YOLO26n", str(probe_default) == "yolo26n.pt", str(probe_default))
+    check("框缓存指纹默认 YOLO26n", str(tag_default) == "yolo26n.pt", str(tag_default))
+
+
+def test_audio_default_off_and_visual_shots_estimate() -> None:
+    """Hit-sound detection defaults off; visual shots cover pose / motion / duration-prior sources."""
+    print("\n视觉评分：默认关闭击球声 + 替代击球源")
+    check("分析参数默认关闭击球声检测", AnalysisParams().use_audio is False)
+    pose = _synthetic_pose(peaks=(3.0, 8.0, 15.0, 22.0))
+    ivs = [RA.RallyInterval(start=1.0, end=10.0, confidence=0.8),
+           RA.RallyInterval(start=12.0, end=27.0, confidence=0.8)]
+
+    est = VS.estimate(pose=pose, intervals=ivs, duration=30.0)
+    check("姿态峰作为首选来源", est.trace.get("source") == "pose", str(est.trace))
+    check("姿态事件数与合成峰一致", est.hits.times.size == 4,
+          str(est.hits.times.round(2).tolist()))
+    check("无需用时长先验补洞", est.trace.get("filled_intervals") == 0, str(est.trace))
+
+    low = _synthetic_pose(peaks=(3.0, 8.0, 15.0, 22.0), coverage=0.1)
+    est_low = VS.estimate(pose=low, intervals=ivs, duration=30.0)
+    check("姿态覆盖率不足时不采用姿态", est_low.trace.get("source") == "duration_prior",
+          str(est_low.trace))
+    check("每个回合都被补上拍数",
+          all(bool(np.any((est_low.hits.times >= iv.start) & (est_low.hits.times <= iv.end)))
+              for iv in ivs),
+          str(est_low.hits.times.round(2).tolist()))
+
+    # A detection gap inside one rally must be filled rather than scored as "zero shots".
+    sparse = _synthetic_pose(peaks=(3.0, 8.0, 15.0))
+    sparse_ivs = [RA.RallyInterval(start=1.0, end=10.0),
+                  RA.RallyInterval(start=22.0, end=30.0)]
+    est_gap = VS.estimate(pose=sparse, intervals=sparse_ivs, duration=30.0)
+    check("空回合被时长先验补洞", est_gap.trace.get("filled_intervals") == 1,
+          str(est_gap.trace))
+    check("补洞后两个回合都有拍",
+          all(bool(np.any((est_gap.hits.times >= iv.start) & (est_gap.hits.times <= iv.end)))
+              for iv in sparse_ivs),
+          str(est_gap.hits.times.round(2).tolist()))
+
+    # Full-analysis helper: source selection must mirror the switch.
+    hits_off, trace_off = P._score_hits_for(
+        ivs, hits=None, params=AnalysisParams(use_audio=False), pose_sig=pose,
+        duration=30.0)
+    check("全量分析关音频时走视觉击球", trace_off.get("source") == "pose",
+          str(trace_off))
+    check("全量分析关音频时评分击球非空", hits_off.times.size == 4,
+          str(hits_off.times.round(2).tolist()))
+    audio_hits = _hits([3.0, 8.0, 15.0, 22.0])
+    hits_on, trace_on = P._score_hits_for(
+        ivs, hits=audio_hits, params=AnalysisParams(use_audio=True), pose_sig=pose,
+        duration=30.0)
+    check("全量分析开音频时沿用音频击球", trace_on.get("source") == "audio",
+          str(trace_on))
+    check("开音频时击球序列与音频一致", hits_on is audio_hits)
+
+
+def test_visual_scoring_matches_audio_scaling() -> None:
+    """Both shot sources must feed one scoring formula and stay on the same scale."""
+    print("\n视觉评分：两种来源口径一致")
+    fps, dur = 12.0, 30.0
+    n = int(dur * fps)
+    fused = RA.FusedSignal(fps=fps, duration=dur,
+                           activity=np.full(n, 0.5, dtype=np.float32))
+    ivs = [RA.RallyInterval(start=1.0, end=10.0, confidence=0.8),
+           RA.RallyInterval(start=12.0, end=27.0, confidence=0.8)]
+    pose = _synthetic_pose(peaks=(3.0, 8.0, 15.0, 22.0))
+    audio = _hits([3.0, 8.0, 15.0, 22.0])
+    visual = VS.estimate(pose=pose, intervals=ivs, duration=dur).hits
+
+    def score_with(hits) -> list[float]:
+        iv_copy = copy.deepcopy(ivs)
+        RA.attach_features(iv_copy, fused, hits=hits)
+        quality = [{"sharpness": 0.6, "shake": 0.3, "subject_size": 0.25} for _ in iv_copy]
+        sc = SC.score_rallies([iv.features for iv in iv_copy], SC.PRESETS["balanced"], quality)
+        return [float(x["total"]) for x in sc]
+
+    audio_totals = score_with(audio)
+    visual_totals = score_with(visual)
+    check("两种来源分差 < 8 分",
+          max(abs(a - b) for a, b in zip(audio_totals, visual_totals)) < 8.0,
+          f"{audio_totals} vs {visual_totals}")
+    check("视觉来源不是零拍口径", all(v > 8 for v in visual_totals), str(visual_totals))
+
+    # Recomputing scores from stored features (weight switching / cross-media) must carry the
+    # highlight inputs; otherwise that dimension silently collapses to a constant.
+    from bms.core.models import Rally, RallyFeatures
+    from bms.main import _rescore_features
+
+    r = Rally(features=RallyFeatures(duration=10.0, shot_count=6,
+                                     smash_proxy=3.0, confrontation_streak=6.0,
+                                     tempo_variance=0.4))
+    feats = _rescore_features(r)
+    check("重算分携带 smash_proxy/streak/variance",
+          feats.get("smash_proxy") == 3.0 and feats.get("confrontation_streak") == 6.0
+          and feats.get("tempo_variance") == 0.4, str(feats))
 
 
 def test_segment_rallies_reuses_player_signal() -> None:
@@ -3338,7 +3619,7 @@ def _cc_layout(data: Path, models: Path) -> None:
     (wv / "Default" / "Network").mkdir(parents=True, exist_ok=True)
     (wv / "Default" / "Network" / "Cookies").write_bytes(b"keep")
     # Models: loose weights + a fetched model directory
-    (models / "yolo11n.pt").write_bytes(b"x" * 10)
+    (models / "yolo26n.pt").write_bytes(b"x" * 10)
     (models / "vosk-model-small-cn-0.22").mkdir(parents=True, exist_ok=True)
     (models / "vosk-model-small-cn-0.22" / "am").mkdir(parents=True, exist_ok=True)
     (models / "vosk-model-small-cn-0.22" / "am" / "final.mdl").write_bytes(b"x" * 10)
@@ -3399,7 +3680,7 @@ def test_cachemgmt_clear_selected_only_keeps_dirs() -> None:
           and not (data / "cache" / "pose" / "pose.npz").exists())
     check("未选项保留", (data / "cache" / "audio" / "a.wav").exists()
           and (data / "uploads" / "src.mp4").exists()
-          and (models / "yolo11n.pt").exists())
+          and (models / "yolo26n.pt").exists())
     check("进度回调覆盖全部文件", progress and progress[-1][0] == progress[-1][1] == 4)
 
 
@@ -3418,11 +3699,11 @@ def test_cachemgmt_models_require_confirm() -> None:
 
     with pytest.raises(ValueError):
         CM.clear_targets(["models"], data_dir=data, models_dir=models)
-    check("未确认时模型保留", (models / "yolo11n.pt").exists())
+    check("未确认时模型保留", (models / "yolo26n.pt").exists())
     with pytest.raises(ValueError):
         CM.clear_targets(["nope"], data_dir=data, models_dir=models)
     res = CM.clear_targets(["models"], data_dir=data, models_dir=models, confirms={"models": True})
-    check("确认后删除权重与模型目录", not (models / "yolo11n.pt").exists()
+    check("确认后删除权重与模型目录", not (models / "yolo26n.pt").exists()
           and not (models / "vosk-model-small-cn-0.22").exists())
     check("模型清理返回释放量", res["freed"] == 20)
 
@@ -3816,6 +4097,59 @@ def test_boxes_cache_v2_raw_grid_remap() -> None:
         check("对齐 v2 可加载", doc2 is not None and abs(float(doc2["raw_fps"] or 0) - 12.0) < 1e-9)
 
 
+def test_overlay_pose_cache_fallback() -> None:
+    """The overlay must find skeletons when only ``pose_trace.cache_tag`` holds the npz tag.
+
+    Regression: ``stats["pose_cache"]`` used to be written before ``derive_stats`` replaced the
+    whole stats dict, so every full analysis silently lost the reference; the annotation overlay
+    then drew boxes but no pose. Existing analyses must keep working via the trace fallback.
+    """
+    print("\n叠加层：姿态缓存 tag 回退到 pose_trace")
+    import tempfile
+    from types import SimpleNamespace
+
+    from bms.analysis import pose as POSE
+    from bms.api import annotations as ANN_API
+
+    fps, n = 12.0, 24
+    kp_xy = np.full((2, POSE.KP_COUNT, 2), int(0.5 * POSE._KP_XY_QUANT), dtype=np.uint16)
+    kp_conf = np.full((2, POSE.KP_COUNT), 240, dtype=np.uint8)
+    with tempfile.TemporaryDirectory() as td:
+        np.savez_compressed(
+            Path(td) / "pose_unittest_overlay.npz",
+            version=np.int64(POSE.POSE_CACHE_VERSION),
+            fps=np.float64(fps), duration=np.float64(n / fps),
+            swing=np.zeros(n, dtype=np.float32), ok=np.zeros(n, dtype=np.float32),
+            overhead=np.zeros(n, dtype=np.float32),
+            coverage=np.float64(1.0), quiet=np.float64(0.0),
+            kp_frame=np.asarray([0, 12], dtype=np.int32),
+            kp_fi=np.asarray([0, 0], dtype=np.uint8),
+            kp_track=np.asarray([7, 7], dtype=np.int32),
+            kp_xy=kp_xy, kp_conf=kp_conf,
+        )
+        res = AnalysisResult(
+            media_id="m_pose", status="done", params=AnalysisParams(),
+            stats={"pose_trace": {"cache_tag": "pose_unittest_overlay"}},
+        )
+        fake_proj = SimpleNamespace(analyses={"m_pose": res})
+        fake_media = SimpleNamespace(name="clip.mp4")
+        orig_load, orig_media, orig_dir = ANN_API._load, ANN_API._media, POSE.default_cache_dir
+        try:
+            ANN_API._load = lambda pid: fake_proj
+            ANN_API._media = lambda proj, mid: fake_media
+            POSE.default_cache_dir = lambda: Path(td)
+            out = ANN_API.get_annotation_overlay("p_x", "m_pose", 0.0, 2.0)
+            check("仅 pose_trace 也报告骨架可用", out["skeletons_available"] is True)
+            skel = [sk for f in out["frames"] for sk in f["skeletons"]]
+            check("骨架随窗口返回（2 帧 × 1 人）", len(skel) == 2 and skel[0]["track"] == 7)
+            check("关键点数量为 17", all(len(sk["kp"]) == 17 for sk in skel))
+            sig = ANN_API.get_annotation_signals("p_x", "m_pose")
+            check("信号接口 has_pose_cache 同样回退", sig["has_pose_cache"] is True)
+        finally:
+            ANN_API._load, ANN_API._media = orig_load, orig_media
+            POSE.default_cache_dir = orig_dir
+
+
 def test_track_hole_interpolation_rules() -> None:
     """Short same-track holes are linearly filled; >2s gaps, occupied slots and inactive
     tracks are left alone."""
@@ -4085,9 +4419,13 @@ def main() -> int:
     test_polygon_calibration()
     test_select_active_players_signature_end_to_end()
     test_select_active_players_depth_bands()
-    test_select_active_players_windowed_cap_keeps_unique_coverage()
-    test_cap_band_aware_coverage_keeps_far_short_tracks()
-    test_cap_uses_window_level_band_truth()
+    test_cap_by_coverage_keeps_unique_time_range()
+    test_select_players_per_frame_keeps_far_player()
+    test_visible_people_survive_id_churn()
+    test_mode_sequence_trailing_median()
+    test_stitch_orphan_detections()
+    test_foot_in_court_exact_boundary()
+    test_space_prior_ranks_central_track()
     test_manual_quad_parsing()
     test_quiet_spans_and_segmentation()
     test_detection_coverage()
@@ -4114,6 +4452,7 @@ def main() -> int:
     test_shuttle_budget_seconds_frame_unit()
     test_rebuild_fused_weight_overrides()
     test_pose_swing_peaks()
+    test_pose_and_detection_use_yolo26_weights()
     test_pose_hit_gating_one_to_one()
     test_pose_gate_degrades()
     test_pose_keypoint_crop_inverse_map()
@@ -4121,6 +4460,7 @@ def main() -> int:
     test_boxes_cache_v2_roundtrip_and_v1_compat()
     test_boxes_cache_v3_raw_align_and_interp()
     test_boxes_cache_v2_raw_grid_remap()
+    test_overlay_pose_cache_fallback()
     test_track_hole_interpolation_rules()
     test_junction_edge_clip_endpoints()
     test_npz_lru_cache()
@@ -4128,6 +4468,8 @@ def main() -> int:
     test_resegment_regates_hits()
     test_resegment_gate_degrades_without_raw()
     test_resegment_respects_use_audio()
+    test_audio_default_off_and_visual_shots_estimate()
+    test_visual_scoring_matches_audio_scaling()
     test_segment_rallies_reuses_player_signal()
     test_merge_by_availability_windows()
     test_annotation_evidence_and_metrics()

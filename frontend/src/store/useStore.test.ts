@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useStore, consumeMediaPick } from './useStore'
+import { useStore, consumeMediaPick, DEFAULT_PARAMS } from './useStore'
 import { api } from '../lib/api'
 import type { MediaInfo, Project } from '../lib/types'
 
@@ -238,5 +238,13 @@ describe('manual court calibration gates analysis', () => {
     seedCourtProject({ m1: COURT_POLY, m2: COURT_POLY })
     await useStore.getState().runAnalysisBatch()
     expect(mockedAnalyzeBatch).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('default analysis parameters', () => {
+  it('keeps hit-sound detection off by default', () => {
+    // Multi-court venues contaminate the audio hit sequence; visual scoring covers shots instead.
+    expect(DEFAULT_PARAMS.use_audio).toBe(false)
+    expect(useStore.getState().params.use_audio).toBe(false)
   })
 })

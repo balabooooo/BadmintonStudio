@@ -46,6 +46,11 @@ from ..i18n import tr
 
 EPS = 1e-9
 
+#: Pose weights. YOLO26n-pose reports high keypoint AP (COCO pose mAP50-95 57.2) at the same
+#: parameter count / FLOPs as the nano class, and emits person boxes in the same pass (the player
+#: detector uses YOLO26n separately).
+DEFAULT_POSE_MODEL = "yolo26n-pose.pt"
+
 #: Npz cache layout version. v1 stores only the derived swing/ok/overhead curves;
 #: v2 additionally stores the full 17-keypoint skeleton of every detected slot;
 #: v3 fixes the crop->frame keypoint mapping (v2 skeletons projected far off the player and its
@@ -138,7 +143,7 @@ def analyze_pose(
     video_path: str,
     frame_boxes: list,
     boxes_fps: float,
-    model_name: str = "yolo11n-pose.pt",
+    model_name: str = DEFAULT_POSE_MODEL,
     crop_size: int = 192,
     margin: float = 0.35,
     up_shift: float = 0.05,
@@ -745,7 +750,7 @@ def _cache_path(cache_dir, video_path: str, fps: float, crop: int,
 
 def pose_cache_path(cache_dir, video_path: str, boxes_fps: float, frame_boxes: list,
                     crop_size: int = 192, margin: float = 0.35, up_shift: float = 0.05,
-                    model_name: str = "yolo11n-pose.pt") -> Path:
+                    model_name: str = DEFAULT_POSE_MODEL) -> Path:
     """Public resolver for the pose npz of a given (video, boxes) pair."""
     return _cache_path(cache_dir, video_path, boxes_fps, crop_size,
                        margin, up_shift, model_name,
@@ -906,6 +911,7 @@ def _pick_device(device: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_POSE_MODEL",
     "PoseSignal",
     "analyze_pose",
     "filter_hits",

@@ -146,6 +146,20 @@ def _pool_curve(values: list, target: int = 600) -> list[float]:
     return [round(float(v), 3) for v in pooled]
 
 
+def _pose_cache_tag(stats: dict) -> str:
+    """Resolve the pose npz tag for the overlay (``pose_cache``, else the pose trace).
+
+    ``stats.pose_cache`` is canonical. Analyses written before that key was moved after
+    ``derive_stats`` only carry the tag inside ``stats.pose_trace``; falling back to it keeps
+    the skeleton layer visible for existing projects without a full AI re-run.
+    """
+    tag = stats.get("pose_cache")
+    if tag:
+        return str(tag)
+    trace = stats.get("pose_trace")
+    return str(trace.get("cache_tag") or "") if isinstance(trace, dict) else ""
+
+
 @router.get("/signals")
 def get_annotation_signals(pid: str, mid: str) -> dict:
     """Downsampled multi-track signals for the annotation-page signal panel.
@@ -194,7 +208,7 @@ def get_annotation_signals(pid: str, mid: str) -> dict:
         "hit_times": sig.get("hit_times") or [],
         "hit_times_raw": sig.get("hit_times_raw") or [],
         "has_boxes_cache": bool(stats.get("boxes_cache")),
-        "has_pose_cache": bool(stats.get("pose_cache")),
+        "has_pose_cache": bool(_pose_cache_tag(stats)),
     }
 
 
@@ -230,7 +244,7 @@ def get_annotation_overlay(pid: str, mid: str, t0: float = 0.0, t1: float = 1.0)
 
     t_start = time.perf_counter()
     boxes_tag = str(stats.get("boxes_cache") or "")
-    pose_tag = str(stats.get("pose_cache") or "")
+    pose_tag = _pose_cache_tag(stats)
     t_boxes0 = time.perf_counter()
     boxes_doc = PL.load_boxes_cache(boxes_tag) if boxes_tag else None
     t_boxes_ms = (time.perf_counter() - t_boxes0) * 1000.0

@@ -107,6 +107,24 @@ describe('OptimizePanel', () => {
     expect(screen.queryByText(/match format/i)).toBeNull()
   })
 
+  it('shows the runtime singles/doubles split under the format badge', () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    renderPanel({
+      matchFormat: 'single',
+      matchMode: { single: 62, doubles: 38, switches: 3 },
+    })
+    expect(screen.getByText(/62% singles \/ 38% doubles, 3 switches/i)).toBeInTheDocument()
+    act(() => useStore.setState({ lang: 'zh' }))
+    expect(screen.getByText(/单打 62% \/ 双打 38%，切换 3 次/)).toBeInTheDocument()
+  })
+
+  it('omits the runtime split when the analysis predates it', () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    renderPanel({ matchFormat: 'single' })
+    expect(screen.getByText(/match format/i)).toBeInTheDocument()
+    expect(screen.queryByText(/switches/i)).toBeNull()
+  })
+
   it('shows live percentage + stage while optimizing and locks apply actions', () => {
     act(() => useStore.setState({ lang: 'en' }))
     const { props } = renderPanel({ optimizing: true, progress: 0.426, stage: 'sensitivity' })

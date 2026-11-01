@@ -110,9 +110,9 @@ cd ..
 Model weights are **not committed to the repository** (they are large binaries). They are obtained
 automatically or with a small script:
 
-- **YOLO player/pose weights** (`yolo11n.pt`, `yolo11n-pose.pt`): detected in this order — explicit path →
-  `models/` → project root → otherwise `ultralytics` downloads them into `models/` on first use. To keep a
-  machine offline, place the two `.pt` files in `models/` yourself (they are ~5.6 MB and ~6.2 MB).
+- **YOLO weights** (`yolo26n.pt` for player detection, `yolo26n-pose.pt` for pose): detected in this order — explicit path →
+  `models/` → project root → otherwise `ultralytics` downloads it into `models/` on first use. To keep a
+  machine offline, place both `.pt` files in `models/` yourself (~5.5 MB and ~7.9 MB).
 - **faster-whisper speech model** (optional, for voice-command scoring): pre-fetch it with:
 
   ```powershell
@@ -245,18 +245,44 @@ into `ultralytics`) to join them into tracks:
 - An adapter drives the tracker frame-by-frame over sampled frames while keeping the original batched GPU
   inference (not per-frame `model.track()`)
 
-It then selects the **actual match players** by "large box + fast movement + present for a long time"
-(spectators and people on adjacent courts have small boxes and barely move, so they are excluded).
+It then selects the **actual match players** frame by frame (`_select_players_per_frame`): when the boxes
+present in a frame already fit the singles/doubles quota, all of them are players — so a far-side player
+whose perspective-shrunk pixel motion looks tiny is not filtered out; otherwise each depth band fills its
+quota by each track's own lifetime evidence (coverage, depth-normalized motion, band-local size), and short
+fragments do not take a slot. Spectators and people on adjacent courts are excluded earlier, by the court
+ROI and the box-size histogram.
 
 The output is per-frame "number of active players on court", "average speed" and "maximum speed" — the most
 reliable rally signal.
 
-The per-frame active-player count also yields a `stats.match_format` recommendation (single / doubles /
-unknown): over frames with at least one player present (detection gaps excluded), doubles is declared when
-≥4 players fill ≥34% of covered frames or ≥3 fill ≥60%, singles when ≥3-person frames stay ≤15%, and the
-band in between (or evidence under 300 frames / 30% coverage) stays `unknown`. It is a **recommendation
-only** — the scoring preset is never switched silently; the annotation page shows the verdict and its
-evidence. The three labeled clips are all singles footage, so the doubles thresholds remain unvalidated.
+`stats.match_format` reports the singles/doubles verdict. Its input is deliberately **not** the selected
+player count: selection produces that number, so feeding it back would let a selector that dropped a player
+"confirm" its own mistake as singles. The primary input is `PlayerSignal.format_count`, the number of
+**distinct people visible on court**, counted before selection and spatially deduplicated (two overlapping
+track ids for one person collapse into one; `IoU ≥ 0.75`). It is deliberately **not** a per-track tally and
+not weighted by track duration: ByteTrack restarts an id after any gap longer than 5 s, so in a doubles
+rally each player's track fragments every 30–60 s — weighting tracks by their span made four visible players
+add up to ~2.7, and the 82-minute clip1 stayed on singles for its entire length, including a clear doubles
+stretch at 21:34.
+
+`PlayerSignal.format_mode` then holds the per-frame mode (2 = singles / 4 = doubles) the selector actually
+applied. The switch point is **2.5 visible people**, i.e. "three people inside the court means doubles":
+requiring four would need all four visible at once, which tracking rarely delivers even in a clear doubles
+rally (a partner occludes another, a low-confidence box is dropped, two boxes merge), so the per-second
+count in real doubles footage is mostly 3 with stretches of 4 — and a 3.5 threshold classified clip1's
+entire doubles session as singles. Three people *inside the calibrated court* is strong evidence because
+off-court people are already removed at admission. The count is then smoothed with a 9 s median and a
+**median over the trailing 180 s** with a ±0.25 hysteresis band. The trailing median replaced a "must stay
+on one side for 180 consecutive seconds" counter, which never fired on real footage because a doubles
+stretch dips below the threshold for a few seconds every minute and reset it; the median keeps the same
+inertia against a player walking out of the ROI to fetch the shuttle, without the reset pathology.
+
+The report then declares whichever side covers most of the covered time and stores the run-length
+`segments` (start/end seconds per mode) plus the switch count, which the annotation page shows under the
+badge. Without `format_mode` it falls back to the older count rule (doubles
+when ≥4 people fill ≥34% of covered frames or ≥3 fill ≥60%; singles when ≥3-person frames stay ≤15%).
+Verdicts need ≥300 covered frames and ≥30% coverage, and a 40–60% split stays `unknown`. It is a
+**recommendation only** — the scoring preset is never switched silently.
 
 **Detection floor and the visualization cache (`data/cache/boxes/boxes_<tag>.npz`)**: the inference floor is
 `LOW_CONF = 0.10` (historically 0.15). Everything at or above it is kept and fed to ByteTrack, whose
@@ -461,9 +487,15 @@ do not create it.
 - **Define boundaries with quiet segments**: start = the first clear movement after a pause ends; end = the
   last clear movement before the next pause. The resulting interval is exactly "the time the shuttle was in
   play", without fetching-shuttle walking.
-- "Select match players" becomes **per time window** (`_select_active_players_windowed`): each window ranks
-  only the tracks overlapping it, then the per-window results are unioned. Reassigning a player a new id in
-  one stretch no longer removes the signal there.
+- "Select match players" becomes **per frame** (`_select_players_per_frame`): each frame applies the
+  singles/doubles quota to the boxes that exist *now* — if the ROI holds no more boxes than the quota,
+  every box is a player, so a far-side player is kept even when perspective shrinks his motion. A track's
+  rank is backed only by its own lifetime evidence (coverage, depth-normalized motion, band-local size,
+  plus how far inside the calibrated boundary it plays), never by a window-wide beauty contest between
+  track ids. The singles/doubles format is a temporally filtered count of **distinct visible people**
+  (medians over ±4.5 s and over the trailing 180 s), deliberately *not* an "inside the court polygon"
+  test: the far player's foot median sits on the far baseline, so that criterion drops the far side
+  (measured). Reassigning a player a new id in one stretch no longer removes the signal there.
 - Then the **hit sequence** does the final correction: split at large gaps and anchor the end to the last
   hit (previous section).
 - When the shuttle signal is available, one more check: if almost no shuttle is seen in the core interval,
@@ -540,6 +572,13 @@ filter additionally drops clips where "the AI is not sure".
 ## Rally scoring
 
 Scoring is a **explainable formula**, not a black box (`analysis/scoring.py`).
+
+Shot evidence has two interchangeable sources, both producing the same feature fields so the formula
+and its scale never change: gated **hit sounds** when hit-sound detection is enabled, and **pose swing
+peaks** (`analysis/visual_shots.py`) when it is disabled. If pose is unavailable the visual estimator
+degrades to an even-tempo duration prior; the active source and the number of gap-filled rallies are
+recorded in `stats.visual_shots`. Hit-sound detection now defaults to **off**
+because neighboring courts in a shared gym contaminate the hit sequence; enable it only in a quiet venue.
 
 | Component | Basis |
 | --- | --- |
@@ -741,11 +780,12 @@ BadmintonStudio/
 │  │  ├─ audio_hits.py     Hit-sound detection + reliability estimation
 │  │  ├─ motion.py         Motion energy / shake / sharpness / activity heatmap
 │  │  ├─ court_calib.py    Court calibration (floor color → polygon → homography) + camera-angle detection
-│  │  ├─ players.py        YOLO detection + ByteTrack tracking + match-player selection (camera-adaptive + box size filtering)
+│  │  ├─ players.py        YOLO26n detection + ByteTrack tracking + match-player selection (camera-adaptive + box size filtering)
 │  │  ├─ shuttle.py        Shuttle candidate detection + parabolic trajectory association
 │  │  ├─ rally.py          Multimodal fusion + hysteresis state machine + boundary snapping
 │  │  ├─ rally_vision.py   Player-motion quiet-segment segmentation (primary) + activity-valley segmentation (fallback)
-│  │  ├─ pose.py           Pose-assist hit attribution + composite gate (local strength + pose evidence)
+│  │  ├─ pose.py           Crop-refined YOLO26-pose keypoints + hit attribution / composite gate
+│  │  ├─ visual_shots.py   Audio-independent shot estimation for scoring (pose peaks → duration prior)
 │  │  ├─ scoring.py        Six-dimension scoring (incl. highlight) + tags + statistics
 │  │  ├─ speech.py         Optional voice-command scoring (faster-whisper + near-homophone match)
 │  │  ├─ annotation.py     Manual annotation I/O + annotation-driven parameter search
@@ -853,7 +893,8 @@ above for how to pre-fetch the model.
 | --- | --- | --- |
 | Proxy generation (960×540 / 30 fps) | **177 s** | Full GPU chain, about 10× real time |
 | Audio track extraction | 15 s | |
-| Player detection and tracking | ~3.5 min | YOLO11n + custom tracker |
+| Player detection and tracking | ~3.5 min | YOLO26n + custom tracker |
+| Pose keypoints (crop-refined) | ~1.5-2 min / 30 min | YOLO26n-pose on cropped boxes |
 | Frame motion analysis | ~45 s | about 10 s per 5 minutes |
 | Fusion + segmentation + scoring | seconds | |
 | **Whole analysis pipeline** | **237 s** | 30 minutes → 13 rallies |
@@ -908,7 +949,7 @@ Calibration therefore represents the court as an **N-point polygon (4–24 point
 
 | Use | Representation |
 | --- | --- |
-| Decide "is the player on court" | **Polygon** (ray casting, boundary expanded 4%, see below) |
+| Decide "is the player on court" | **Polygon** (ray casting, boundary taken exactly as calibrated, see below) |
 | Analysis ROI (coarse range) | Bounding rectangle of the polygon |
 | Homography (who is nearer the camera, distance comparison) | **Largest inscribed quadrilateral** of the polygon |
 | Camera-angle decision | Homography + player distribution (unchanged) |
@@ -920,10 +961,21 @@ Calibration therefore represents the court as an **N-point polygon (4–24 point
 - **"How much it curved" is written into the result**: `calibration.distortion` is the extra area of the
   polygon over the fitted quadrilateral. Above 6%, `calibration.notes` warns of "a typical sign of
   ultra-wide/fisheye distortion".
-- **The polygon is expanded by 4%** (each edge moved outward by 0.04 frame units) before the on-court test.
-  The cost of judging the wrong way is asymmetric: keeping one extra person is only noise (size filtering
-  and activity scoring follow), while missing a real player breaks the downstream activity curve and crop
-  following.
+- **The polygon is used exactly as calibrated** (`ROI_POLY_MARGIN = 0`). It used to be expanded outward by
+  4% with the argument that "keeping one extra person is only noise". That assumption is wrong in practice:
+  4% of the frame is several metres, so people who stand or walk just outside the lines were admitted to
+  the tracker, and ByteTrack — which has no appearance model — then handed them the nearest player's track
+  id when that player was briefly missed. Measured on clip1: the far player's track (id 2) moved from the
+  far court (0.390, 0.576) at 4 s to a walker behind the sideline (0.210, 0.651) at 5 s, and by 13 s was
+  following a waiting person outside the baseline. Admission is the only place this can be fixed: a person
+  the tracker never receives cannot steal an id. Edge jitter is absorbed by the tracker's ~2 s buffer and
+  the short-gap interpolation, not by widening the court.
+- **Off-court people are additionally out-ranked, not just filtered.** Each candidate carries a spatial
+  score equal to how far its median foot point lies *inside* the boundary (signed distance to the nearest
+  edge, saturating at 2% of the frame), folded into the per-track credibility used when candidates compete
+  for a slot. Distance from the **boundary**, not from the court centre: under a rear camera the far player
+  legitimately stands on the far baseline, and a centre-distance prior would rank a bystander a metre off
+  the sideline above a player serving from the baseline.
 
 Calibration then **feeds back into the analysis**:
 

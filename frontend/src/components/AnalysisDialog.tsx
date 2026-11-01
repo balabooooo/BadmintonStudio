@@ -421,12 +421,17 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
         <Wand2 size={12} /> {tr('analysis.modulesTitle')}
       </SectionTitle>
       <div data-tour="dlg-modules" className="mb-4 grid gap-1.5 md:grid-cols-2">
-        <Toggle
-          checked={params.use_audio}
-          onChange={(v) => setParams({ use_audio: v })}
-          label={tr('analysis.toggle.audio.label')}
-          hint={tr('analysis.toggle.audio.hint')}
-        />
+        <div className="min-w-0">
+          <Toggle
+            checked={params.use_audio}
+            onChange={(v) => setParams({ use_audio: v })}
+            label={tr('analysis.toggle.audio.label')}
+            hint={tr('analysis.toggle.audio.hint')}
+          />
+          <p className="px-2.5 pb-1 text-[10px] leading-snug text-ink-400">
+            {tr('analysis.toggle.audio.warn')}
+          </p>
+        </div>
         <Toggle
           checked={params.use_motion}
           onChange={(v) => setParams({ use_motion: v })}
@@ -434,16 +439,10 @@ export default function AnalysisDialog({ open, onClose }: { open: boolean; onClo
           hint={tr('analysis.toggle.motion.hint')}
         />
         <Toggle
-          checked={params.use_players}
-          onChange={(v) => setParams({ use_players: v })}
+          checked={params.use_players && params.use_pose}
+          onChange={(v) => setParams({ use_players: v, use_pose: v })}
           label={tr('analysis.toggle.players.label')}
           hint={tr('analysis.toggle.players.hint')}
-        />
-        <Toggle
-          checked={params.use_pose}
-          onChange={(v) => setParams({ use_pose: v })}
-          label={tr('analysis.toggle.pose.label')}
-          hint={tr('analysis.toggle.pose.hint')}
         />
         <Toggle
           checked={params.use_shuttle}

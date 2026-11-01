@@ -102,6 +102,39 @@ export function tagColor(tag: string): string {
   return TAG_COLORS[tag] || '#6b7787'
 }
 
+/** One `stats.match_format.segments` entry: a time range (seconds) and its stable mode code. */
+export type FormatSegment = { start: number; end: number; mode: string }
+
+/**
+ * 回合区间内占主导的赛制稳定码（`single` / `doubles`）；没有可用的分段数据时返回 `null`。
+ *
+ * 判定按"与回合区间重叠时长最大"来选，所以跨过切换点的回合会归到覆盖它更多的那一侧；
+ * 这样每个回合都有唯一结论，不需要把回合强行对齐到分段边界。
+ */
+export function formatForSpan(
+  segments: FormatSegment[] | null | undefined,
+  start: number,
+  end: number,
+): string | null {
+  if (!segments || segments.length === 0 || !(end > start)) return null
+  const overlap: Record<string, number> = {}
+  for (const s of segments) {
+    const a = Math.max(start, s.start)
+    const b = Math.min(end, s.end)
+    if (b <= a) continue
+    overlap[s.mode] = (overlap[s.mode] || 0) + (b - a)
+  }
+  let best: string | null = null
+  let bestLen = 0
+  for (const [mode, len] of Object.entries(overlap)) {
+    if (len > bestLen) {
+      best = mode
+      bestLen = len
+    }
+  }
+  return best === 'single' || best === 'doubles' ? best : null
+}
+
 export function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }

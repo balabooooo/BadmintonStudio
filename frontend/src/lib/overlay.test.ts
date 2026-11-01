@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   selectFrame,
+  selectFrameAt,
   selectFrameTolerant,
   strictGap,
   visibleBoxes,
@@ -35,6 +36,52 @@ describe('selectFrameTolerant', () => {
 
   it('returns empty for empty frames regardless of tolerance', () => {
     expect(selectFrameTolerant([], 1, fps, 1)).toBeNull()
+  })
+})
+
+describe('selectFrameAt (12 fps data on a 30 fps video)', () => {
+  const a: OverlayFrame = {
+    t: 0,
+    boxes: [{ track: 1, xyxy: [0, 0, 0.1, 0.2], conf: 0.9 }],
+    skeletons: [{ track: 1, kp: [[0, 0, 0.9]] }],
+  }
+  const b: OverlayFrame = {
+    t: 1 / 12,
+    boxes: [{ track: 1, xyxy: [0.2, 0.1, 0.3, 0.3], conf: 0.7 }],
+    skeletons: [{ track: 1, kp: [[0.2, 0.1, 0.7]] }],
+  }
+
+  it('interpolates boxes and keypoints to the presented video time', () => {
+    const sel = selectFrameAt([a, b], 1 / 24, fps)
+    expect(sel).not.toBeNull()
+    expect(sel!.frame.t).toBeCloseTo(1 / 24, 9)
+    expect(sel!.frame.boxes[0].xyxy[0]).toBeCloseTo(0.1, 6)
+    expect(sel!.frame.boxes[0].xyxy[1]).toBeCloseTo(0.05, 6)
+    expect(sel!.frame.boxes[0].conf).toBeCloseTo(0.8, 6)
+    expect(sel!.frame.skeletons[0].kp[0][0]).toBeCloseTo(0.1, 6)
+  })
+
+  it('picks the immediate neighbours (not the outer ends) when three samples surround t', () => {
+    const c: OverlayFrame = {
+      t: 2 / 12,
+      boxes: [{ track: 1, xyxy: [0.4, 0.2, 0.5, 0.4] }],
+      skeletons: [{ track: 1, kp: [[0.4, 0.2, 0.5]] }],
+    }
+    const sel = selectFrameAt([a, b, c], 1 / 12 + 1 / 24, fps)
+    expect(sel!.frame.boxes[0].xyxy[0]).toBeCloseTo(0.3, 6)
+  })
+
+  it('returns the exact sample at a sample timestamp', () => {
+    expect(selectFrameAt([a, b], 0, fps)!.frame).toBe(a)
+    expect(selectFrameAt([a, b], 1 / 12, fps)!.frame).toBe(b)
+  })
+
+  it('never bridges a real data gap', () => {
+    const gap: OverlayFrame[] = [
+      { t: 0, boxes: [], skeletons: [] },
+      { t: 1, boxes: [], skeletons: [] },
+    ]
+    expect(selectFrameAt(gap, 0.5, fps)).toBeNull()
   })
 })
 
