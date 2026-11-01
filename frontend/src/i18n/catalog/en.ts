@@ -464,7 +464,7 @@ const baseEn: Record<string, string> = {
   'rally.gateRebuild': 'Rebuild hits',
   'rally.audioToggle': 'Use hit-sound assistance',
   'rally.audioToggleHint':
-    'Turn off to segment from vision only (player + frame motion); resegments in seconds for A/B comparison. Note: loses hit-based boundary anchoring and shot-count features.',
+    'Turn off to segment from vision only (player + frame motion); shot counts are then estimated from pose swing peaks. Resegments in seconds for A/B comparison.',
   'rally.audioOff': 'Hit sounds are off; segmentation is currently vision-only.',
   'rally.applyResegment': 'Apply segmentation',
   'rally.finerTooltip': 'Resegment with only a finer split granularity; other params unchanged',

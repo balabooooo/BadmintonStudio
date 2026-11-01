@@ -105,6 +105,12 @@ class RallyFeatures(BaseModel):
     # here (in older analysis results they are the default values).
     #: Hit strength 90th percentile
     hit_strength_p90: float = 0.0
+    #: Smash proxy: shots in the rally's top-15% strength (the highlight sub-score's input)
+    smash_proxy: float = 0.0
+    #: Longest run of rapid exchanges (gaps <= 0.85 s); 1 = no measured run
+    confrontation_streak: float = 1.0
+    #: Variance of the shot-to-shot gap (high = unpredictable exchange)
+    tempo_variance: float = 0.0
     #: Player movement speed mean / peak (pixels per second, normalized to court scale)
     player_speed_mean: float = 0.0
     player_speed_max: float = 0.0
@@ -196,14 +202,17 @@ class AnalysisParams(BaseModel):
     #: clear.
     hit_tail_seconds: float = 0.9
     #: Enable individual analysis modules
-    use_audio: bool = True
+    #: Hit-sound detection defaults to off: in a multi-court gym neighboring contact sounds
+    #: contaminate the hit sequence, and the visual shot estimator (pose swing peaks) now
+    #: supplies scoring evidence without it. Turn it on only when the venue is quiet.
+    use_audio: bool = False
     use_motion: bool = True
     use_players: bool = True
-    #: Pose assistance (YOLO-pose): attributes audio hits to "whether it was our match".
-    #: In a multi-court gym, audio cannot distinguish "who is hitting", while our players swing only on real
-    #: hits, so this is the key evidence for solving "rallies glued too long / eating into the next rally".
-    #: Failures (no GPU / missing weights / players too small) degrade automatically, matching the behavior
-    #: when this switch is off.
+    #: Pose assistance (YOLO26n-pose, crop-refined). Two jobs: attribute audio hits to our match
+    #: when audio is on, and act as the primary shot source for scoring when hit-sound detection
+    #: is off. The UI exposes it together with ``use_players`` as one "player detection + pose"
+    #: switch; a failure (no GPU / missing weights / players too small) degrades automatically and
+    #: scoring falls back to the duration prior (visual_shots).
     use_pose: bool = True
     #: ---- Hit attribution gate (cross-court rejection) ----
     #: Pose evidence threshold 0~1: an audio hit is kept only when a swing peak explains it. Larger =

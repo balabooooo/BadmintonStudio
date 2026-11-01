@@ -3,7 +3,7 @@
  * Kept out of the component file so React fast-refresh stays component-only and the
  * math is unit-testable without rendering.
  */
-import type { OverlayBox, OverlayDet, OverlayFrame } from './types'
+import type { OverlayBox, OverlayDet, OverlayFrame, OverlaySkeleton } from './types'
 
 /** 取数窗口（秒）：播放头前 2s、后 6s，保证正常播放时数据总在前面等着 */
 export const WINDOW_LEAD = 2
@@ -84,6 +84,101 @@ export function selectFrameTolerant(
   const dt = Math.abs(best.t - t)
   if (dt > limit) return null
   return { frame: best, age: dt }
+}
+
+/**
+ * Interpolated frame for drawing on top of a video whose frame rate (usually 30 fps) is
+ * higher than the analysis timeline (12 fps).
+ *
+ * Why: ``selectFrameTolerant`` snaps to the nearest sample. When the user pauses and steps
+ * with the arrow keys, the paused video frame sits between two 12 fps samples, so every box
+ * is drawn at the wrong sample time and looks offset from the player. Linear interpolation
+ * between the two neighbours (matched by track id) puts the boxes back on the presented frame.
+ * Gaps wider than one sample interval are never bridged (that is real missing data).
+ */
+export function selectFrameAt(
+  frames: OverlayFrame[],
+  t: number,
+  fps = 12,
+  tolerance = 0,
+): { frame: OverlayFrame; age: number } | null {
+  if (!frames.length) return null
+  const limit = Math.max(strictGap(fps), tolerance)
+  const idx = nearestIndex(frames, t)
+  const best = frames[idx]
+  const dt = Math.abs(best.t - t)
+  if (dt > limit) return null
+
+  // Find the immediate pair around t. Interpolation is only valid when the pair is one
+  // regular sample interval apart; over a data gap, fall back to the nearest frame.
+  let lo = 0
+  let hi = frames.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (frames[mid].t < t) lo = mid + 1
+    else hi = mid
+  }
+  const next = frames[Math.min(lo, frames.length - 1)]
+  const prev = frames[Math.max(0, lo - 1)]
+  if (prev.t >= t || next.t <= t || next.t - prev.t > strictGap(fps)) {
+    return { frame: best, age: dt }
+  }
+  const w = (t - prev.t) / (next.t - prev.t)
+  return { frame: interpolateFrame(prev, next, w, t), age: dt }
+}
+
+function interpolateFrame(a: OverlayFrame, b: OverlayFrame, w: number, t: number): OverlayFrame {
+  const lerp = (x: number, y: number) => x + (y - x) * w
+  const boxes = new Map<number, OverlayBox>()
+  for (const box of a.boxes) boxes.set(box.track, box)
+  for (const box of b.boxes) {
+    const prev = boxes.get(box.track)
+    if (prev) {
+      boxes.set(box.track, {
+        ...box,
+        xyxy: [
+          lerp(prev.xyxy[0], box.xyxy[0]),
+          lerp(prev.xyxy[1], box.xyxy[1]),
+          lerp(prev.xyxy[2], box.xyxy[2]),
+          lerp(prev.xyxy[3], box.xyxy[3]),
+        ],
+        conf: prev.conf != null && box.conf != null ? lerp(prev.conf, box.conf) : box.conf,
+        interp: prev.interp || box.interp,
+      })
+    } else {
+      boxes.set(box.track, box)
+    }
+  }
+  // Tracks that vanished in b keep their a position; that is safer than dropping a box.
+  const aBoxes = new Map<number, OverlayBox>()
+  for (const box of a.boxes) aBoxes.set(box.track, box)
+  for (const [track, box] of aBoxes) {
+    if (!boxes.has(track)) boxes.set(track, box)
+  }
+
+  const skeletons = new Map<number, OverlaySkeleton>()
+  for (const sk of a.skeletons) skeletons.set(sk.track, sk)
+  for (const sk of b.skeletons) {
+    const prev = skeletons.get(sk.track)
+    if (prev && prev.kp.length === sk.kp.length) {
+      const kp: [number, number, number][] = sk.kp.map((p, i) => {
+        const q = prev.kp[i]
+        return [lerp(q[0], p[0]), lerp(q[1], p[1]), lerp(q[2], p[2])]
+      })
+      skeletons.set(sk.track, { ...sk, kp })
+    } else {
+      skeletons.set(sk.track, sk)
+    }
+  }
+
+  return {
+    t,
+    boxes: [...boxes.values()],
+    skeletons: [...skeletons.values()],
+    // Raw detections have no track id, so they cannot be matched across frames; using the
+    // nearest frame's diagnostics is better than interpolating unrelated boxes.
+    dets: (Math.abs(a.t - t) <= Math.abs(b.t - t) ? a : b).dets,
+  }
 }
 
 /** 高于检测阈值的跟踪框（v1 缓存无 conf 时不过滤，保持旧行为） */

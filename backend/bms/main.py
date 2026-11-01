@@ -1429,6 +1429,9 @@ def _rescore_features(r: Rally) -> dict:
         # Scoring also uses these signals: they used to be omitted here, so scores recomputed under a
         # different weighting did not match the weighting used at analysis time
         "hit_strength_p90": r.features.hit_strength_p90,
+        "smash_proxy": r.features.smash_proxy,
+        "confrontation_streak": r.features.confrontation_streak,
+        "tempo_variance": r.features.tempo_variance,
         "player_speed_mean": r.features.player_speed_mean,
         "player_speed_max": r.features.player_speed_max,
         "shuttle_presence": r.features.shuttle_presence,

@@ -66,6 +66,8 @@ interface OptimizePanelProps {
   canOptimize: boolean
   /** 赛制稳定码（single/doubles），未知时 null 不显示徽标 */
   matchFormat: string | null
+  /** 运行期单/双打占比（百分比整数）与切换次数；旧分析结果没有该字段时为 null */
+  matchMode?: { single: number; doubles: number; switches: number } | null
   onRun: () => void
   onCancel: () => void
   onApplyBest: () => void
@@ -80,6 +82,7 @@ export default function OptimizePanel({
   stage,
   canOptimize,
   matchFormat,
+  matchMode = null,
   onRun,
   onCancel,
   onApplyBest,
@@ -124,11 +127,22 @@ export default function OptimizePanel({
         </div>
       )}
       {matchFormat && matchFormat !== 'unknown' && (
-        <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-white/8 bg-white/[0.02] px-2 py-1 text-[10.5px] text-ink-300">
-          <Info size={11} className="shrink-0 text-court-300" />
-          <span className="text-ink-500">{tr('annotate.matchFormat')}：</span>
-          <span className="font-medium">{matchFormatLabel(matchFormat)}</span>
-          <span className="ml-auto text-ink-600">{tr('annotate.matchFormatHint')}</span>
+        <div className="mb-2 rounded-lg border border-white/8 bg-white/[0.02] px-2 py-1 text-[10.5px] text-ink-300">
+          <div className="flex items-center gap-1.5">
+            <Info size={11} className="shrink-0 text-court-300" />
+            <span className="text-ink-500">{tr('annotate.matchFormat')}：</span>
+            <span className="font-medium">{matchFormatLabel(matchFormat)}</span>
+            <span className="ml-auto text-ink-600">{tr('annotate.matchFormatHint')}</span>
+          </div>
+          {matchMode && (
+            <div className="mt-0.5 pl-[17px] text-ink-600">
+              {tr('annotate.matchModeSummary', {
+                single: matchMode.single,
+                doubles: matchMode.doubles,
+                switches: matchMode.switches,
+              })}
+            </div>
+          )}
         </div>
       )}
       {!opt ? (

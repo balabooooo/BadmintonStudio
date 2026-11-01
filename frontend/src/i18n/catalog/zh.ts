@@ -447,7 +447,7 @@ const baseZh = {
   'rally.gateRebuild': '重建击球序列',
   'rally.audioToggle': '使用击球声辅助切分',
   'rally.audioToggleHint':
-    '关闭后只靠视觉（球员运动 + 画面运动）切分，秒级重切，可与开启状态对比。注意会失去击球锚定与拍数特征。',
+    '关闭后切分只靠视觉（球员运动 + 画面运动），拍数改由姿态挥拍峰估计，秒级重切，可与开启状态对比。',
   'rally.audioOff': '击球声已关闭，当前为纯视觉切分。',
   'rally.applyResegment': '应用切分参数',
   'rally.finerTooltip': '只把「切分粒度」调细一档后重新切分，其余参数保持',

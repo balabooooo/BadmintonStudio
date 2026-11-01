@@ -92,8 +92,9 @@ export interface AnalysisParams {
   hit_tail_seconds: number
   use_audio: boolean
   use_motion: boolean
+  /** 球员检测（YOLO26n 的人体框 + ByteTrack 跟踪） */
   use_players: boolean
-  /** 姿态辅助：给音频击球做「是不是我们这场比赛打的」归属判定 */
+  /** 姿态关键点（YOLO26-pose 裁剪精修；与 use_players 由同一个合并开关控制） */
   use_pose: boolean
   /** 击球归属门控阈值 0~1：越大越严格（剔除更多邻场击球声），即时可调 */
   pose_gate_threshold: number

@@ -27,7 +27,7 @@ hiddenimports = []
 # Bundled read-only resources. config._resource_root() resolves these under
 # sys._MEIPASS when frozen, so the destination names must match config defaults.
 datas.append((FRONTEND_DIST, "frontend/dist"))
-for weights in ("yolo11n.pt", "yolo11n-pose.pt"):
+for weights in ("yolo26n.pt", "yolo26n-pose.pt"):
     p = os.path.join(MODELS_DIR, weights)
     if os.path.isfile(p):
         datas.append((p, "models"))

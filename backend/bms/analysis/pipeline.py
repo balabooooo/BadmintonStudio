@@ -40,6 +40,7 @@ from . import rally as RA
 from . import rally_vision as RV
 from . import scoring as SC
 from . import speech as SP
+from . import visual_shots as VS
 
 Progress = Callable[[float, str, str], None]  # (progress, stage, message)
 
@@ -349,10 +350,6 @@ def run_analysis(
                         # Measured distribution of size filtering: the UI uses it to draw a histogram and preview threshold effects in real time
                         "size_filter": dict(getattr(player_sig, "size_stats", {}) or {}),
                         "roi_poly_points": len(eff_poly or []),
-                        # L1 mode-engine verdicts (picker quotas): modal mode + per-window sequence.
-                        # Additive keys — the frontend ignores unknown player_trace entries.
-                        "mode": int(getattr(player_sig, "mode", 0) or 0),
-                        "mode_windows": list(getattr(player_sig, "mode_windows", []) or []),
                     }
                 except Exception as e:  # a player-module failure should not interrupt the whole analysis
                     player_trace = {"error": f"{type(e).__name__}: {e}"}
@@ -362,16 +359,18 @@ def run_analysis(
             return res
 
         # ---------------------------------------------------------- 4.5 pose
-        # Pose **does not change which signal is used for segmentation**, it only answers one
-        # question: was this audio hit made in our match. In a multi-court gym audio cannot answer
-        # this by itself (measured audio_reliability = 0.04), and without it one can only guess rally
-        # boundaries from "hit intervals" — sounds from neighboring courts fill the intervals, so
-        # rallies get glued longer. Any failure degrades: when pose_sig is None downstream behavior
-        # matches having the switch off.
+        # Pose has two jobs. When audio hits exist it answers one question: was this hit made in
+        # our match (in a multi-court gym audio cannot answer that by itself; measured
+        # audio_reliability = 0.04). When audio hits do not exist it becomes the **primary shot
+        # source** for scoring: swing peaks are a direct physical proxy for "a racket swing
+        # happened", which is exactly what the length/technique/highlight dimensions need. This is
+        # why pose must run even with hit-sound detection switched off. Any failure degrades: when
+        # pose_sig is None downstream behavior matches having the switch off (scoring then falls
+        # back to player-motion peaks or a duration prior, see visual_shots).
         pose_sig = None
         pose_trace: dict[str, Any] = {}
         gate_mask: np.ndarray | None = None
-        if params.use_pose and hits is not None and player_sig is not None:
+        if params.use_pose and player_sig is not None:
             boxes = getattr(player_sig, "frame_boxes", None)
             if boxes:
                 mod = _try_import("pose")
@@ -387,16 +386,21 @@ def run_analysis(
                         )
                         if pose_sig is not None:
                             pose_trace = dict(pose_sig.trace)
-                            gate_mask, g_trace = mod.gate_hits(
-                                hits, pose_sig,
-                                threshold=params.pose_gate_threshold,
-                                window=params.pose_gate_window,
-                                one_to_one=params.pose_gate_one_to_one,
-                                force=params.pose_gate_force,
-                            )
-                            pose_trace.update(g_trace)
-                            if gate_mask is not None:
-                                hits = mod.filter_hits(hits, gate_mask)
+                            if hits is not None and hits.times.size:
+                                gate_mask, g_trace = mod.gate_hits(
+                                    hits, pose_sig,
+                                    threshold=params.pose_gate_threshold,
+                                    window=params.pose_gate_window,
+                                    one_to_one=params.pose_gate_one_to_one,
+                                    force=params.pose_gate_force,
+                                )
+                                pose_trace.update(g_trace)
+                                if gate_mask is not None:
+                                    hits = mod.filter_hits(hits, gate_mask)
+                            else:
+                                # No audio attribution to gate; the signal itself is kept for
+                                # visual scoring / resegmentation.
+                                pose_trace["gate"] = "audio_off"
                     except Exception as e:  # a pose failure can only degrade, never interrupt the whole analysis
                         pose_trace = {"error": f"{type(e).__name__}: {e}"}
                         log.opt(exception=e).warning("pose gating degraded")
@@ -571,8 +575,16 @@ def run_analysis(
 
         # ---------------------------------------------------------- 8. features + scoring
         emit(0.92, "score", tr("analysis.stage.score"))
-        RA.attach_features(intervals, fused, hits=hits, motion=motion_dict,
+        # Scoring needs shot evidence even when hit-sound detection is off. Audio hits stay the
+        # source when they exist (they are already attributed by the pose gate); otherwise the
+        # visual shot estimator supplies the exact same HitDetection shape, so both modes run the
+        # one formula in scoring.py and cannot drift apart.
+        score_hits, visual_trace = _score_hits_for(
+            intervals, hits=hits, params=params, pose_sig=pose_sig,
+            duration=duration)
+        RA.attach_features(intervals, fused, hits=score_hits, motion=motion_dict,
                            players=players_dict, shuttle=shuttle_dict)
+        _neutralize_prior_semantics(intervals, visual_trace)
         # The speech bonus is written after features and before scoring so that resegmentation uses
         # the same logic (see resegment) and both paths give the same scores.
         _apply_speech_bonus(intervals, speech_events, params)
@@ -608,6 +620,7 @@ def run_analysis(
         # (resegment) does not re-run AI, but it must reproduce the same gating results, otherwise
         # "resegment" and "re-run" would give different rally counts — which is exactly where users
         # get confused most.
+        pose_cache_tag = ""
         if pose_sig is not None:
             res.signals["pose_swing"] = _downsample(pose_sig.swing)
             res.signals["pose_ok"] = _downsample(pose_sig.ok)
@@ -622,11 +635,10 @@ def run_analysis(
             # from raw arrays (e.g. after a template/version bump); same numeric-curve convention.
             res.signals["pose_overhead_full"] = [round(float(v), 4) for v in pose_sig.overhead]
             res.signals["pose_quiet"] = [round(float(pose_sig.quiet), 5)]
-            # Reference to the v2 pose npz holding per-frame keypoint skeletons; lives in stats
-            # (a reference, not a float curve) and survives resegment via keep_keys.
-            ptag = str((pose_sig.trace or {}).get("cache_tag", "") or "")
-            if ptag:
-                res.stats["pose_cache"] = ptag
+            # Reference to the v3 pose npz holding per-frame keypoint skeletons; lives in stats
+            # (a reference, not a float curve) and survives resegment via keep_keys. Written
+            # after derive_stats below, which replaces the whole stats dict.
+            pose_cache_tag = str((pose_sig.trace or {}).get("cache_tag", "") or "")
         # Packed boundary-evidence curves (boundary.py): resegment / the annotation optimizer read
         # these instead of recomputing the template-normalized motion part of the score.
         if boundary_ev is not None:
@@ -639,6 +651,7 @@ def run_analysis(
         res.signal_fps = fused.fps
         res.stats = SC.derive_stats(feats, scores)
         res.stats["hit_trace"] = hit_trace
+        res.stats["visual_shots"] = visual_trace
         res.stats["player_trace"] = player_trace
         res.stats["shuttle_trace"] = shuttle_trace
         res.stats["pose_trace"] = pose_trace
@@ -660,19 +673,41 @@ def run_analysis(
         # The polygon actually used for "in-court determination" (the court boundary when calibration succeeded; otherwise None)
         res.stats["effective_poly"] = [list(p) for p in eff_poly] if eff_poly else None
         res.stats["player_size_filter"] = dict(size_filter)
-        # Reference to the compact per-frame box npz (data/cache/boxes/); resolved by the overlay
-        # API. Empty/missing means the cache write was skipped and visualization degrades.
+        # Cache references for the annotation overlay must be written AFTER derive_stats (which
+        # replaces the whole stats dict) or they are silently lost and the layer degrades to
+        # boxes-only. Pose resolves the skeleton npz (data/cache/pose/); boxes the tracked boxes
+        # (data/cache/boxes/). Empty/missing means the cache write was skipped.
+        if pose_cache_tag:
+            res.stats["pose_cache"] = pose_cache_tag
         btag = str(getattr(player_sig, "cache_tag", "") or "")
         if btag:
             res.stats["boxes_cache"] = btag
-        # P4-3: singles/doubles recommendation from the per-frame active-player count.
+        # P4-3: singles/doubles recommendation. Preference order:
+        #   1. the runtime **visible-people** count + the mode the selector actually used (both
+        #      computed before player selection, so a selector mistake cannot make the scene read as
+        #      singles and then "confirm" itself);
+        #   2. the selected-box count (old behaviour, only when the candidate count is unavailable).
         # Recommendation only — no parameter preset is switched automatically.
         ac = getattr(player_sig, "active_count", None) if player_sig is not None else None
-        if ac is not None and getattr(ac, "size", 0):
+        fc = getattr(player_sig, "format_count", None) if player_sig is not None else None
+        modes = getattr(player_sig, "format_mode", None) if player_sig is not None else None
+        has_candidates = getattr(fc, "size", 0) > 0
+        counts = fc if has_candidates else ac
+        if counts is not None and getattr(counts, "size", 0):
             try:
                 from . import players as PL
-                res.stats["match_format"] = PL.match_format_stats(
-                    ac, float(getattr(player_sig, "fps", 0.0) or 0.0))
+                mf = PL.match_format_stats(
+                    counts, float(getattr(player_sig, "fps", 0.0) or 0.0),
+                    modes=modes if has_candidates else None,
+                    source=(PL.MATCH_SOURCE_VISIBLE_PEOPLE if has_candidates
+                            else PL.MATCH_SOURCE_SELECTED_BOXES),
+                )
+                res.stats["match_format"] = mf
+                log.info("match format: {} (source={}, singles={:.0%} doubles={:.0%}, "
+                         "switches={}, candidates={}/{})",
+                         mf["format"], mf["source"], mf["mode_single_frac"],
+                         mf["mode_doubles_frac"], mf["mode_switches"],
+                         mf["present_frames"], mf["frames"])
             except Exception:  # noqa: BLE001
                 pass
         res.stats["duration"] = duration
@@ -734,6 +769,43 @@ def _manual_poly(raw: object) -> "np.ndarray | None":
 _manual_quad = _manual_poly
 
 
+def _score_hits_for(intervals, *, hits, params: AnalysisParams, pose_sig,
+                    duration: float):
+    """Return the shot sequence scoring should use, plus its diagnostic trace.
+
+    Audio hits win whenever they exist (including analyses made with audio on). Otherwise the
+    visual estimator runs on the same intervals. The two sources produce the same feature
+    fields, so a switch toggle cannot change the scoring formula or its scale.
+    """
+    if params.use_audio and hits is not None and getattr(hits, "times", np.zeros(0)).size:
+        return hits, {"source": "audio", "events": int(hits.times.size), "filled_intervals": 0}
+    est = VS.estimate(
+        pose=pose_sig,
+        intervals=intervals,
+        duration=duration,
+    )
+    return est.hits, est.trace
+
+
+def _neutralize_prior_semantics(intervals, visual_trace: dict[str, Any]) -> None:
+    """Clear shot semantics that a constant-tempo prior cannot actually measure.
+
+    The duration prior emits evenly spaced events with identical strength. If those were fed
+    into the usual feature derivation unchanged, the "top 15% strength" rule would count every
+    event as a smash and the "gaps <= 0.85 s" rule would count the whole rally as one long
+    confrontation streak — inventing smash / confrontation tags out of nothing. The shot count
+    and duration-driven length score remain (that is what the prior is for), but these two
+    event-semantics are reset to their neutral values and the trace keeps source=duration_prior.
+    """
+    if (visual_trace or {}).get("source") != "duration_prior":
+        return
+    for iv in intervals:
+        f = iv.features
+        f["smash_proxy"] = 0.0
+        f["confrontation_streak"] = 1.0
+        f["tempo_variance"] = 0.0
+
+
 def _build_rally(i: int, iv: RA.RallyInterval, hits, media: MediaInfo,
                  sc: dict[str, float], params: AnalysisParams,
                  quality: dict[str, float] | None = None) -> Rally:
@@ -773,6 +845,9 @@ def _build_rally(i: int, iv: RA.RallyInterval, hits, media: MediaInfo,
         confidence=float(f.get("confidence", 0.5)),
         # Intermediate quantities needed for scoring are also stored, so that a different scoring scheme can recompute from the same raw values
         hit_strength_p90=float(f.get("hit_strength_p90", 0.0)),
+        smash_proxy=float(f.get("smash_proxy", 0.0)),
+        confrontation_streak=float(f.get("confrontation_streak", 1.0)),
+        tempo_variance=float(f.get("tempo_variance", 0.0)),
         player_speed_mean=float(f.get("player_speed_mean", 0.0)),
         player_speed_max=float(f.get("player_speed_max", 0.0)),
         shuttle_presence=float(f.get("shuttle_presence", 0.0)),
@@ -1829,8 +1904,30 @@ def resegment(
     if shuttle_dict and "presence" in shuttle_dict:
         shuttle_dict["presence"] = shuttle_dict.pop("presence")
 
-    RA.attach_features(intervals, fused, hits=hits, motion=motion_dict,
+    # Scoring shot source: audio hits when the switch is on and the stored candidates survived
+    # gating; otherwise rebuild the visual sequence from the stored pose curves. This is the fast
+    # equivalent of a full re-run with audio off (pose is not re-run, so toggling the switch is
+    # instant and reversible, and both paths feed the same scoring formula).
+    score_hits = hits
+    visual_trace: dict[str, Any] = {}
+    if not params.use_audio or hits is None or hits.times.size == 0:
+        # Respect the pose switch: an analysis made with pose on must not keep using the stored
+        # pose curves after the user explicitly turns pose off (otherwise the two switches would
+        # silently disagree).
+        score_pose = _rebuild_pose_signal(sig) if params.use_pose else None
+        est = VS.estimate(
+            pose=score_pose,
+            intervals=intervals,
+            duration=duration,
+        )
+        visual_trace = est.trace
+        score_hits = est.hits
+    else:
+        visual_trace = {"source": "audio", "events": int(hits.times.size), "filled_intervals": 0}
+
+    RA.attach_features(intervals, fused, hits=score_hits, motion=motion_dict,
                        players=players_dict, shuttle=shuttle_dict)
+    _neutralize_prior_semantics(intervals, visual_trace)
     # Speech events were stored in stats during analysis; read them back here to recompute the bonus,
     # ensuring "fast resegmentation" and "full re-run" give consistent scores (changing phrases /
     # bonus values also takes effect immediately).
@@ -1888,6 +1985,7 @@ def resegment(
                       "count": len(intervals), "resegmented": True})
     res.stats["segmentation"] = seg_trace
     res.stats["weights"] = weights_key
+    res.stats["visual_shots"] = visual_trace
     if boundary_ev is not None:
         res.stats.setdefault("boundary", BD.boundary_meta(boundary_ev))
     res.stats["boundary_refine"] = boundary_refine_trace

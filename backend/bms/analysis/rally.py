@@ -772,6 +772,13 @@ def attach_features(
             "activity_peak": float(seg.max()) if seg.size else 0.0,
             "confidence": float(iv.confidence),
         })
+        if hits is not None:
+            # Boundary anchoring normally pre-binds each interval's hits (and clamps them so one hit
+            # cannot belong to two rallies). Visual shot events never go through that path, so bind
+            # them here by time when the caller supplied an unbound sequence.
+            if not iv.hit_indices:
+                iv.hit_indices = np.nonzero(
+                    (hits.times >= iv.start) & (hits.times <= iv.end))[0].tolist()
         if hits is not None and iv.hit_indices:
             hs = hits.strength[iv.hit_indices]
             hc = hits.confidence[iv.hit_indices]

@@ -22,7 +22,7 @@ export const FRAG: [string, string, string][] = [
   ['tour.dlg.run.body', '引导模式下不会真正调用 GPU：约 3 秒的示例流程与真实分析完全一致，结束后界面中出现的结果均为示例数据', 'During the tour no real GPU work runs: a ~3-second sample flow identical to a real analysis; every result shown afterward is sample data'],
   ['tour.dlg.run.hint', '点击高亮的主按钮开始，观察进度走完并自动生成示例结果', 'Click the highlighted primary button to start, watch the progress finish and sample results appear automatically'],
   ['tour.dlg.run.title', '开始分析', 'Start analysis'],
-  ['tour.dlg.modules.body', '音频/运动/姿态/球员默认开启；羽毛球追踪默认关（更准但耗时，开启建议全片预算）；语音口令需先下载模型', 'Audio/motion/pose/players are on by default; shuttle tracking is off by default (more accurate but slower — budget the full clip when enabling it); voice commands need a model download first'],
+  ['tour.dlg.modules.body', '击球声检测默认关闭（多场地球馆易受邻场干扰，此时改由姿态挥拍峰等视觉信号估计拍数）；画面运动与「球员检测+姿态」默认开启（YOLO26n 检测 + YOLO26-pose 关键点）；羽毛球追踪默认关（更准但耗时，开启建议全片预算）；语音口令需先下载模型', 'Hit-sound detection is off by default (multi-court venues suffer neighbor interference; visual swing peaks then estimate shots instead). Frame motion and the combined player-detection + pose module are on by default (YOLO26n detection + YOLO26-pose keypoints); shuttle tracking is off (more accurate but slower — budget the full clip when enabling it); voice commands need a model download first'],
   ['tour.dlg.modules.title', '分析模块开关', 'Analysis module toggles'],
   ['tour.dlg.params.body', '间隔/最短回合/前后余量等，推荐保持默认；进阶参数已折叠', 'Gap/min rally/pre- & post-padding and more — keeping the defaults is recommended; advanced parameters are collapsed'],
   ['tour.dlg.params.title', '关键参数', 'Key parameters'],

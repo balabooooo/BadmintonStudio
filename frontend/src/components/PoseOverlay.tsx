@@ -1,5 +1,7 @@
 /**
  * 标注页视频叠加层：在视频画面上绘制 AI 球员框（含归一化尺寸读数）与 COCO 17 点骨架。
+ * 框与骨架来自同一个「球员检测+姿态」模块，因此默认作为一个合并图层开关显示；
+ * 尺寸读数、原始检测诊断层与阈值仍可独立调节。
  *
  * 数据来自后端窗口化接口 annotation/overlay（只读 data/cache 下的紧凑 npz，不跑 AI）：
  * - 播放时按 500ms 节流拉取「播放头前 2s ~ 后 6s」窗口；播放头完全冲出当前窗口时立即重取
@@ -17,7 +19,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Eye, EyeOff, Box, Bone, Ruler, ScanSearch } from 'lucide-react'
+import { Eye, EyeOff, Bone, Ruler, ScanSearch } from 'lucide-react'
 import { api } from '../lib/api'
 import { createLogger } from '../lib/logger'
 import type { OverlayResponse } from '../lib/types'
@@ -29,7 +31,7 @@ import {
   REFETCH_MIN_INTERVAL_MS,
   WINDOW_LEAD,
   contentRect,
-  selectFrameTolerant,
+  selectFrameAt,
   strictGap,
   visibleBoxes,
   visibleDets,
@@ -69,8 +71,7 @@ function clampNum(v: number, min: number, max: number): number {
 export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
   const tr = useT()
   const [enabled, setEnabled] = useState(false)
-  const [showBoxes, setShowBoxes] = useState(true)
-  const [showSkeleton, setShowSkeleton] = useState(true)
+  const [showPlayerPose, setShowPlayerPose] = useState(true)
   const [showSize, setShowSize] = useState(true)
   const [showDets, setShowDets] = useState(false)
   const [confThr, setConfThr] = useState(DEFAULT_CONF)
@@ -90,10 +91,10 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
   /** Safety net: if a 'seeked' event is ever missed, release the seek lock after 1s. */
   const seekStallTimerRef = useRef<number | null>(null)
   const confRef = useRef(confThr)
-  const layersRef = useRef({ showBoxes, showSkeleton, showSize, showDets, detThr, lostTol })
+  const layersRef = useRef({ showPlayerPose, showSize, showDets, detThr, lostTol })
   dataRef.current = data
   confRef.current = confThr
-  layersRef.current = { showBoxes, showSkeleton, showSize, showDets, detThr, lostTol }
+  layersRef.current = { showPlayerPose, showSize, showDets, detThr, lostTol }
 
   const fetchWindow = useCallback(
     async (center: number) => {
@@ -240,10 +241,15 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
       ctx.clearRect(0, 0, canvas.width, canvas.height)
       const res = dataRef.current
       if (!res) return
+      // While a seek is in flight the video still presents the OLD frame, but currentTime
+      // already points at the NEW target. Drawing boxes for the target over the old frame is
+      // exactly the "boxes don't line up after pressing an arrow key" bug; blank the layer
+      // until the seek settles, then draw against the newly presented frame.
+      if (v.seeking || seekingRef.current) return
       const fps = res.fps || 12
-      const { showBoxes: b, showSkeleton: s, showSize: z, showDets: d, detThr: dt, lostTol: lt } =
+      const { showPlayerPose: p, showSize: z, showDets: d, detThr: dt, lostTol: lt } =
         layersRef.current
-      const sel = selectFrameTolerant(res.frames, v.currentTime, fps, lt)
+      const sel = selectFrameAt(res.frames, v.currentTime, fps, lt)
       const lostTag = tr('annotate.overlayLostTag')
       if (!sel) {
         // 状态监控：窗口内有数据但当前时刻没有任何帧（容差内）——canvas 直接画提示，避免每帧 setState
@@ -289,7 +295,7 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
         ctx.setLineDash([])
       }
 
-      if (b) {
+      if (p) {
         for (const box of visibleBoxes(frame, dt)) {
           // Interpolated boxes (v3 cache, short occlusion gaps) are real timeline data but not
           // actual detections — draw them dimmed so the user can tell guessed boxes from hits.
@@ -325,7 +331,7 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
         }
       }
 
-      if (s) {
+      if (p) {
         ctx.globalAlpha = ghost ? 0.35 : 1
         for (const sk of frame.skeletons) {
           const color = colorOf(sk.track)
@@ -382,25 +388,14 @@ export default function PoseOverlay({ videoRef, pid, mid }: PoseOverlayProps) {
           <div className="pointer-events-auto flex max-w-[320px] flex-wrap items-center justify-end gap-1 rounded-lg bg-black/55 p-1 backdrop-blur-sm">
             <button
               type="button"
-              onClick={() => setShowBoxes((v) => !v)}
+              onClick={() => setShowPlayerPose((v) => !v)}
               className={cn(
                 'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]',
-                showBoxes ? 'bg-court-500/30 text-court-200' : 'text-ink-500 hover:text-ink-300',
+                showPlayerPose ? 'bg-court-500/30 text-court-200' : 'text-ink-500 hover:text-ink-300',
               )}
-              title={tr('annotate.overlayBoxes')}
+              title={tr('annotate.overlayPlayerPose')}
             >
-              <Box size={12} /> {tr('annotate.overlayBoxes')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowSkeleton((v) => !v)}
-              className={cn(
-                'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]',
-                showSkeleton ? 'bg-court-500/30 text-court-200' : 'text-ink-500 hover:text-ink-300',
-              )}
-              title={tr('annotate.overlaySkeleton')}
-            >
-              <Bone size={12} /> {tr('annotate.overlaySkeleton')}
+              <Bone size={12} /> {tr('annotate.overlayPlayerPose')}
             </button>
             <button
               type="button"

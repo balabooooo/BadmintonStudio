@@ -30,7 +30,7 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { createLogger } from '../lib/logger'
-import { cn, clamp } from '../lib/format'
+import { cn, clamp, formatForSpan, type FormatSegment } from '../lib/format'
 import { itemCounts, snapPatch, visibleWarnings, warningKey } from '../lib/annotationQuality'
 import { Button, Empty, Modal, SpeedMenu, Tooltip, useConfirm } from './ui'
 import { stepSpeedValue } from '../lib/playback'
@@ -41,6 +41,7 @@ import SignalTracks from './SignalTracks'
 import { useStore } from '../store/useStore'
 import { useAnnotationDraft, type DraftHit as AnnHit, type DraftRally as AnnRally } from '../store/annotationDraft'
 import { useT } from '../i18n/useT'
+import { matchFormatLabel } from '../i18n/domain'
 import type {
   AnalysisParams,
   AnnotationDraft,
@@ -980,10 +981,22 @@ export default function AnnotatePage() {
     )
   }
 
-  const rows = tab === 'auto' ? auto.map((a) => ({ start: a.start, end: a.end, key: `a${a.index}`, meta: tr('annotate.autoMeta', { shots: a.shots, score: a.score }), id: undefined as number | undefined })) : ann.map((r) => ({ start: r.start, end: r.end, key: `r${r.id}`, meta: r.source === 'auto' ? tr('annotate.sourceAuto') : tr('annotate.sourceManual'), id: r.id }))
-  const canOptimize = ann.length > 0
   const mf = mediaId ? project?.analyses?.[mediaId]?.stats?.match_format : null
+  const segments: FormatSegment[] | null = Array.isArray(mf?.segments) ? (mf.segments as FormatSegment[]) : null
+  const rows = tab === 'auto'
+    ? auto.map((a) => ({ start: a.start, end: a.end, key: `a${a.index}`, meta: tr('annotate.autoMeta', { shots: a.shots, score: a.score }), id: undefined as number | undefined, fmt: formatForSpan(segments, a.start, a.end) }))
+    : ann.map((r) => ({ start: r.start, end: r.end, key: `r${r.id}`, meta: r.source === 'auto' ? tr('annotate.sourceAuto') : tr('annotate.sourceManual'), id: r.id, fmt: formatForSpan(segments, r.start, r.end) }))
+  const canOptimize = ann.length > 0
   const matchFormatCode = mf?.format && mf.format !== 'unknown' ? String(mf.format) : null
+  // Runtime split behind the badge: the share of covered time the selector read as singles vs
+  // doubles, plus how many times it switched. Absent for analyses produced by older builds.
+  const matchMode = mf && typeof mf.mode_doubles_frac === 'number'
+    ? {
+        single: Math.round(Number(mf.mode_single_frac ?? 0) * 100),
+        doubles: Math.round(Number(mf.mode_doubles_frac) * 100),
+        switches: Number(mf.mode_switches ?? 0),
+      }
+    : null
 
   return (
     <div className="flex h-full flex-col">
@@ -1358,6 +1371,17 @@ export default function AnnotatePage() {
                     >
                       <span className="w-5 shrink-0 text-[10.5px] text-ink-500">{i + 1}</span>
                       <span className="mono flex-1 truncate">{r.start.toFixed(2)} → {r.end.toFixed(2)} <span className="text-ink-500">({(r.end - r.start).toFixed(2)}s)</span></span>
+                      {r.fmt && (
+                        <span
+                          title={tr('annotate.matchFormatHint')}
+                          className={cn(
+                            'shrink-0 rounded px-1 text-[10px]',
+                            r.fmt === 'doubles' ? 'bg-court-500/15 text-court-200' : 'bg-white/6 text-ink-400',
+                          )}
+                        >
+                          {matchFormatLabel(r.fmt)}
+                        </span>
+                      )}
                       <span className="shrink-0 text-[10.5px] text-ink-500">{r.meta}</span>
                       {qi && qc && qc.warn + qc.info > 0 && (
                         <button
@@ -1444,6 +1468,7 @@ export default function AnnotatePage() {
             stage={optimizeJob?.stage ?? ''}
             canOptimize={canOptimize}
             matchFormat={matchFormatCode}
+            matchMode={matchMode}
             onRun={() => void runOptimize()}
             onCancel={() => void cancelOptimize()}
             onApplyBest={() => void applyBest()}

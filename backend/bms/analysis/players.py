@@ -29,7 +29,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 import numpy as np
 from loguru import logger
@@ -38,6 +38,12 @@ from ..i18n import tr
 from .court_calib import point_in_poly
 
 # ------------------------------------------------------------------ constants
+
+#: Player detector weights. YOLO26n is the detection-only model (its box AP is close to the
+#: previous generation but its small-object recall is what keeps the far-side player tracked;
+#: the YOLO26n-pose detection head missed that player entirely in an A/B). Pose keypoints use
+#: a separate YOLO26n-pose pass on cropped boxes (see pose.DEFAULT_POSE_MODEL).
+DEFAULT_PLAYER_MODEL = "yolo26n.pt"
 
 #: Boxes below this confidence are ignored outright (for tracking and for the visualization cache).
 #: 0.10 (not the historical 0.15): everything above it is stored and fed to ByteTrack, whose stage-two
@@ -52,6 +58,9 @@ BT_HIGH_THRESH = 0.25
 #: Lower bound for stage-two "low-score boxes"; below it they do not participate in association at all.
 BT_LOW_THRESH = 0.10
 #: When a detection matches no track, its score must reach this to start a new track (blocks new tracks from low-score noise).
+#: An A/B on clip1 around 6:31 confirmed this is **not** what hides a small far-side player: lowering
+#: it to 0.15 produced exactly the same tracks, because his detections (conf 0.30-0.55 at the far
+#: baseline) were being merged away later, not blocked here.
 BT_NEW_THRESH = 0.25
 #: Number of **sampled frames** a lost track is kept before deletion. Counted on the sampled timeline:
 #: with the default sample_fps=15, 30 frames ≈ 2 seconds, so a track can reconnect after one or two seconds of occlusion.
@@ -78,6 +87,30 @@ MERGE_MAX_DIST = 0.10
 MERGE_AREA_RATIO = 3.5
 #: Track merging: when overlapping in time, the lower bound on the fraction of overlapping frames that look like "the same person"
 MERGE_OVERLAP_RATIO = 0.5
+#: Track merging, **simultaneous** tracks only: the "same person" test must be far stricter than the
+#: sequential one, because two people can stand closer than :data:`MERGE_MAX_DIST` (0.10 of the
+#: frame) without being one person. Measured on clip1 around 6:31, the far-side doubles pair stands
+#: 0.07-0.08 apart, so the old rule glued the fourth player's track into his partner's and he
+#: disappeared from every downstream output ("a box that is never tracked"). Two observations of
+#: the same person at the same moment overlap in the image, so require either a real box overlap
+#: (:data:`MERGE_OVERLAP_IOU`) or a centre distance under this fraction of the smaller box's height
+#: (pure jitter of one box).
+MERGE_OVERLAP_IOU = 0.5
+MERGE_OVERLAP_FRAC = 0.5
+#: ---- orphan stitching (see :func:`_stitch_orphan_detections`) ----
+#: A detection that overlaps no track of its frame by more than this IoU is "orphan": the tracker
+#: never picked it up.
+_ORPHAN_IOU = 0.2
+#: Two orphan detections join one cluster when their centers are within this distance (aspect
+#: corrected, frame-height units) and at most :data:`_ORPHAN_LINK_GAP_S` seconds apart.
+_ORPHAN_LINK_DIST = 0.06
+_ORPHAN_LINK_GAP_S = 3.0
+#: A cluster only becomes a track with at least this many detections over at least this long, and
+#: with a mean confidence at least :data:`_ORPHAN_MIN_CONF` — so one-off false positives never
+#: turn into players.
+_ORPHAN_MIN_HITS = 15
+_ORPHAN_MIN_SPAN_S = 5.0
+_ORPHAN_MIN_CONF = 0.20
 #: Junction seam: boxes closer than this to a frame edge are treated as clipped/partial and ignored
 #: when comparing the geometry at a merge seam (fragments frequently start/end glued to an edge).
 EDGE_CLIP_EPS = 0.01
@@ -100,24 +133,43 @@ SIZE_HIST_MAX = 0.50
 _BAND_MIN_SIZE_RATIO = 2.0
 #: Size filtering: upper bound on the number of samples sent with the statistics (the UI uses them to preview threshold drags in real time)
 SIZE_SAMPLE_MAX = 600
-#: Same-person grouping: two tracks count as fragments of ONE player when they overlap in
-#: time, or sit no further apart than this gap (seconds). Occlusion/id-switch fragments of
-#: one player are seconds-to-tens-of-seconds apart (measured on clip1, the far player's
-#: serial fragments were ~15 s apart), while substitutions / next-game arrivals are minutes
-#: apart, so a small gap keeps one player's fragments inside one person-slot (crucial under
-#: mode-2 quotas, where competing for a second slot means "the player vanishes between
-#: fragments") without merging players from different eras.
-_SAME_PERSON_GAP_S = 30.0
-#: L2 spatial prior: weight of the band-normalized court-depth bonus in the picker's score.
-#: Small on purpose — it is a tie-breaker between otherwise comparable candidates ("stands
-#: inside the court" is evidence of being a match player), never a gate that overrides the
-#: size/motion criteria.
-_BOUNDARY_W = 0.10
-#: Outward expansion of the court polygon ROI (normalized units; every edge gives way outward by this much).
-#: Matches the old rectangular ROI expansion of 0.04. A player standing exactly on the boundary line must count as "in court":
-#: the cost of erring in one direction is asymmetric — keeping one extra person is just noise (size filtering and activity scoring come later),
-#: while missing a real player makes the downstream activity curve and crop tracking drop out completely.
-ROI_POLY_MARGIN = 0.04
+#: Outward allowance of the court polygon ROI (normalized units). **Zero: the calibrated boundary
+#: is taken literally.**
+#:
+#: It used to be 0.04 to keep "a player standing exactly on the line" admissible, but 4% of the
+#: frame is several metres: on clip1 the walker passing behind the far sideline sat only ~0.03
+#: outside, so every one of his detections entered the tracker. ByteTrack has no appearance model,
+#: and once the real far player was briefly missed the association attached that walker to the same
+#: track id (measured: id 2 moved from bc (0.390,0.576) at 4 s to (0.210,0.651) at 5 s and then
+#: drifted onto a waiting person outside the baseline by 13 s). Filtering at admission is the only
+#: place that fixes this: a person the tracker never receives cannot steal an id.
+#:
+#: Edge jitter is handled by the tracker itself (a track survives ~2 s of misses and
+#: :data:`TRACK_INTERP_MAX_GAP` bridges the short hole), not by widening the court.
+ROI_POLY_MARGIN = 0.0
+#: Depth at which the "in-court centrality" prior saturates (normalized units, measured as the
+#: distance from the track's median foot point to the nearest court edge). 0.02 of the frame is a
+#: few pixels on a proxy; anything from there inward counts as fully on court. Deliberately
+#: **distance from the boundary, not from the court centre**: under a rear camera the far player
+#: legitimately stands on the far baseline, so a centre-distance prior would systematically push
+#: him out while a bystander a metre off the sideline would outrank him.
+_SPACE_SATURATION = 0.02
+#: "Static" is a scale-invariant statement: a person counts as standing when they move less than this
+#: fraction of their own body height per second. A fixed normalized-speed threshold (the old 0.05)
+#: is depth-dependent: under a rear camera a far-side player's pixels move ~2.5-3.5x less than a
+#: near-side player's for the same real motion, so the fixed threshold labelled 95% of the far
+#: player's frames "static" and charged him the full static penalty (measured on clip1 window 0:
+#: far track id 2, static_ratio 0.95, score 0.37 vs two 7-10 s fragments at 0.59/0.56). Dividing by
+#: the track's own size removes that bias: 0.22 x 0.22 (near player) ~= the old 0.05.
+_STATIC_BODY_FRAC = 0.22
+#: Activity-score weights for a low rear/side camera. Coverage (duration) is the dominant term on
+#: purpose: over a full match a player is present for most of the window, while the competing
+#: candidates are short fragments (a passer-by, a warm-up swing). Measured on clip1 window 0 with
+#: the old (0.45, 0.40, 0.15) weights the far player (2985 frames) lost to 87- and 127-frame
+#: fragments; (0.30, 0.25, 0.45) puts the real player first while keeping area/speed as evidence.
+_W_AREA, _W_SPEED, _W_DUR = 0.30, 0.25, 0.45
+#: Overhead/elevated: everyone is the same size, so motion leads and coverage backs it up.
+_W_AREA_TOP, _W_SPEED_TOP, _W_DUR_TOP = 0.20, 0.50, 0.30
 
 Progress = Callable[[float, str], None]
 
@@ -144,13 +196,7 @@ class PlayerTrack:
     mean_speed: float = 0.0
     max_speed: float = 0.0
     active_score: float = 0.0   # Combined "activity" 0~1, used to pick out match players
-    total_travel: float = 0.0  # Normalized cumulative travel
-    #: Depth band (index into the picker's band list) that PICKED this track, stamped at
-    #: pick time. The windowed cap buckets coverage by this stamp: window-level banding
-    #: classifies players correctly, while whole-video band statistics can be skewed by a
-    #: spectator crowd (measured on clip1: full-video split at 0.095 misclassified real
-    #: far-side player fragments at 0.102-0.105 as "near"). -1 = not stamped (fallback).
-    band_hint: int = -1
+    total_travel: float = 0.0   # Normalized cumulative travel
 
     @property
     def n(self) -> int:
@@ -175,15 +221,21 @@ class PlayerSignal:
     active_player_ids: list[int] = field(default_factory=list)
     #: Per-frame boxes of each person, used for automatic crop tracking: [frame] -> [(track_id, x1,y1,x2,y2), ...] (active only)
     frame_boxes: list[list[tuple[int, float, float, float, float]]] = field(default_factory=list)
+    #: Per-frame number of **distinct candidate people visible on court** — the input of the
+    #: singles/doubles decision. Candidate boxes are spatially deduplicated (IoU), so one person
+    #: represented by two overlapping track ids counts once. Computed from the raw candidates
+    #: **before** player selection, so the verdict never feeds back on itself (a selector that drops
+    #: a player must not make the scene read as singles). Deliberately **not** weighted by track
+    #: span: ByteTrack re-creates an id after a gap, so weighting by span made four real doubles
+    #: players — whose tracks fragment every 30-60 s — add up to ~2.7 and locked the whole video to
+    #: singles.
+    format_count: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: Per-frame resolved format on the same timeline: 2 = singles, 4 = doubles (0 = no candidates).
+    format_mode: np.ndarray = field(default_factory=lambda: np.zeros(0))
     #: Statistics for person-box size filtering (pre-filter box-height distribution, how many were dropped, reference scale), for UI parameter tuning
     size_stats: dict[str, Any] = field(default_factory=dict)
     #: Cache tag of the persisted per-frame box npz (empty when caching failed/was skipped); not part of any derived signal
     cache_tag: str = ""
-    #: L1 mode-engine verdict for observability: the modal quota the picker's baseline pass used
-    #: (2 = singles, 4 = doubles; 0 = engine not used / no evidence — short clips, empty input).
-    mode: int = 0
-    #: Per-window mode sequence behind ``mode`` (one entry per 90 s step; empty when ``mode`` is 0).
-    mode_windows: list[int] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------ match format (singles / doubles)
@@ -201,41 +253,95 @@ MATCH_FRAC_GE4_DOUBLES = 0.34
 MATCH_FRAC_GE3_DOUBLES = 0.60
 #: Singles: three or more players essentially never present.
 MATCH_FRAC_GE3_MAX_SINGLE = 0.15
+#: Count thresholds of the **fallback** rule (used only when the runtime mode is unavailable, e.g.
+#: an analysis stored by an older build). ``MATCH_COUNT_GE4`` is deliberately not tied to
+#: :data:`_MODE_DOUBLES_AT`: the runtime switches at 2.5 visible people because tracking regularly
+#: loses one of the four, whereas this ratio rule describes "four people really were there".
+MATCH_COUNT_GE3 = 3.0
+MATCH_COUNT_GE4 = 3.5
+#: Mostly-doubles / mostly-singles share of covered time the runtime mode must reach before the
+#: report commits to that side; the band in between stays ``unknown`` (prefer unknown over a guess).
+MATCH_MODE_DOUBLES_SHARE = 0.60
+MATCH_MODE_SINGLE_SHARE = 0.40
+#: Input flavours of :func:`match_format_stats`, echoed in the trace so a stored analysis states
+#: which number the verdict came from.
+MATCH_SOURCE_VISIBLE_PEOPLE = "visible_people"
+MATCH_SOURCE_SELECTED_BOXES = "selected_boxes"
 
 
-def match_format_stats(active_count: np.ndarray | Sequence[float],
-                       fps: float = 0.0) -> dict[str, Any]:
-    """Guess singles vs doubles from the per-frame active-player count.
+def match_format_stats(counts: np.ndarray | Sequence[float],
+                       fps: float = 0.0,
+                       modes: np.ndarray | Sequence[int] | None = None,
+                       source: str = MATCH_SOURCE_SELECTED_BOXES) -> dict[str, Any]:
+    """Guess singles vs doubles from a per-frame person count.
 
-    Returns a trace dict with the stable code ``single | doubles | unknown`` and the
-    evidence behind it. The verdict is deliberately conservative: detection gaps are
-    excluded from the denominator, and ambiguous footage stays ``unknown`` instead of
-    forcing a label. This is a **recommendation only** — callers must never silently
-    switch parameter presets based on it.
+    ``counts`` is either the count of **selected** player boxes per frame or — preferred — the
+    count of **distinct candidates visible on court** (:attr:`PlayerSignal.format_count`, detected
+    and deduplicated before any selection). Feeding the pre-selection count removes the
+    self-reinforcing failure mode of the old input: the selected-box count is produced *by* the
+    player selector, so a selector that drops one player automatically makes the scene look like
+    singles and "confirms" its own mistake.
 
-    Threshold rationale (validated qualitatively against clip1-3): a side-court
-    doubles rally shows >=4 active players on roughly a third+ of the covered frames
-    and >=3 on a large majority; a singles rally shows >=3 only on transient ID-split
-    noise (<15%).
+    ``modes`` is the per-frame verdict the selector actually used (:attr:`PlayerSignal.format_mode`,
+    ``2`` = singles / ``4`` = doubles). When supplied and aligned with ``counts``, the returned
+    ``format`` is the verdict covering most of the **covered** time (detection gaps excluded), which
+    keeps the report and the runtime decision identical instead of re-deriving it from the raw count
+    and disagreeing at the smoothing/dwell boundary.
+
+    Returns a trace dict with the stable code ``single | doubles | unknown``, the evidence behind it,
+    the input flavour (``source``) and the mode run-length ``segments``. The verdict is deliberately
+    conservative: ambiguous footage stays ``unknown`` instead of forcing a label. This is a
+    **recommendation only** — callers must never silently switch parameter presets based on it.
+
+    Threshold rationale (validated qualitatively against clip1-3): a side-court doubles rally shows
+    >=4 active players on roughly a third+ of the covered frames and >=3 on a large majority; a
+    singles rally shows >=3 only on transient ID-split noise (<15%).
     """
-    a = np.asarray(active_count, dtype=np.float32)
+    a = np.asarray(counts, dtype=np.float32)
     total = int(a.size)
-    present = a >= 1
+    # "Present" = at least one candidate. ``> 0`` rather than ``>= 1`` so a weighted/continuous
+    # count is also handled correctly (integer counts are unaffected).
+    present = a > 0
     n_present = int(present.sum())
     present_frac = round(n_present / total, 4) if total else 0.0
-    frac_ge3 = round(float(np.count_nonzero(a >= 3) / n_present), 4) if n_present else 0.0
-    frac_ge4 = round(float(np.count_nonzero(a >= 4) / n_present), 4) if n_present else 0.0
+    frac_ge3 = round(float(np.count_nonzero(a >= MATCH_COUNT_GE3) / n_present), 4) if n_present else 0.0
+    # 3.5 rather than 4, so a frame with a partially-detected fourth person still counts; for
+    # integer counts the two are identical.
+    frac_ge4 = round(float(np.count_nonzero(a >= MATCH_COUNT_GE4) / n_present), 4) if n_present else 0.0
+
+    m: np.ndarray | None = None
+    if modes is not None:
+        cand = np.asarray(modes, dtype=np.int16)
+        if cand.size == total and total:
+            m = cand
+    mode_doubles_frac = 0.0
+    segments: list[dict[str, Any]] = []
+    if m is not None:
+        mode_doubles_frac = round(float(np.mean(m[present] >= 4)) if n_present else 0.0, 4)
+        segments = _mode_segments(m, float(fps) if fps > 0 else 1.0)
+
     fmt = MATCH_FORMAT_UNKNOWN
-    if total and n_present >= MATCH_MIN_EVIDENCE_FRAMES \
-            and present_frac >= MATCH_MIN_COVERED_FRAC:
-        if frac_ge4 >= MATCH_FRAC_GE4_DOUBLES or frac_ge3 >= MATCH_FRAC_GE3_DOUBLES:
+    enough = total and n_present >= MATCH_MIN_EVIDENCE_FRAMES \
+        and present_frac >= MATCH_MIN_COVERED_FRAC
+    if enough:
+        if m is not None:
+            if mode_doubles_frac >= MATCH_MODE_DOUBLES_SHARE:
+                fmt = MATCH_FORMAT_DOUBLES
+            elif mode_doubles_frac <= MATCH_MODE_SINGLE_SHARE:
+                fmt = MATCH_FORMAT_SINGLE
+        elif frac_ge4 >= MATCH_FRAC_GE4_DOUBLES or frac_ge3 >= MATCH_FRAC_GE3_DOUBLES:
             fmt = MATCH_FORMAT_DOUBLES
         elif frac_ge3 <= MATCH_FRAC_GE3_MAX_SINGLE:
             fmt = MATCH_FORMAT_SINGLE
     return {
         "format": fmt,
+        "source": source,
         "frac_ge3": frac_ge3,
         "frac_ge4": frac_ge4,
+        "mode_single_frac": round(1.0 - mode_doubles_frac, 4),
+        "mode_doubles_frac": mode_doubles_frac,
+        "mode_switches": max(0, len(segments) - 1),
+        "segments": segments,
         "present_frac": present_frac,
         "frames": total,
         "present_frames": n_present,
@@ -246,8 +352,42 @@ def match_format_stats(active_count: np.ndarray | Sequence[float],
             "frac_ge4_doubles": MATCH_FRAC_GE4_DOUBLES,
             "frac_ge3_doubles": MATCH_FRAC_GE3_DOUBLES,
             "frac_ge3_max_single": MATCH_FRAC_GE3_MAX_SINGLE,
+            "count_ge3": MATCH_COUNT_GE3,
+            "count_ge4": MATCH_COUNT_GE4,
+            "mode_doubles_at": _MODE_DOUBLES_AT,
+            "mode_doubles_share": MATCH_MODE_DOUBLES_SHARE,
+            "mode_single_share": MATCH_MODE_SINGLE_SHARE,
         },
     }
+
+
+def _mode_segments(modes: np.ndarray | Sequence[int], fps: float) -> list[dict[str, Any]]:
+    """Run-length encode the per-frame format mode into ``[{start, end, mode}]`` (seconds).
+
+    Used to expose *when* the runtime read the scene as singles vs doubles. The mode sequence
+    already carries the median smoothing and the dwell hysteresis, so detection gaps need no special
+    handling: the mode does not change while no candidate is present.
+    """
+    n = len(modes)
+    if not n:
+        return []
+    step = 1.0 / max(float(fps), 1e-6)
+
+    def name(code: int) -> str:
+        if code >= 4:
+            return MATCH_FORMAT_DOUBLES
+        return MATCH_FORMAT_SINGLE if code == 2 else MATCH_FORMAT_UNKNOWN
+
+    out: list[dict[str, Any]] = []
+    start, cur = 0, int(modes[0])
+    for i in range(1, n):
+        v = int(modes[i])
+        if v != cur:
+            out.append({"start": round(start * step, 3), "end": round(i * step, 3),
+                        "mode": name(cur)})
+            start, cur = i, v
+    out.append({"start": round(start * step, 3), "end": round(n * step, 3), "mode": name(cur)})
+    return out
 
 
 # ------------------------------------------------------------------ small utilities
@@ -276,6 +416,68 @@ def _box_center(box: Sequence[float]) -> tuple[float, float]:
 
 def _box_area(box: Sequence[float]) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _poly_signed_depth(pt: Sequence[float], poly: np.ndarray) -> float:
+    """Distance from a point to the nearest polygon edge: positive inside, negative outside.
+
+    This is the "how deep on court" measure used by the selection prior. Signed distance (rather
+    than plain containment) keeps the prior smooth: a player one body-width inside the line and one
+    standing mid-court are ordered, but neither is treated as "outside".
+    """
+    q = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    if q.shape[0] < 3:
+        return 0.0
+    p = np.asarray(pt, dtype=np.float64).reshape(2)
+    ab = np.roll(q, -1, axis=0) - q
+    denom = np.maximum((ab ** 2).sum(axis=1), 1e-12)
+    t = np.clip(((p - q) * ab).sum(axis=1) / denom, 0.0, 1.0)
+    proj = q + ab * t[:, None]
+    dist = float(np.min(np.hypot(p[0] - proj[:, 0], p[1] - proj[:, 1])))
+    inside = bool(point_in_poly(np.asarray([p], dtype=np.float32),
+                                q.astype(np.float32), margin=ROI_POLY_MARGIN)[0])
+    return dist if inside else -dist
+
+
+def _foot_in_court(box: Sequence[float],
+                   poly_arr: np.ndarray | None,
+                   roi_arr: Sequence[float] | None) -> bool:
+    """Whether the box's **bottom-edge center** falls inside the calibrated court.
+
+    The bottom-edge center approximates the feet: the upper half of a person box is often outside
+    the court (raised arm, jump, or the box also captured the scoreboard), so judging by the box
+    center would exclude real players.
+
+    The polygon is taken **exactly as calibrated** (:data:`ROI_POLY_MARGIN` = 0). Any outward
+    allowance admits the people who stand or walk just off the lines, and those are precisely the
+    ones that hijack a player's track id — see the constant's comment for the measured clip1 case.
+    """
+    bcx = 0.5 * (float(box[0]) + float(box[2]))
+    by = float(box[3])
+    if poly_arr is not None:
+        return bool(point_in_poly(np.asarray([[bcx, by]], dtype=np.float32),
+                                  poly_arr, margin=ROI_POLY_MARGIN)[0])
+    if roi_arr is None:
+        return True
+    return (float(roi_arr[0]) <= bcx <= float(roi_arr[2])
+            and float(roi_arr[1]) <= by <= float(roi_arr[3]))
+
+
+def _distinct_boxes(boxes: Sequence[Sequence[float]]) -> int:
+    """How many spatially distinct people a set of candidate boxes represents.
+
+    Candidate boxes come from *tracks*, and ByteTrack has no appearance model: after a gap it
+    starts a new id, and while the old track is still inside its ~2 s buffer one person can be
+    present as two boxes in the same frame. Counting ids would then over-count; collapsing
+    near-identical boxes (IoU >= :data:`DUP_IOU`, the same threshold used for duplicate detections)
+    keeps one person as one while genuinely different people stay apart.
+    """
+    keep: list[Sequence[float]] = []
+    for b in boxes:
+        if any(_iou(b, k) >= DUP_IOU for k in keep):
+            continue
+        keep.append(b)
+    return len(keep)
 
 
 def _box_height(box: Sequence[float]) -> float:
@@ -812,7 +1014,12 @@ def _junction_ok(prev: _TrackBuf, nxt: _TrackBuf, aspect: float) -> bool:
         dist = math.hypot((c1[0] - c2[0]) * aspect, c1[1] - c2[1])
         a1, a2 = _box_area(box), _box_area(o_box)
         ratio = max(a1, a2) / max(1e-9, min(a1, a2))
-        if dist <= MERGE_MAX_DIST and ratio <= MERGE_AREA_RATIO:
+        if ratio > MERGE_AREA_RATIO:
+            continue
+        # Simultaneous tracks: "same person" needs the boxes to coincide, not merely to be near
+        # each other — two players standing side by side are not one player (MERGE_OVERLAP_*).
+        jitter = MERGE_OVERLAP_FRAC * min(_box_height(box), _box_height(o_box))
+        if _iou(box, o_box) >= MERGE_OVERLAP_IOU or dist <= jitter:
             hit += 1
     return total > 0 and hit / total >= MERGE_OVERLAP_RATIO
 
@@ -899,6 +1106,21 @@ class _Feat:
         self.static_ratio = static_ratio
 
 
+def _static_ratio(track: PlayerTrack, aspect: float = 1.7778,
+                  frac: float = _STATIC_BODY_FRAC) -> float:
+    """Fraction of frames where the track moves less than ``frac`` of its own body height per second.
+
+    Depth-normalized on purpose (see :data:`_STATIC_BODY_FRAC`): the same real stride produces less
+    pixel displacement for a farther player, so a fixed normalized threshold would label a far-side
+    player "static" and charge him the full static penalty.
+    """
+    sp = np.asarray(track.speeds[1:], dtype=np.float64) if len(track.speeds) > 1 else np.zeros(0)
+    if not sp.size:
+        return 1.0
+    thr = float(frac) * max(_track_median_size(track, aspect), 1e-6)
+    return float(np.mean(sp < thr))
+
+
 def _track_feat(track: PlayerTrack, fps: float) -> _Feat:
     """Compute the derived features needed for identification from a track.
 
@@ -916,6 +1138,81 @@ def _track_feat(track: PlayerTrack, fps: float) -> _Feat:
         duration=float(track.times[-1] - track.times[0]) if track.times else 0.0,
         static_ratio=float(np.mean(sp < 0.05)) if sp.size else 1.0,
     )
+
+
+def _stitch_orphan_detections(
+    raw_dets: Sequence[Sequence[tuple[tuple[float, float, float, float], float]]],
+    times: Sequence[float],
+    tracks: Sequence[_TrackBuf],
+    aspect: float,
+    next_id: int,
+) -> list[_TrackBuf]:
+    """Turn recurring "detected but never tracked" boxes into real tracks.
+
+    Why this exists: in a doubles rally the two far-side players often stand side by side, and the
+    detector reports them in *alternating* frames — NMS merges the pair whenever their boxes
+    overlap. ByteTrack can only confirm a new track when the same detection is matched again on the
+    next sampled frame, so a detection that appears every other frame opens a new id that dies
+    immediately (measured on clip1 near 6:31: ids 42-47 each created and removed within 0.5 s).
+    The result is a person who is visible and detected but never tracked — the overlay box the user
+    sees with no id.
+
+    This runs **after** the tracker, so it cannot disturb association: keep the detections no track
+    covers at all, link them into space-time clusters, and accept a cluster as a person only when it
+    recurs often enough (:data:`_ORPHAN_MIN_HITS`), lasts long enough
+    (:data:`_ORPHAN_MIN_SPAN_S`) and is confident enough (:data:`_ORPHAN_MIN_CONF`). A one-off
+    false positive therefore never becomes a player, and a person standing behind a partner is no
+    longer dropped just because his box loses the NMS lottery every other frame.
+    """
+    if not raw_dets or not times:
+        return []
+    # Boxes every track has on each sampled frame (used to decide "is this detection covered?").
+    by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
+    for tk in tracks:
+        for f, b in zip(tk.frames, tk.boxes):
+            by_frame.setdefault(int(f), []).append(b)
+
+    active: list[dict[str, Any]] = []
+    done: list[dict[str, Any]] = []
+    for k, dets in enumerate(raw_dets):
+        if not dets:
+            continue
+        t = float(times[k]) if k < len(times) else 0.0
+        # Drop clusters that went quiet for too long, so the active list never grows unbounded.
+        active = [cl for cl in active if t - cl["t1"] <= _ORPHAN_LINK_GAP_S]
+        covered = by_frame.get(k, [])
+        for box, conf in dets:
+            if any(_iou(box, tb) >= _ORPHAN_IOU for tb in covered):
+                continue
+            c = _box_center(box)
+            best: dict[str, Any] | None = None
+            best_d = 1e9
+            for cl in active:
+                d = math.hypot((c[0] - cl["c"][0]) * aspect, c[1] - cl["c"][1])
+                if d <= _ORPHAN_LINK_DIST and d < best_d:
+                    best, best_d = cl, d
+            if best is None:
+                cl = {"t0": t, "t1": t, "c": c, "items": [(k, box, conf)]}
+                active.append(cl)
+                done.append(cl)
+            else:
+                best["t1"] = t
+                best["c"] = c
+                best["items"].append((k, box, conf))
+
+    out: list[_TrackBuf] = []
+    for cl in done:
+        items = cl["items"]
+        if len(items) < _ORPHAN_MIN_HITS or cl["t1"] - cl["t0"] < _ORPHAN_MIN_SPAN_S:
+            continue
+        if float(np.mean([c for _k, _b, c in items])) < _ORPHAN_MIN_CONF:
+            continue
+        buf = _TrackBuf(next_id, aspect)
+        for k, box, conf in items:
+            buf.observe(k, float(times[k]) if k < len(times) else 0.0, box, conf)
+        out.append(buf)
+        next_id += 1
+    return out
 
 
 def _summarize(bufs: list[_TrackBuf], fps: float) -> list[PlayerTrack]:
@@ -1171,61 +1468,6 @@ def _band_size_stats(band: list[PlayerTrack], aspect: float = 1.7778) -> dict[st
     return {"ref": ref, "min_abs": max(0.03, ref * 0.42), "max_abs": min(1.0, ref * 4.0)}
 
 
-def _feet_signed_dists(feet: np.ndarray, poly: np.ndarray) -> np.ndarray:
-    """Vectorized signed distance from every foot point to the polygon's nearest edge
-    (positive inside, negative outside) — the engine behind :func:`_foot_signed_dist`."""
-    p = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
-    pts = np.asarray(feet, dtype=np.float64).reshape(-1, 2)
-    if pts.shape[0] == 0 or p.shape[0] < 3:
-        return np.zeros(pts.shape[0], dtype=np.float64)
-    best = np.full(pts.shape[0], np.inf)
-    n = p.shape[0]
-    for i in range(n):
-        a = p[i]
-        b = p[(i + 1) % n]
-        e = b - a
-        seg2 = max(float(e @ e), 1e-12)
-        t = np.clip(((pts - a) @ e) / seg2, 0.0, 1.0)
-        q = a[None, :] + t[:, None] * e[None, :]
-        best = np.minimum(best, np.hypot(pts[:, 0] - q[:, 0], pts[:, 1] - q[:, 1]))
-    inside = point_in_poly(pts.astype(np.float32), p.astype(np.float32))
-    return np.where(inside, best, -best)
-
-
-def _foot_signed_dist(foot: tuple[float, float], poly: np.ndarray) -> float:
-    """Signed distance from a foot point (box bottom-center, normalized coords) to the court
-    polygon's nearest edge: positive inside, negative outside.
-
-    This is L2's basic quantity — "how deep into the court is this person's footing". The
-    magnitude is the distance to the nearest edge SEGMENT (so corners behave correctly, not
-    the distance to the infinite edge line); the sign is a plain point-in-polygon test
-    (:func:`court_calib.point_in_poly` with margin 0 — :data:`ROI_POLY_MARGIN` is a threshold
-    applied TO this distance by the picker, not part of its definition).
-    """
-    return float(_feet_signed_dists(np.asarray([[float(foot[0]), float(foot[1])]],
-                                                dtype=np.float64), poly)[0])
-
-
-def _track_court_depth(track: PlayerTrack, poly: np.ndarray) -> tuple[float, float]:
-    """Track-level court depth: ``(d_med, d_max)`` of the per-observation foot signed
-    distances (box bottom-center vs the polygon).
-
-    ``d_med`` says where the person USUALLY stands; ``d_max`` is the deepest they ever got
-    in. A baseline-hugging real player has a small ``d_med`` but a real ``d_max`` (measured
-    on clip1: a real far player reached ~0.13 while the bench person outside the baseline
-    never exceeded 0.043) — the PAIR is what separates "player resting on the line" from
-    "bench staff who never enter the court".
-    """
-    if not track.boxes:
-        return (0.0, 0.0)
-    feet = np.asarray([[0.5 * (float(b[0]) + float(b[2])), float(b[3])] for b in track.boxes],
-                      dtype=np.float64)
-    if feet.shape[0] == 0:
-        return (0.0, 0.0)
-    ds = _feet_signed_dists(feet, poly)
-    return (float(np.median(ds)), float(ds.max()))
-
-
 def _select_active_players(
     tracks: list[PlayerTrack],
     fps: float,
@@ -1235,8 +1477,6 @@ def _select_active_players(
     boxes: list | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
-    strict_tier: float | None = None,
-    roi_poly: np.ndarray | list | None = None,
 ) -> list[PlayerTrack]:
     """Pick "the players currently in a match", splitting the scene by depth first.
 
@@ -1251,13 +1491,6 @@ def _select_active_players(
     spread) ``_depth_bands`` returns ``None`` and this delegates to a single whole-set pass, so the
     behaviour is byte-for-byte the old one. A user-activated ``size_filter`` also forces a single
     pass: an explicit manual threshold must not be second-guessed by automatic banding.
-
-    ``strict_tier`` tightens :func:`_select_within_band`'s same-tier gate for "a second different
-    person" (0.80 in singles mode vs the default 0.55), so under a mode-2 quota only a genuinely
-    comparable second person is admitted; the windowed picker passes it per window.
-
-    ``roi_poly`` (normalized court polygon) enables the L2 spatial layer inside
-    :func:`_select_within_band`; without it the whole layer is skipped.
     """
     if not tracks:
         return []
@@ -1273,23 +1506,16 @@ def _select_active_players(
     manual = size_filter is not None and size_filter.active
     bands = _depth_bands(cand, aspect) if (size is not None and not manual) else None
     if bands is None:
-        picked = _select_within_band(cand, fps, total_duration, max_players, viewpoint,
-                                     size, aspect, size_filter, strict_tier, roi_poly)
-        for t in picked:
-            t.band_hint = 0
-        return picked
+        return _select_within_band(cand, fps, total_duration, max_players, viewpoint,
+                                   size, aspect, size_filter)
 
     # Reserve at least one slot per band so a far-side player is not crowded out by the near side;
     # the floor keeps doubles (up to 4) selectable when there are two bands.
     per_band = max(1, int(np.ceil(max_players / len(bands))))
     out: list[PlayerTrack] = []
-    for bi, band in enumerate(bands):
-        picked = _select_within_band(band, fps, total_duration, per_band, viewpoint,
-                                     _band_size_stats(band, aspect), aspect, size_filter,
-                                     strict_tier, roi_poly)
-        for t in picked:
-            t.band_hint = bi
-        out.extend(picked)
+    for band in bands:
+        out.extend(_select_within_band(band, fps, total_duration, per_band, viewpoint,
+                                       _band_size_stats(band, aspect), aspect, size_filter))
     # Scores are band-local and therefore not comparable across bands; this ordering only decides
     # the return order (downstream only reads the ids).
     out.sort(key=lambda t: t.active_score, reverse=True)
@@ -1305,8 +1531,6 @@ def _select_within_band(
     size: dict[str, float] | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
-    strict_tier: float | None = None,
-    roi_poly: np.ndarray | list | None = None,
 ) -> list[PlayerTrack]:
     """Pick out "the players currently in a match" and write each one's ``active_score``.
 
@@ -1353,21 +1577,10 @@ def _select_within_band(
     split into multiple tracks, they count as one person**, leaving the slot for another player;
     a fragment is included only when it clearly extends this player's time coverage (otherwise the
     player would "vanish" during some periods and downstream cropping would have nothing to follow).
-    The quota counts PERSONS (groups), never their fragments: a fragment of an already-picked
-    person is admitted by group extension without consuming a slot, so a singles-mode quota
-    (``max_players=2``, one slot per band) never starves a player between two id-switch
-    fragments — the extension only has to add appreciable NEW time coverage and pass the same
-    moving gate. ``strict_tier`` tightens the same-tier gate for "a different person" beyond the
-    first (0.80 in singles mode vs the default 0.55).
-
-    With a court polygon (``roi_poly``) the L2 spatial layer applies: candidates whose foot
-    never enters the polygon and who stand still for most of the window are hard-excluded
-    (bench staff; see :func:`_track_court_depth` for the measured separation), and survivors
-    get a small band-normalized "how deep inside the court do they usually stand" bonus
-    (:data:`_BOUNDARY_W`). Without a polygon the whole layer is skipped.
     """
     top_view = viewpoint in ("overhead", "elevated")
-    w_area, w_speed, w_dur = ((0.20, 0.65, 0.15) if top_view else (0.45, 0.40, 0.15))
+    w_area, w_speed, w_dur = ((_W_AREA_TOP, _W_SPEED_TOP, _W_DUR_TOP) if top_view
+                              else (_W_AREA, _W_SPEED, _W_DUR))
 
     feats: dict[int, _Feat] = {t.track_id: _track_feat(t, fps) for t in cand}
 
@@ -1393,40 +1606,6 @@ def _select_within_band(
                 cand = sized
                 feats = {t.track_id: _track_feat(t, fps) for t in cand}
 
-    # ---- L2 spatial prior (needs a court polygon; the whole layer is skipped without one).
-    depths: dict[int, tuple[float, float]] = {}
-    d_ref = 0.0
-    poly_arr = np.asarray(roi_poly, dtype=np.float64).reshape(-1, 2) \
-        if roi_poly is not None else None
-    if poly_arr is not None and poly_arr.shape[0] >= 3:
-        # Hard exclusion: "lives on the ROI edge and never really enters the court" — ALL
-        # clauses must hold together. d_med <= ROI_POLY_MARGIN: the foot's median position
-        # is pressed on/behind the boundary line; d_max < 2*ROI_POLY_MARGIN: the track never
-        # got meaningfully inside (measured clip1: bench person max 0.043 vs real
-        # baseline-hugging players 0.13 — comfortable separation); static_ratio >= 0.90 and
-        # duration >= 30% of the window: a LONG, still presence, not a player transiting the
-        # line mid-rally. The moving gate alone cannot catch this in a slow band, where the
-        # RELATIVE thresholds let a bench person through (the exclusion's whole purpose).
-        kept: list[PlayerTrack] = []
-        for t in cand:
-            dep = _track_court_depth(t, poly_arr)
-            depths[t.track_id] = dep
-            f = feats[t.track_id]
-            if (dep[0] <= ROI_POLY_MARGIN and dep[1] < 2.0 * ROI_POLY_MARGIN
-                    and f.static_ratio >= 0.90
-                    and f.duration >= 0.30 * max(total_duration, 1e-6)):
-                continue
-            kept.append(t)
-        if kept:
-            cand = kept
-        # Soft-prior reference: the band's own median d_med. A non-positive median means
-        # nobody in this band really stands inside the polygon, so the prior is meaningless
-        # and stays off ("prefer unknown over a guessed measurement").
-        meds = [depths[t.track_id][0] for t in cand if t.track_id in depths]
-        if meds:
-            m = float(np.median(np.asarray(meds, dtype=np.float64)))
-            d_ref = m if m > 0.0 else 0.0
-
     areas = np.asarray([feats[t.track_id].area_p90 for t in cand], dtype=np.float64)
     speeds = np.asarray([t.mean_speed for t in cand], dtype=np.float64)
     peaks = np.asarray([t.max_speed for t in cand], dtype=np.float64)
@@ -1434,6 +1613,8 @@ def _select_within_band(
     speed_ref = max(_pct(speeds, 90), 1e-6)
     peak_ref = max(_pct(peaks, 90), 1e-6)
     dur_ref = max(total_duration, 1e-6)
+    # Depth-normalized "static" ratio, see _STATIC_BODY_FRAC.
+    statics = {t.track_id: _static_ratio(t, aspect) for t in cand}
 
     for t in cand:
         f = feats[t.track_id]
@@ -1446,23 +1627,16 @@ def _select_within_band(
         )
         duration_score = _clip01(f.duration / dur_ref)
         # --- penalties ---
-        penalty_static = 0.35 * _clip01(f.static_ratio)                  # slow for a long time
+        penalty_static = 0.35 * _clip01(statics[t.track_id])                # slow for a long time
         penalty_fixed = 0.25 if (f.x_range < 0.06 and f.duration > 0.5 * dur_ref) else 0.0
         # With a high camera / overhead shot the court may naturally be off to one side of the frame, so being at the edge does not mean spectator
         edge = _clip01((abs(f.cx_mean - 0.5) - 0.42) / 0.08)             # pinned to the frame edge
         penalty_edge = 0.0 if top_view else 0.30 * edge
-        # L2 soft prior: prefer players who stand deeper inside the court, band-normalized
-        # (the far band compares against the far band — a far player is not punished for
-        # perspective). Deeper footing is evidence of "on court" vs "at the edge"; small
-        # weight by design (see :data:`_BOUNDARY_W`).
-        prior = (_BOUNDARY_W * _clip01(depths[t.track_id][0] / d_ref)
-                 if d_ref > 0.0 and t.track_id in depths else 0.0)
 
         score = (
             w_area * area_score
             + w_speed * speed_score
             + w_dur * duration_score
-            + prior
             - penalty_static
             - penalty_fixed
             - penalty_edge
@@ -1487,490 +1661,355 @@ def _select_within_band(
     if best <= 1e-6:
         return ranked[:1]
 
-    tier = 0.55 if strict_tier is None else float(strict_tier)
-
-    def _same_player_group(t: PlayerTrack, g: dict[str, Any]) -> bool:
-        """Whether ``t`` is another fragment of the person represented by group ``g``.
-
-        Two kinds of time evidence tie fragments to one person: actual overlap, or a short
-        id-switch gap no larger than :data:`_SAME_PERSON_GAP_S` (occlusions re-id a player
-        within seconds; measured clip1 far-side fragments sit ~15 s apart, substitutions are
-        minutes apart). The gap is measured against the group's EXTENDED time range so
-        fragment chains (A1 -> A2 -> A3) stay one person. Position and scale must also
-        match (same court spot, same depth).
-        """
-        rep = g["rep"]
-        fa, fb = feats[t.track_id], feats[rep.track_id]
-        t0, t1 = t.times[0], t.times[-1]
-        if min(g["t1"], t1) - max(g["t0"], t0) <= 0.0:
-            if max(g["t0"], t0) - min(g["t1"], t1) > _SAME_PERSON_GAP_S:
-                return False
+    def _same_player(a: PlayerTrack, b: PlayerTrack) -> bool:
+        """Whether two tracks are "the same player" (overlap in time + close in position/scale)."""
+        fa, fb = feats[a.track_id], feats[b.track_id]
+        overlap = min(a.times[-1], b.times[-1]) - max(a.times[0], b.times[0])
+        if overlap <= 0.0:
+            return False
         if abs(fa.cx_mean - fb.cx_mean) > 0.08:
             return False
         return max(fa.area_p90, fb.area_p90) / max(1e-9, min(fa.area_p90, fb.area_p90)) <= 2.5
 
-    # "Player groups": the same player may be split into multiple tracks, but they still count
-    # as one person. A fragment is included only when it is mostly "new time coverage" (periods
-    # when this player was not tracked before) — so the player does not "vanish" during some
-    # period and downstream crop tracking does not lose them midway.
+    # "Player groups": the same player may be split into multiple tracks, but they still count as
+    # one person. A fragment is included only when it is mostly "new time coverage" (periods when
+    # this player was not tracked before) — so the player does not "vanish" during some period and
+    # downstream crop tracking does not lose them midway.
     EXTEND_MIN = 2.0
     groups: list[dict[str, Any]] = []
     picked: list[PlayerTrack] = []
     for t in ranked:
+        if len(picked) >= max_players:
+            break
         f = feats[t.track_id]
         t0, t1 = t.times[0], t.times[-1]
-        grp = next((g for g in groups if _same_player_group(t, g)), None)
+        grp = next((g for g in groups if _same_player(t, g["rep"])), None)
         if grp is not None:
-            # Same-person fragment: admitted by group EXTENSION, never by person quota —
-            # one player's fragments share their person's single slot instead of competing
-            # for a second one (which a mode-2 quota would deny, making the player
-            # "vanish" between fragments).
             gain = max(0.0, grp["t0"] - t0) + max(0.0, t1 - grp["t1"])
             span = max(1e-6, t1 - t0)
             # It must add appreciable time and also cover more than half of this track's own
-            # duration; otherwise it is just a duplicate fragment of the same player and
-            # should not be counted at all.
+            # duration; otherwise it is just a duplicate fragment of the same player and should not
+            # take up a "player slot".
             if gain < EXTEND_MIN or gain < 0.5 * span:
                 continue
-            # Moving + non-small box stays a necessary condition even for extensions.
-            moving = (t.mean_speed / speed_ref) >= 0.20 and (f.area_p90 / area_ref) >= 0.20
-            if not moving:
-                continue
-            picked.append(t)
-            grp["t0"] = min(grp["t0"], t0)
-            grp["t1"] = max(grp["t1"], t1)
-            continue
-        # A NEW person: the quota counts persons (groups), never their fragments.
-        if len(groups) >= max_players:
-            break
         # Moving + non-small box is a necessary condition for a "match player"
         moving = (t.mean_speed / speed_ref) >= 0.20 and (f.area_p90 / area_ref) >= 0.20
         if not moving:
             continue
-        # From the 2nd person on: must be in the same tier as the 1st and the absolute score
-        # must not be too low; singles-mode passes tighten the tier via ``strict_tier``.
-        if picked and t.active_score < max(tier * best, 0.30):
+        # From the 2nd on: must be in the same tier as the 1st (0.55x or more) and the absolute score must not be too low
+        if picked and t.active_score < max(0.55 * best, 0.30):
             break
         picked.append(t)
-        groups.append({"rep": t, "t0": t0, "t1": t1})
+        if grp is None:
+            groups.append({"rep": t, "t0": t0, "t1": t1})
+        else:
+            grp["t0"] = min(grp["t0"], t0)
+            grp["t1"] = max(grp["t1"], t1)
     return picked
 
 
-#: Window length and step (seconds) when re-picking match players per time window. The window must
-#: be much longer than "one substitution / one occlusion" so the player has enough observations
-#: inside it; the step is half of it so there is no seam at the boundary where nobody is selected.
-_ACTIVE_WINDOW_S = 180.0
-_ACTIVE_WINDOW_STEP_S = 90.0
-#: Maximum number of tracks allowed to remain after per-window merging (safety valve to keep background false detections from blowing up frame_boxes).
+#: Per-frame selection constants.
+#: Temporal smoothing of the per-second visible-people count (median over +/- this many seconds),
+#: which removes single-second detection flicker before the verdict looks at it.
+_MODE_SMOOTH_S = 9.0
+#: Visible-people count below this resolves to singles (quota 2), at/above it to doubles (quota 4).
+#: It sits between 2 and 3, i.e. "three people on court means doubles". Two would demand exactly
+#: four visible people, which never happens in practice: tracking regularly loses one of the four
+#: (occlusion behind a partner, a low-confidence detection, a partner's box merged into his own), so
+#: the per-second count in a real doubles rally is mostly 3 with stretches of 4, and a 3.5 threshold
+#: kept the whole clip1 doubles session classified as singles (measured at 21:34: count 4 at that
+#: instant, median 3 over the surrounding minute). Off-court people are already excluded at
+#: admission, so a third person *inside* the calibrated court is meaningful evidence, and the
+#: median + hysteresis still ignore a brief passer-by.
+_MODE_DOUBLES_AT = 2.5
+#: Length of the trailing window the verdict looks at. The verdict is the **median over the last
+#: 180 s**, not a "the count must stay on one side for 180 s" counter: measured on clip1, a real
+#: doubles stretch oscillates around the threshold every 30-60 s, so a consecutive-run requirement
+#: never fired and the whole 82-minute video stayed locked on singles. A trailing median keeps the
+#: same inertia against a brief dip (a player stepping out of the ROI to fetch the shuttle) without
+#: requiring the count to be continuously on one side.
+_MODE_MIN_DWELL_S = 180.0
+#: Hysteresis band (in people) around :data:`_MODE_DOUBLES_AT`: leaving the current mode requires
+#: the window median to clear the threshold by this margin, so a median sitting exactly on it does
+#: not flicker between singles and doubles.
+_MODE_HYST = 0.25
+#: Seconds of evidence required before the verdict may move off its initial value.
+_MODE_WARMUP_S = 20.0
+#: Coverage term of the per-track credibility score saturates here (a track present this long is
+#: "fully covered"). Coverage is the dominant term: over a match the real players are present for
+#: most of the time, while the competing candidates are short fragments.
+_CRED_COVERAGE_S = 180.0
+#: An extra per-band slot may only go to a track covering at least this fraction of the principal
+#: track's span (and at least ``_FRAG_MIN_S``), so 2-8 s fragments never take a player slot.
+#: A track stitched from recurring detections (:func:`_stitch_orphan_detections`) is exempt when it
+#: has this many observations: its *span* looks short only because the detector reports it in
+#: alternating frames, while its observation count proves it was there all along.
+_FRAG_FRACTION = 0.4
+_FRAG_MIN_S = 2.0
+_FRAG_MIN_HITS = 30
+#: Safety valve: maximum number of distinct track ids kept after the per-frame union.
 _ACTIVE_MAX_TRACKS = 64
 
-#: Mode engine: raw person counts are clamped to this range before filtering — below 2 a rally
-#: cannot be happening (counting noise), above 4 means duplicated tracks / bench staff leaked
-#: past the moving gate.
-_MODE_CLAMP = (2, 4)
-#: Mode engine: a filtered value must disagree with the current mode for this many consecutive
-#: windows before the mode switches (one deviating window is a pickup break, not a format change).
-_MODE_SWITCH_WINDOWS = 2
-#: Mode engine: after a switch the mode must dwell at least this long (seconds) before the next
-#: switch is allowed, so the sequence cannot oscillate at window rate.
-_MODE_MIN_DWELL_S = 180.0
 
+def _cap_by_coverage(out: list[PlayerTrack], max_tracks: int = _ACTIVE_MAX_TRACKS,
+                     base_ids: set[int] | None = None) -> list[PlayerTrack]:
+    """Truncate to ``max_tracks`` while preserving time coverage greedily.
 
-def _window_person_counts(
-    sub: list[PlayerTrack],
-    fps: float,
-    t0: float,
-    t1: float,
-    band_of_track: dict[int, int],
-) -> dict[int, float]:
-    """Per depth band: the median over the window's frames of "distinct moving tracks with a
-    box in this frame".
-
-    This is the mode engine's counting signal, deliberately fragment-immune: serial fragments
-    of one player never share a frame (when the tracker re-ids a player the old id is already
-    gone), and duplicated overlapping tracks shift only a minority of frames, which the
-    median absorbs. The moving gate (speed ratio >= 0.20 AND area ratio >= 0.20 against this
-    window's own per-band p90 references — the same formula :func:`_select_within_band` uses,
-    but computed independently for this window) keeps immobile waiters and bench staff out of
-    the count. Tracks missing from ``band_of_track`` are sub-minimum-length noise and are
-    never counted.
-
-    Known limit (measured on clip1, 82 min of a multi-court gym): a warm-up / practice person
-    INSIDE the court is as mobile as a real player and is counted, so the count reflects
-    "mobile people in the court area", not "players in the match". A polygon-based
-    "typical foot position inside the court" filter was tried and reverted: it systematically
-    dropped the far-side player's own fragments (their median foot rests just behind the far
-    baseline; measured d_med ~ -0.03), i.e. it biased the count AGAINST the far side and could
-    collapse a genuine doubles window to 2 — the exact silent-coverage loss this refactor
-    exists to prevent. The quota is deliberately kept permissive (ties resolve toward 4)
-    because an over-count only adds spurious extra picks while an under-count loses real
-    players.
-
-    Returns ``{band: median_count}``; bands with no moving candidates are omitted.
+    Keeps ``base_ids`` (the optional anchors) first, then repeatedly admits the track that adds the
+    most not-yet-covered timeline frames; stop when nothing adds coverage. A short track that is the
+    only coverage of some time range therefore always beats a redundant long track.
     """
-    if not sub or t1 <= t0:
-        return {}
-    feats = {t.track_id: _track_feat(t, fps) for t in sub}
-    by_band: dict[int, list[PlayerTrack]] = {}
-    for t in sub:
-        b = band_of_track.get(t.track_id)
-        if b is None:
-            continue
-        by_band.setdefault(b, []).append(t)
-    i0 = int(np.ceil(t0 * fps))
-    i1 = int(np.floor(t1 * fps))
-    if i1 < i0:
-        return {}
-    out: dict[int, float] = {}
-    for b, members in by_band.items():
-        speeds = np.asarray([t.mean_speed for t in members], dtype=np.float64)
-        areas = np.asarray([feats[t.track_id].area_p90 for t in members], dtype=np.float64)
-        speed_ref = max(_pct(speeds, 90), 1e-6)
-        area_ref = max(_pct(areas, 90), 1e-6)
-        moving = [t for t in members
-                  if (t.mean_speed / speed_ref) >= 0.20
-                  and (feats[t.track_id].area_p90 / area_ref) >= 0.20]
-        if not moving:
-            continue
-        counts = np.zeros(i1 - i0 + 1, dtype=np.int32)
-        for t in moving:
-            fs = np.asarray(t.frames, dtype=np.int64)
-            fs = fs[(fs >= i0) & (fs <= i1)]
-            counts[fs - i0] += 1
-        out[b] = float(np.median(counts))
-    return out
-
-
-def _window_modes(
-    tracks: list[PlayerTrack],
-    fps: float,
-    duration: float,
-    band_of_track: dict[int, int],
-    aspect: float = 1.7778,
-) -> list[int]:
-    """Per-window match mode (the picker's singles/doubles quota), one entry per window.
-
-    Decision chain, each step immunizing against one measured failure mode:
-
-    1. Per window, sum the per-band median "mobile person" counts (see
-       :func:`_window_person_counts`) and clamp to ``[_MODE_CLAMP]`` — a pickup break with two
-       people still on court must not read as "singles", and four is the ceiling anyway.
-    2. 3-window median filter (endpoint windows: mean of self and the single neighbour; empty
-       windows carry the nearest valid value first). Erases single-window dips: a 10-30 s
-       shuttle pickup inside a doubles match shows up as one low window.
-    3. Switch hysteresis: a deviating filtered value must persist
-       ``_MODE_SWITCH_WINDOWS`` consecutive windows to switch, and a fresh mode must dwell
-       ``_MODE_MIN_DWELL_S`` before the next switch — so mixed-format footage switches for
-       real, and oscillation is impossible.
-
-    ``aspect`` is accepted for interface stability (the L3 band-consolidation pass threads it
-    through); the count itself only needs ``band_of_track``.
-    """
-    n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S) / _ACTIVE_WINDOW_STEP_S))) + 1
-    raw: list[float | None] = []
-    for w in range(n_win):
-        t0 = w * _ACTIVE_WINDOW_STEP_S
-        t1 = min(duration, t0 + _ACTIVE_WINDOW_S)
-        if t1 - t0 < 8.0:
-            raw.append(None)  # mirror the picker loop: too-short tail windows are skipped
-            continue
-        sub = [t for t in tracks
-               if t.n > 0 and t.times[-1] >= t0 and t.times[0] <= t1]
-        counts = _window_person_counts(sub, fps, t0, t1, band_of_track) if sub else {}
-        if not counts:
-            raw.append(None)  # empty window: carry the nearest valid value
-            continue
-        total = sum(counts.values())
-        raw.append(min(max(total, _MODE_CLAMP[0]), _MODE_CLAMP[1]))
-    # Empty windows carry the nearest valid value (forward fill, then back-fill leading gaps).
-    filled: list[float] = []
-    last: float | None = None
-    for v in raw:
-        if v is None:
-            filled.append(last if last is not None else float("nan"))
-        else:
-            last = v
-            filled.append(v)
-    first_valid = next((v for v in filled if v == v), None)
-    if first_valid is None:
-        return [4] * n_win  # no evidence anywhere: stay permissive (old fixed-quota behaviour)
-    for w in range(n_win):
-        if filled[w] != filled[w]:
-            filled[w] = first_valid
-        else:
+    if len(out) <= max_tracks:
+        return out
+    kept = [t for t in out if base_ids and t.track_id in base_ids]
+    rest = [t for t in out if not (base_ids and t.track_id in base_ids)]
+    frame_sets = {t.track_id: set(t.frames) for t in rest}
+    covered: set[int] = set()
+    for t in kept:
+        covered.update(t.frames)
+    rest.sort(key=lambda t: (-t.n, t.track_id))
+    while len(kept) < max_tracks and rest:
+        best_i, best_gain = 0, -1
+        for i, t in enumerate(rest):
+            gain = len(frame_sets[t.track_id] - covered)
+            if gain > best_gain:
+                best_i, best_gain = i, gain
+        if best_gain <= 0:
             break
-    # 3-window median filter; endpoint windows use the mean of self and the single neighbour.
-    filtered: list[int] = []
-    for w in range(n_win):
-        vals = [filled[j] for j in (w - 1, w, w + 1) if 0 <= j < n_win]
-        if len(vals) >= 3:
-            filtered.append(int(np.median(vals)))
-        else:
-            filtered.append(int(np.floor(sum(vals) / len(vals) + 0.5)))
-    # Switch hysteresis.
-    modes: list[int] = []
-    cur = filtered[0]
-    last_switch = 0
-    pending: int | None = None
-    pending_len = 0
-    for w in range(n_win):
-        f = filtered[w]
-        if f != cur:
-            pending_len = pending_len + 1 if f == pending else 1
-            pending = f
-            dwell_ok = (w - last_switch) * _ACTIVE_WINDOW_STEP_S >= _MODE_MIN_DWELL_S
-            if pending_len >= _MODE_SWITCH_WINDOWS and dwell_ok:
-                cur, last_switch = f, w
-                pending, pending_len = None, 0
-        else:
-            pending, pending_len = None, 0
-        modes.append(cur)
-    logger.debug("mode engine: n_win={} raw_counts={} filtered={} modes={}",
-                 n_win, raw, filtered, modes)
-    return modes
+        t = rest.pop(best_i)
+        frame_sets.pop(t.track_id, None)
+        kept.append(t)
+        covered.update(t.frames)
+    return sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
 
 
-def _band_assignment(
-    tracks: list[PlayerTrack],
-    fps: float,
-    aspect: float = 1.7778,
-) -> tuple[list[list[PlayerTrack]] | None, dict[int, int], list[dict[str, float]]]:
-    """One depth-band computation, shared by every consumer in the windowed picker (the size
-    floor, the L1 mode engine's counting, the cap's fallback banding).
+def _mode_sequence(counts: list[float], sample_fps: float) -> list[int]:
+    """Turn the per-frame visible-people count into a singles/doubles mode sequence.
 
-    Returns ``(bands, band_of_track, per_band_stats)``:
+    ``2`` = singles, ``4`` = doubles, one value per timeline frame.
 
-    * ``bands``: the :func:`_depth_bands` partition, or ``None`` for a flat-depth scene;
-    * ``band_of_track``: track id -> band index; a flat-depth scene maps every candidate to
-      the single virtual band 0 so the mode engine still counts persons;
-    * ``per_band_stats``: :func:`_band_size_stats` per band (empty when ``bands is None``).
+    Three layers of inertia, each answering a different failure:
 
-    The candidate filter mirrors the picker's: sub-minimum-length tracks (under ~0.4 s) are
-    noise and stay unmapped (banded case) — they must not be counted as on-court persons.
+    1. per-second buckets — the count is what people are visible, sampled at ``sample_fps``;
+    2. a 9 s centred median — one occluded frame or one duplicate box cannot move the number;
+    3. a **trailing 180 s median** with a small hysteresis band — the verdict follows the recent
+       three minutes, so a brief drop (a player leaving the ROI to fetch the shuttle) does not flip
+       the quota, while a real change of format is followed within the window.
+
+    The dwell used to be a "the count must stay on the other side for 180 consecutive seconds"
+    counter. Measured on clip1 that never fired: a genuine doubles stretch keeps dipping below the
+    threshold for a few seconds every minute, so the counter kept resetting and the entire
+    82-minute video stayed on singles. A trailing median has the same inertia and no such
+    reset pathology.
     """
-    full = [t for t in tracks if t.n >= max(3, int(round(0.4 * fps)))] or tracks
-    bands = _depth_bands(full, aspect)
-    band_of_track: dict[int, int] = {}
-    stats: list[dict[str, float]] = []
-    if bands:
-        for bi, band in enumerate(bands):
-            stats.append(_band_size_stats(band, aspect))
-            for t in band:
-                band_of_track[t.track_id] = bi
-    else:
-        # Flat-depth scene: one virtual band so the mode engine still counts persons.
-        for t in full:
-            band_of_track[t.track_id] = 0
-    return bands, band_of_track, stats
+    if not counts:
+        return []
+    n = len(counts)
+    # Work on 1 s buckets: cheaper than a per-frame median and enough resolution for a format.
+    per_sec = max(1, int(round(sample_fps)))
+    n_sec = max(1, int(np.ceil(n / per_sec)))
+    arr = np.asarray(counts, dtype=np.float64)
+    buckets = np.asarray([arr[i * per_sec:min(n, (i + 1) * per_sec)].mean()
+                          for i in range(n_sec)], dtype=np.float64)
+    half = max(1, int(round(_MODE_SMOOTH_S / 2.0)))
+    smooth = np.asarray([
+        np.median(buckets[max(0, i - half):min(n_sec, i + half + 1)]) for i in range(n_sec)
+    ], dtype=np.float64)
+
+    win = max(1, int(round(_MODE_MIN_DWELL_S)))
+    warm = max(1, int(round(_MODE_WARMUP_S)))
+    out: list[int] = []
+    cur = 4 if smooth[0] >= _MODE_DOUBLES_AT else 2
+    for s in range(n_sec):
+        if s + 1 >= warm:
+            hist = smooth[max(0, s - win + 1):s + 1]
+            v = float(np.median(hist))
+            if cur == 2 and v >= _MODE_DOUBLES_AT + _MODE_HYST:
+                cur = 4
+            elif cur == 4 and v <= _MODE_DOUBLES_AT - _MODE_HYST:
+                cur = 2
+        out.extend([cur] * per_sec)
+    return out[:n]
 
 
-def _select_active_players_windowed(
+class FrameSelection(NamedTuple):
+    """Result of :func:`_select_players_per_frame`.
+
+    A tuple (not just a dataclass) so callers can still unpack positionally, while the names keep
+    the four outputs self-documenting: the kept tracks, the per-frame id sets, the visible-people
+    count that drove the format decision, and the resolved per-frame format mode.
+    """
+
+    tracks: list[PlayerTrack]
+    ids_per_frame: list[set[int]]
+    #: Per-frame number of **distinct visible candidate people** (IoU-deduplicated boxes).
+    counts: list[float]
+    #: Per-frame resolved format, 2 = singles / 4 = doubles (same length as ``counts``).
+    modes: list[int]
+
+
+def _track_foot(track: PlayerTrack) -> tuple[float, float]:
+    """Median foot point of a track (per-axis median of the bottom-edge centers)."""
+    if not track.boxes:
+        return (0.5, 0.5)
+    arr = np.asarray(track.boxes, dtype=np.float64)
+    return (float(np.median(0.5 * (arr[:, 0] + arr[:, 2]))), float(np.median(arr[:, 3])))
+
+
+def _select_players_per_frame(
     tracks: list[PlayerTrack],
     fps: float,
     duration: float,
-    max_players: int = 4,
+    sample_fps: float | None = None,
     viewpoint: str = "unknown",
-    boxes: list | None = None,
     aspect: float = 1.7778,
     size_filter: SizeFilter | None = None,
-    roi_poly: np.ndarray | list | None = None,
-    trace: dict | None = None,
-) -> list[PlayerTrack]:
-    """Pick match players **window by window in time**, then merge the results.
+    roi_poly: np.ndarray | Sequence[Sequence[float]] | None = None,
+    n_frames: int | None = None,
+) -> FrameSelection:
+    """Select the player boxes **frame by frame** and return the format decision that drove it.
 
-    Why not pick only once for the whole video: a measured 30-minute clip has 285 tracks — the
-    player gets occluded midway, walks out of frame, or overlaps with a background person, and the
-    tracker gives them a new id. Meanwhile :func:`_select_active_players` ranks by **whole-video**
-    statistics, so the top 4 are very likely all in the middle of the video. The consequences are
-    severe: ``PlayerSignal.frame_boxes`` is empty for the rest of the time, so
+    Why per frame instead of window-level track ranking: a track id is not a stable identity over
+    180 s, so ranking whole tracks inside a window makes the quota depend on which fragments happen
+    to be strong there. Measured on clip1 window 0, the far-side player had a continuous track from
+    0 s (2985 frames) yet lost the quota to 87- and 127-frame fragments, purely because his
+    perspective-shrunk motion looked slower. Per-frame selection removes that competition: the
+    quota is applied to the boxes that exist *now*, and a track's rank is backed by its own
+    lifetime evidence (coverage, depth-normalized motion, band-local size), never by a window-wide
+    beauty contest.
 
-    * ``active_count`` / ``player_motion`` are 0 for entire segments (a measured first 372 seconds were constantly 0);
-    * at segmentation time player coverage is only 0.48, which kills the "player-motion segmentation"
-      path outright and falls back to "whole-frame activity" — and the latter never collapses in a
-      multi-court gym, so rallies get glued into segments dozens of seconds long.
+    The rule, for every timeline frame:
 
-    Approach: slice into windows of ``_ACTIVE_WINDOW_S`` (step half, so nothing is missed at the
-    boundaries); each window ranks only the tracks that **overlap in time with that window**, then
-    the selected ids from all windows are unioned. The whole-video pass still runs: its per-depth-band
-    reference scale ("how big the largest person is on this side of the court") is used as the final
-    size gate to keep a window from selecting distant spectators, while a legitimate far-side player is
-    judged against the far side's own scale rather than the near side's.
+    1. Candidates are the tracks with a box in that frame.
+    2. If the number of candidates is already within the format quota, **all are players** — this is
+       the "ROI contains only two boxes, so the far one is a player too even if it barely moves"
+       case, and it needs no motion evidence at all.
+    3. Otherwise each depth band receives its quota (1 for singles, 2 for doubles) by credibility;
+       an extra slot in a band additionally requires the track to cover a meaningful fraction of
+       the principal track's span, so short fragments are dropped instead of competing.
+    4. With a single (flat-depth) band the quota is the full format count.
 
-    The L1 mode engine makes the picker singles/doubles aware: each window's mobile-person
-    count (per depth band, median over frames, moving-gated — see :func:`_window_modes`)
-    becomes that window's quota (2 in singles, 4 in doubles), and the whole-video baseline
-    uses the modal quota. A mode-2 window also tightens the "second different person"
-    same-tier gate (``strict_tier=0.80``), so a waiter cannot ride a weak 0.55-tier score
-    into the singles quota. One player's serial fragments share their person's slot via
-    same-person group extension (see :func:`_select_within_band`), so a mode-2 quota never
-    starves the far player between two id-switch fragments.
+    The singles/doubles format itself is a **temporally filtered count of how many distinct people
+    are visible** (:func:`_distinct_boxes`), deliberately not a geometric on-court test: a player's
+    foot median can sit right on the far baseline, so deciding "is this frame singles or doubles"
+    from inside-polygon geometry systematically under-counts the far side. Nor is it a per-track
+    tally: track ids fragment in a doubles rally, so id-based evidence under-counts real people.
 
-    When ``duration`` is shorter than one window, behavior is exactly the same as the old
-    implementation (the mode engine is not used; ``trace`` then reports mode 0 and an empty
-    window list — the picker's verdicts are unknown, not guessed).
-
-    ``trace`` (optional out-dict) receives the mode-engine verdicts for observability:
-    ``mode`` (the modal quota the baseline pass used) and ``mode_windows`` (the per-window
-    mode sequence). ``analyze_players`` copies these onto ``PlayerSignal`` and pipeline.py
-    surfaces them in ``stats.player_trace``; unknown keys are ignored downstream.
+    ``roi_poly`` adds the opposite thing — a **soft spatial prior for ranking**, never a hard test:
+    each candidate's credibility gets a term proportional to how far its median foot point lies
+    *inside* the calibrated boundary (distance to the nearest edge, saturating at
+    :data:`_SPACE_SATURATION`). Signed distance from the boundary, not distance from the court
+    centre: the far player standing on the far baseline is fully legitimate, whereas someone resting
+    or walking a metre off the sideline is not — a centre-distance term would rank the bystander
+    above a serving player at the baseline. Hard exclusion of off-court people already happens
+    upstream, at tracker admission (:func:`_foot_in_court`).
     """
-    def _fill_trace(mode: int, windows: list[int]) -> None:
-        if trace is not None:
-            trace["mode"] = mode
-            trace["mode_windows"] = windows
-
+    sample_fps = float(sample_fps or fps)
+    n = int(n_frames) if n_frames else max(1, int(math.ceil(duration * sample_fps - 1e-9)))
     if not tracks:
-        _fill_trace(0, [])
-        return []
-    if duration <= _ACTIVE_WINDOW_S:
-        _fill_trace(0, [])
-        return _select_active_players(tracks, fps, duration, max_players=max_players,
-                                      viewpoint=viewpoint, boxes=boxes, aspect=aspect,
-                                      size_filter=size_filter, roi_poly=roi_poly)
+        return FrameSelection([], [set() for _ in range(n)], [0.0] * n, [0] * n)
+    min_frames = max(3, int(round(0.4 * fps)))
+    cand = [t for t in tracks if t.n >= min_frames]
+    if not cand:
+        cand = sorted(tracks, key=lambda t: t.n, reverse=True)[:2]
+    if not cand:
+        return FrameSelection([], [set() for _ in range(n)], [0.0] * n, [0] * n)
 
-    gsize = _box_size_stats(boxes, aspect) if boxes else None
-    g_ref = float(gsize["ref"]) if gsize else 0.0
-    g_min = float(gsize["min_abs"]) if gsize else 0.0
-    # Tracks picked per window must also pass the same "big enough" gate: discard only when they are
-    # clearly smaller than their own depth band's reference scale (meaning distant spectators / people
-    # on a neighboring court). The floor is depth-aware on purpose: a flat global floor calibrated on
-    # the near side would throw away every far-side window pick, which is exactly the bug we fix.
-    size_floor = max(g_min, g_ref * 0.45) if g_ref > 0 else 0.0
-    floor_by_track: dict[int, float] = {}
-    # One shared band computation (see :func:`_band_assignment`), consumed by the floor, the
-    # mode engine's counting and the cap's unmapped-track fallback. The cap's redundancy test
-    # is band-aware and normally trusts the pick-time ``band_hint`` stamps instead (window-level
-    # truth; whole-video statistics can be skewed by a spectator crowd).
-    all_bands, band_of_track, band_stats = _band_assignment(tracks, fps, aspect)
-    if all_bands:
-        for bi, band in enumerate(all_bands):
-            bstat = band_stats[bi]
-            if size_floor > 0 and bstat["ref"] > 0:
-                bfloor = max(bstat["min_abs"], bstat["ref"] * 0.45)
-                for t in band:
-                    floor_by_track[t.track_id] = bfloor
+    bands = _depth_bands(cand, aspect) or [cand]
+    band_of: dict[int, int] = {}
+    band_ref: dict[int, float] = {}
+    for bi, band in enumerate(bands):
+        stats = _band_size_stats(band, aspect)
+        band_ref[bi] = float(stats["ref"])
+        for t in band:
+            band_of[t.track_id] = bi
 
-    def _band_of(t: PlayerTrack) -> int:
-        """Depth band of a track; unmapped (sub-min_frames fallback) tracks go to the nearest band."""
-        b = band_of_track.get(t.track_id)
-        if b is not None:
-            return b
-        if not all_bands:
-            return 0
-        small_max = max(_track_median_size(t2, aspect) for t2 in all_bands[0])
-        large_min = min(_track_median_size(t2, aspect) for t2 in all_bands[1])
-        return 1 if _track_median_size(t, aspect) >= 0.5 * (small_max + large_min) else 0
+    # Manual size filtering wins over the adaptive band reference (the user asked for it).
+    if size_filter is not None and size_filter.active:
+        keep_ids = set()
+        for bi, band in enumerate(bands):
+            for t in band:
+                if size_filter.keep(_median_box(t), band_ref.get(bi, 0.0)):
+                    keep_ids.add(t.track_id)
+        if keep_ids:
+            cand = [t for t in cand if t.track_id in keep_ids]
 
-    n_win = max(1, int(np.ceil((duration - _ACTIVE_WINDOW_S)
-                               / _ACTIVE_WINDOW_STEP_S))) + 1
-    # ---- L1 mode engine: per-window quota from the detected match mode.
-    modes = _window_modes(tracks, fps, duration, band_of_track, aspect)
-    _fill_trace(0, [])  # provisional defaults; overwritten below once the modal quota is known
-    mode_counts: dict[int, int] = {}
-    for m in modes:
-        mode_counts[m] = mode_counts.get(m, 0) + 1
-    if mode_counts:
-        top = max(mode_counts.values())
-        tied = [m for m, c in mode_counts.items() if c == top]
-        # Ties resolve toward 4: the baseline is insurance (a too-small baseline quota could
-        # not be topped up later), while windows still quota by their own detected mode.
-        base_quota = 4 if 4 in tied else max(tied)
-    else:
-        base_quota = max_players
-    base_quota = min(base_quota, max_players)
-    _fill_trace(base_quota, list(modes))
+    poly_arr: np.ndarray | None = None
+    if roi_poly is not None:
+        p = np.asarray(roi_poly, dtype=np.float32).reshape(-1, 2)
+        p = p[np.all(np.isfinite(p), axis=1)]
+        if p.shape[0] >= 3:
+            poly_arr = p
 
-    # Whole-video pass: the "reference size", a set of baseline ids, and the modal quota.
-    base = _select_active_players(tracks, fps, duration, max_players=base_quota,
-                                  viewpoint=viewpoint, boxes=boxes, aspect=aspect,
-                                  size_filter=size_filter,
-                                  strict_tier=(0.80 if base_quota == 2 else None),
-                                  roi_poly=roi_poly)
-    base_ids = {t.track_id for t in base}
+    # Per-track credibility: its own lifetime evidence, never a window-wide ranking.
+    # Weights: coverage stays dominant (a real player is there most of the time, a passer-by is
+    # not), activity (share of frames actually moving, depth-normalized so the far side is not
+    # penalized) backs it up, and the spatial term only orders tracks that are both plausible.
+    cred: dict[int, float] = {}
+    span: dict[int, float] = {}
+    for t in cand:
+        s = max(0.0, float(t.times[-1] - t.times[0])) if t.times else 0.0
+        span[t.track_id] = s
+        cov = _clip01(s / _CRED_COVERAGE_S)
+        motion = 1.0 - _clip01(_static_ratio(t, aspect))
+        ref = band_ref.get(band_of.get(t.track_id, 0), 0.0)
+        size_score = _clip01(_track_median_size(t, aspect) / ref) if ref > 0 else 1.0
+        space = (1.0 if poly_arr is None else
+                 _clip01(_poly_signed_depth(_track_foot(t), poly_arr) / _SPACE_SATURATION))
+        cred[t.track_id] = 0.40 * cov + 0.30 * motion + 0.15 * size_score + 0.15 * space
 
-    chosen: dict[int, PlayerTrack] = {t.track_id: t for t in base}
-    for w in range(n_win):
-        t0 = w * _ACTIVE_WINDOW_STEP_S
-        t1 = min(duration, t0 + _ACTIVE_WINDOW_S)
-        if t1 - t0 < 8.0:
+    # Presence on the timeline grid (dedup: several sampled observations may land on one frame).
+    presence: list[set[int]] = [set() for _ in range(n)]
+    presence_boxes: list[list[tuple[float, float, float, float]]] = [[] for _ in range(n)]
+    for t in cand:
+        for tm, box in zip(t.times, t.boxes):
+            i = min(n - 1, max(0, int(round(tm * sample_fps))))
+            presence[i].add(t.track_id)
+            presence_boxes[i].append(box)
+
+    # Format count = how many distinct people are visible now, **not** how many track ids are
+    # present and not a span-weighted sum of them. ByteTrack re-creates an id after a >5 s gap, so
+    # in doubles the same player shows up as several short tracks; weighting each by its span made
+    # four real players add up to ~2.7 and pinned the whole clip to singles (measured).
+    counts = [float(_distinct_boxes(boxes)) for boxes in presence_boxes]
+    modes = _mode_sequence(counts, sample_fps)
+
+    n_obs = {t.track_id: t.n for t in cand}
+    ids_per_frame: list[set[int]] = []
+    for i in range(n):
+        present = presence[i]
+        if not present:
+            ids_per_frame.append(set())
             continue
-        sub = [t for t in tracks
-               if t.n > 0 and t.times[-1] >= t0 and t.times[0] <= t1]
-        if not sub:
+        mode = modes[i] if i < len(modes) else 2
+        if len(present) <= mode:
+            # The user-facing case: the ROI holds no more boxes than the format allows, so every
+            # box is a player — no motion/size competition is applied at all.
+            ids_per_frame.append(set(present))
             continue
-        quota = min(modes[w], max_players) if w < len(modes) else base_quota
-        sub_boxes = None
-        if boxes:
-            i0 = max(0, int(t0 * fps))
-            i1 = min(len(boxes), max(i0 + 1, int(t1 * fps)))
-            sub_boxes = boxes[i0:i1]
-        try:
-            picked = _select_active_players(sub, fps, t1 - t0,
-                                            max_players=quota, viewpoint=viewpoint,
-                                            boxes=sub_boxes, aspect=aspect,
-                                            size_filter=size_filter,
-                                            strict_tier=(0.80 if quota == 2 else None),
-                                            roi_poly=roi_poly)
-        except Exception:
-            continue
-        floor_drop = 0
-        for t in picked:
-            if t.track_id in chosen:
+        per_band = mode if len(bands) == 1 else max(1, int(np.ceil(mode / len(bands))))
+        picked: set[int] = set()
+        for bi in range(len(bands)):
+            members = [tid for tid in present if band_of.get(tid) == bi]
+            if not members:
                 continue
-            floor = floor_by_track.get(t.track_id, size_floor)
-            if floor > 0 and _track_median_size(t, aspect) < floor:
-                floor_drop += 1
-                continue
-            chosen[t.track_id] = t
-        logger.debug("select win={} mode={} quota={} picks={} floor_drop={}",
-                     w, modes[w] if w < len(modes) else base_quota, quota,
-                     [t.track_id for t in picked], floor_drop)
+            members.sort(key=lambda tid: (-cred.get(tid, 0.0), tid))
+            principal = members[0]
+            picked.add(principal)
+            p_span = span.get(principal, 0.0)
+            for tid in members[1:per_band]:
+                if span.get(tid, 0.0) >= max(_FRAG_MIN_S, _FRAG_FRACTION * p_span) \
+                        or n_obs.get(tid, 0) >= _FRAG_MIN_HITS:
+                    picked.add(tid)
+        ids_per_frame.append(picked)
 
-    out = sorted(chosen.values(), key=lambda t: (t.times[0] if t.n else 0.0))
-    if len(out) > _ACTIVE_MAX_TRACKS:
-        # Too many means background false detections mixed in. Keep the whole-video baseline
-        # first, then admit tracks by GREEDY NEW-TIME-COVERAGE instead of raw length: the old
-        # "longest first" rule silently erased short fragments that were the ONLY coverage of
-        # some time range -- measured on clip1, the far-side player's whole first 230 s
-        # vanished from ``frame_boxes`` this way, because every early far-side window pick
-        # was a short fragment that lost the length sort to long tracks elsewhere in an
-        # 82-minute multi-game video. With the greedy rule a short track covering otherwise
-        # uncovered seconds is always admitted before any redundant duplicate.
-        # The redundancy test is BAND-AWARE: coverage is tracked per depth band, because a
-        # near-side box at second t cannot stand in for the far-side player's box at second t
-        # (measured on clip1: window 0 correctly picked far-side fragments 86/123, and the
-        # time-only metric still dropped them as "redundant" against near-side tracks).
-        # The band key is the PICK-TIME stamp (``band_hint``): window-level banding puts a
-        # real far-side player in the far band, while whole-video band statistics can be
-        # skewed by a spectator crowd (measured: full-video split at 0.095 classified the
-        # 0.102-0.105 far-side fragments as "near", and the cap dropped them again).
-
-        def _cap_band(t: PlayerTrack) -> int:
-            b = t.band_hint
-            return b if b >= 0 else _band_of(t)
-
-        kept = [t for t in out if t.track_id in base_ids]
-        rest = [t for t in out if t.track_id not in base_ids]
-        frame_sets = {t.track_id: set(t.frames) for t in rest}
-        covered_by_band: dict[int, set[int]] = {}
-        for t in kept:
-            covered_by_band.setdefault(_cap_band(t), set()).update(t.frames)
-        rest.sort(key=lambda t: (-t.n, t.track_id))
-        while len(kept) < _ACTIVE_MAX_TRACKS and rest:
-            best_i, best_gain = 0, -1
-            for i, t in enumerate(rest):
-                gain = len(frame_sets[t.track_id] - covered_by_band.get(_cap_band(t), set()))
-                if gain > best_gain:
-                    best_i, best_gain = i, gain
-            if best_gain <= 0:
-                break
-            t = rest.pop(best_i)
-            frame_sets.pop(t.track_id, None)
-            kept.append(t)
-            covered_by_band.setdefault(_cap_band(t), set()).update(t.frames)
-        out = sorted(kept, key=lambda t: (t.times[0] if t.n else 0.0))
-        logger.debug("select cap kept={} redundant={}", len(out), len(rest))
-    return out
+    union: dict[int, PlayerTrack] = {}
+    selected = set().union(*ids_per_frame) if ids_per_frame else set()
+    for t in cand:
+        if t.track_id in selected:
+            union[t.track_id] = t
+    out = _cap_by_coverage(sorted(union.values(), key=lambda t: (t.times[0] if t.n else 0.0)))
+    return FrameSelection(out, ids_per_frame, counts, modes)
 
 
 def _fill_track_holes(
@@ -2047,7 +2086,7 @@ def analyze_players(
     sample_fps: float = 15.0,
     roi: tuple[float, float, float, float] | None = None,   # normalized x0,y0,x1,y1; only person-box bottom-center inside counts as candidate
     max_seconds: float = 0.0,      # 0 = whole video
-    model_name: str = "yolo11n.pt",
+    model_name: str = DEFAULT_PLAYER_MODEL,
     imgsz: int = 640,
     conf: float = 0.25,
     device: str = "cuda",
@@ -2193,22 +2232,8 @@ def analyze_players(
             roi_arr = None
 
     def _passes_roi(box: tuple[float, float, float, float]) -> bool:
-        """Whether the box's bottom-edge center falls inside the court.
-
-        If a court polygon is available use it (mandatory for curved-boundary footage), otherwise
-        fall back to the bounding rectangle. Bottom-edge center rather than box center: the upper
-        half of a person box is often outside the court (raised arm, jump, or the box also captured
-        the scoreboard), and judging by center would exclude real players.
-        """
-        bcx = 0.5 * (box[0] + box[2])
-        by = box[3]
-        if poly_arr is not None:
-            # ROI_POLY_MARGIN: a player standing exactly on the boundary line counts as "in court" (see point_in_poly)
-            return bool(point_in_poly(np.asarray([[bcx, by]], dtype=np.float32),
-                                      poly_arr, margin=ROI_POLY_MARGIN)[0])
-        if roi_arr is None:
-            return True
-        return (roi_arr[0] <= bcx <= roi_arr[2]) and (roi_arr[1] <= by <= roi_arr[3])
+        """Admission test for tracker input; see :func:`_foot_in_court` (exact boundary, no margin)."""
+        return _foot_in_court(box, poly_arr, roi_arr)
 
     def _dets_of(result: Any) -> list[tuple[tuple[float, float, float, float], float]]:
         boxes = getattr(result, "boxes", None)
@@ -2325,21 +2350,39 @@ def analyze_players(
 
     # ---- track merging + summarization ----
     bufs = _merge_tracks(tracker.tracks, aspect)
+    # Detections that no track ever covered (the far player whose box keeps losing NMS to his
+    # partner) become tracks of their own; see _stitch_orphan_detections.
+    if raw_dets:
+        # Sampled rows are appended in order (0, 1, 2, ...), so the row index is the sampled
+        # frame index; ``buf_idx`` itself is a per-batch scratch list and is cleared each batch.
+        orphans = _stitch_orphan_detections(
+            raw_dets, [i * step_dt for i in range(len(raw_dets))], bufs, aspect,
+            max((b.track_id for b in bufs), default=0) + 1,
+        )
+        if orphans:
+            logger.debug("orphan stitching: {} synthesized track(s) from {} detection(s)",
+                         len(orphans), sum(o.n for o in orphans))
+            bufs = _merge_tracks(bufs + orphans, aspect)
     tracks = _summarize(bufs, eff_fps)
 
     # ---- identify match players ----
-    # Window-by-window identification: in long videos a player gets split into many tracks, and
-    # picking only once for the whole video leaves "time outside the middle" with no player signal
-    # at all (measured: frame_boxes is empty 58% of the time).
-    mode_trace: dict = {}
-    active = _select_active_players_windowed(tracks, eff_fps, duration, viewpoint=viewpoint,
-                                             boxes=det_frames, aspect=aspect,
-                                             size_filter=sf, roi_poly=poly_arr,
-                                             trace=mode_trace)
+    # Per-frame identification: a track id is not a stable identity over a long video, so the
+    # player quota is applied to the boxes that exist at each frame, backed by each track's own
+    # lifetime evidence (see _select_players_per_frame). This replaces the former window-by-window
+    # track ranking, whose quota competition let short fragments outrank the real far-side player.
+    n = max(1, int(math.ceil(duration * sample_fps - 1e-9)))
+    sel = _select_players_per_frame(
+        tracks, eff_fps, duration, sample_fps=sample_fps, viewpoint=viewpoint,
+        aspect=aspect, size_filter=sf, roi_poly=poly_arr, n_frames=n,
+    )
+    active, ids_per_frame = sel.tracks, sel.ids_per_frame
     active_ids = [t.track_id for t in active]
+    # The format decision that produced ids_per_frame, kept on the signal so the report can state
+    # the runtime verdict instead of re-deriving it from the selected boxes (self-referential).
+    format_count = np.asarray(sel.counts, dtype=np.float32)
+    format_mode = np.asarray(sel.modes, dtype=np.int16)
 
     # ---- assemble the timeline (length = ceil(duration * sample_fps); index i corresponds to i/sample_fps) ----
-    n = max(1, int(math.ceil(duration * sample_fps - 1e-9)))
 
     def _ti(t: float) -> int:
         return min(n - 1, max(0, int(round(t * sample_fps))))
@@ -2362,7 +2405,7 @@ def analyze_players(
             crowd_sp[i].append(s)
             if s > max_sp[i]:
                 max_sp[i] = s
-            if tk.track_id in active_set:
+            if tk.track_id in ids_per_frame[i]:
                 active_present[i].add(tk.track_id)
                 active_sp[i].append(s)
                 b = tk.boxes[j]
@@ -2427,10 +2470,10 @@ def analyze_players(
         crowd_speed=crowd_speed,
         active_player_ids=active_ids,
         frame_boxes=frame_boxes,
+        format_count=format_count,
+        format_mode=format_mode,
         size_stats=size_stats,
         cache_tag=cache_tag,
-        mode=int(mode_trace.get("mode", 0) or 0),
-        mode_windows=list(mode_trace.get("mode_windows", []) or []),
     )
 
 
@@ -2471,7 +2514,7 @@ def boxes_cache_tag(
     roi_poly: list[list[float]] | None = None,
     viewpoint: str = "unknown",
     size_filter: "SizeFilter | dict | None" = None,
-    model_name: str = "yolo11n.pt",
+    model_name: str = DEFAULT_PLAYER_MODEL,
     imgsz: int = 640,
     conf: float = 0.25,
     max_seconds: float = 0.0,
@@ -2844,7 +2887,7 @@ def _read_frame_at(cap: Any, src_fps: float, t: float, tries: int = 6) -> np.nda
 def probe_boxes(
     video_path: str,
     count: int = 10,
-    model_name: str = "yolo11n.pt",
+    model_name: str = DEFAULT_PLAYER_MODEL,
     imgsz: int = 640,
     conf: float = 0.25,
     device: str = "cuda",
@@ -3022,14 +3065,10 @@ def probe_boxes(
                                   viewpoint)
                 if b is None:
                     continue
-                bcx, by = 0.5 * (b[0] + b[2]), b[3]
-                if poly_arr is not None:
-                    if not bool(point_in_poly(np.asarray([[bcx, by]], dtype=np.float32),
-                                              poly_arr, margin=ROI_POLY_MARGIN)[0]):
-                        continue
-                elif roi_arr is not None:
-                    if not (roi_arr[0] <= bcx <= roi_arr[2] and roi_arr[1] <= by <= roi_arr[3]):
-                        continue
+                # Same admission rule as the tracker input, so this preview shows exactly the
+                # boxes the tracker actually received.
+                if not _foot_in_court(b, poly_arr, roi_arr):
+                    continue
                 dets.append((b, c))
         dets = _dedup_dets(dets, aspect)
         ref = max((_box_height(b) for b, _c in dets), default=0.0)

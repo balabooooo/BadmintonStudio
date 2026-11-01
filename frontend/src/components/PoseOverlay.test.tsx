@@ -29,6 +29,7 @@ function fakeVideo(currentTime = 0): HTMLVideoElement {
     videoHeight: 540,
     clientWidth: 960,
     clientHeight: 540,
+    seeking: false,
     addEventListener: target.addEventListener.bind(target),
     removeEventListener: target.removeEventListener.bind(target),
     dispatchEvent: target.dispatchEvent.bind(target),
@@ -108,6 +109,17 @@ describe('PoseOverlay component', () => {
     renderOverlay()
     fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
     expect(await screen.findByText(/overlay data missing/i)).toBeInTheDocument()
+  })
+
+  it('combines the player-box and skeleton display layers into one toggle', async () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    mockedOverlay.mockResolvedValue(okResponse)
+    renderOverlay()
+    fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
+    await waitFor(() => expect(mockedOverlay).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: /player \+ skeleton/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^boxes$/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^skeleton$/i })).toBeNull()
   })
 
   it('aborts the in-flight request when the layer is switched off', async () => {
@@ -277,6 +289,63 @@ describe('PoseOverlay component', () => {
     })
     expect(mockedOverlay).toHaveBeenCalledTimes(3)
     expect(screen.queryByText(/retrying/i)).toBeNull()
+  })
+
+  it('blanks the boxes while a paused seek is in flight, then draws the new frame', async () => {
+    act(() => useStore.setState({ lang: 'en' }))
+    let strokes = 0
+    let clears = 0
+    const ctx2d = {
+      globalAlpha: 1,
+      clearRect: vi.fn(() => { clears += 1 }),
+      strokeRect: vi.fn(() => { strokes += 1 }),
+      fillRect: vi.fn(),
+      fillText: vi.fn(),
+      measureText: vi.fn(() => ({ width: 10 })),
+      setLineDash: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      arc: vi.fn(),
+    }
+    const getCtxSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(ctx2d as unknown as CanvasRenderingContext2D)
+    let rafCb: FrameRequestCallback | null = null
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCb = cb
+      return 1
+    })
+    const cancelSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+
+    const video = fakeVideo(1 / 12)
+    mockedOverlay.mockResolvedValue(okResponse)
+    renderOverlay(video)
+    fireEvent.click(screen.getByRole('button', { name: /overlay/i }))
+    await waitFor(() => expect(mockedOverlay).toHaveBeenCalledTimes(1))
+    act(() => rafCb?.(0))
+    const before = strokes
+    expect(before).toBeGreaterThan(0)
+
+    // Arrow-key step: currentTime jumps before the video presents the new frame.
+    video.currentTime = 0.1
+    Object.defineProperty(video, 'seeking', { value: true, configurable: true })
+    video.dispatchEvent(new window.Event('seeking'))
+    act(() => rafCb?.(0))
+    expect(clears).toBeGreaterThan(0)
+    expect(strokes).toBe(before)
+
+    // Seek finishes: the next draw uses the presented frame again.
+    Object.defineProperty(video, 'seeking', { value: false, configurable: true })
+    video.dispatchEvent(new window.Event('seeked'))
+    await act(async () => {})
+    act(() => rafCb?.(0))
+    expect(strokes).toBeGreaterThan(before)
+
+    getCtxSpy.mockRestore()
+    rafSpy.mockRestore()
+    cancelSpy.mockRestore()
   })
 
   it('draws v3 interpolated boxes dimmed (alpha 0.55) and observed boxes opaque', async () => {
