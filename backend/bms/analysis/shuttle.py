@@ -227,32 +227,23 @@ BACKEND_ENV = "BMS_SHUTTLE_BACKEND"
 
 
 def _gpu_available() -> bool:
-    """True when a usable torch CUDA device exists. Import failures degrade to False."""
-    try:
-        import torch
+    """True when a usable torch CUDA device exists (cached capability probe)."""
+    from ..inference import probe
 
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
+    return probe().cuda_available
 
 
 def _resolve_backend(force: str | None = None) -> str:
     """Resolve the scan backend ("cpu"/"gpu") from the explicit arg or :data:`BACKEND_ENV`.
 
-    ``auto`` picks GPU when torch CUDA is usable, otherwise CPU. An env-level ``gpu`` request
-    on a CUDA-less machine silently falls back to CPU; an explicit ``force="gpu"`` raises,
-    so callers opting into "GPU, no fallback" get a hard failure instead of silent CPU work.
+    Delegates to :func:`bms.inference.scheduler.resolve_shuttle_backend`. ``auto`` picks GPU
+    when torch CUDA is usable, otherwise CPU. An env-level ``gpu`` request on a CUDA-less
+    machine silently falls back to CPU; an explicit ``force="gpu"`` raises, so callers opting
+    into "GPU, no fallback" get a hard failure instead of silent CPU work.
     """
-    want = str(force if force else os.environ.get(BACKEND_ENV, "auto")).strip().lower()
-    if want == "cpu":
-        return "cpu"
-    if want == "gpu":
-        if _gpu_available():
-            return "gpu"
-        if force:
-            raise RuntimeError("shuttle backend 'gpu' requested but torch.cuda is unavailable")
-        return "cpu"
-    return "gpu" if _gpu_available() else "cpu"
+    from ..inference import resolve_shuttle_backend
+
+    return resolve_shuttle_backend(force, os.environ.get(BACKEND_ENV, "auto"))
 
 
 # cv2.getStructuringElement(MORPH_ELLIPSE, (3, 3)) is a 5-cell cross; dilate uses a full 3x3 square.

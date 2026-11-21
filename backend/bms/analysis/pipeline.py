@@ -14,6 +14,7 @@ Flow
 
 from __future__ import annotations
 
+import time
 import traceback
 from typing import Any, Callable
 
@@ -147,6 +148,11 @@ def attribute_sides(rallies: list[Rally], player_sig, fps: float,
             s.player = first_side if k % 2 == 0 else ("far" if first_side == "near" else "near")  # type: ignore[assignment]
 
 
+def _mark_stage(stage_times: dict[str, float], name: str, started: float) -> None:
+    """Accumulate wall-clock seconds for one analysis stage (repeat names add up)."""
+    stage_times[name] = stage_times.get(name, 0.0) + (time.perf_counter() - started)
+
+
 def run_analysis(
     media: MediaInfo,
     params: AnalysisParams | None = None,
@@ -172,12 +178,21 @@ def run_analysis(
     def cancelled() -> bool:
         return bool(cancel and cancel())
 
+    #: Wall-clock seconds per stage. Purely diagnostic: it never feeds scoring or output files.
+    stage_times: dict[str, float] = {}
+
     try:
         # ---------------------------------------------------------- 1. derived resources
         emit(0.01, "prepare", tr("analysis.stage.prepare"))
+        _t0 = time.perf_counter()
         M.ensure_proxy(media, on=lambda p, m: emit(0.01 + 0.14 * p, "proxy", m), cancel=cancel)
+        _mark_stage(stage_times, "proxy", _t0)
+        _t0 = time.perf_counter()
         M.ensure_audio(media, on=lambda p, m: emit(0.15 + 0.05 * p, "audio", m), cancel=cancel)
+        _mark_stage(stage_times, "audio", _t0)
+        _t0 = time.perf_counter()
         M.ensure_poster(media)
+        _mark_stage(stage_times, "poster", _t0)
         if cancelled():
             res.status = "cancelled"
             return res
@@ -193,6 +208,7 @@ def run_analysis(
         # lets player detection be restricted to this court, no longer relying on the
         # camera-coupled guess "the two largest boxes are the players"; the camera-angle type also
         # determines which prior parameter set is used afterward.
+        _t0 = time.perf_counter()
         calib: CC.CourtCalibration | None = None
         hint = params.viewpoint if params.viewpoint != "auto" else None
         # Manually calibrated court boundary: prefer the new multi-point polygon field; a legacy
@@ -227,6 +243,7 @@ def run_analysis(
         elif manual is None:
             calib = CC.CourtCalibration()
             calib.note("已关闭自动标定，且没有手动标定（使用全画幅与通用参数）")
+        _mark_stage(stage_times, "calib", _t0)
         if cancelled():
             res.status = "cancelled"
             return res
@@ -250,7 +267,9 @@ def run_analysis(
         hit_trace: dict[str, Any] = {}
         if params.use_audio and media.audio_path:
             emit(0.22, "hits", tr("analysis.stage.hits"))
+            _t0 = time.perf_counter()
             hits = AH.detect_hits(media.audio_path, sensitivity=params.hit_sensitivity)
+            _mark_stage(stage_times, "hits", _t0)
             hits_raw = hits
             hit_trace = {
                 "count": int(hits.times.size),
@@ -267,6 +286,7 @@ def run_analysis(
         speech_trace: dict[str, Any] = {}
         if params.use_speech and params.speech_phrases and media.audio_path:
             emit(0.24, "speech", tr("analysis.stage.speech"))
+            _t0 = time.perf_counter()
             speech_res = SP.detect_phrases(
                 media.audio_path,
                 params.speech_phrases,
@@ -275,6 +295,7 @@ def run_analysis(
                 model=params.speech_model,
                 fuzzy=params.speech_fuzzy,
             )
+            _mark_stage(stage_times, "speech", _t0)
             speech_trace = dict(speech_res.trace)
             speech_trace["available"] = bool(speech_res.available)
             speech_trace["count"] = int(speech_res.times.size)
@@ -289,21 +310,17 @@ def run_analysis(
             return res
 
         # ---------------------------------------------------------- 3. frame motion
+        # The motion signal is computed inside the player pass when possible (section 4), sharing
+        # its single decode of the proxy; the accumulator is created here and finalized afterwards.
         motion_sig: MO.MotionSignal | None = None
         motion_dict: dict[str, np.ndarray] | None = None
+        motion_acc: MO.MotionAccumulator | None = None
         if params.use_motion:
             emit(0.26, "motion", tr("analysis.stage.motion"))
-            motion_sig = MO.analyze_motion(
-                media,
+            motion_acc = MO.MotionAccumulator(
                 sample_fps=min(params.sample_fps, 15.0),
                 work_width=320,
-                on=lambda p, m: emit(0.26 + 0.14 * p, "motion", m),
-                cancel=cancel,
             )
-            motion_dict = {"fps": np.array([motion_sig.fps], dtype=np.float32), "motion": motion_sig.motion,
-                           "court_motion": motion_sig.court_motion, "sharpness": motion_sig.sharpness,
-                           "shake": motion_sig.shake}
-            motion_dict["fps"] = float(motion_sig.fps)
         if cancelled():
             res.status = "cancelled"
             return res
@@ -323,6 +340,7 @@ def run_analysis(
             "max_area": params.player_max_area,
         }
         if params.use_players:
+            _t0 = time.perf_counter()
             mod = _try_import("players")
             if mod is not None and hasattr(mod, "analyze_players"):
                 try:
@@ -337,6 +355,7 @@ def run_analysis(
                         viewpoint=(calib.viewpoint if calib is not None else "unknown"),
                         on_progress=lambda p, s: emit(0.40 + 0.24 * p, "players", s),
                         cancel=cancel,
+                        frame_consumers=([motion_acc] if motion_acc is not None else None),
                     )
                     players_dict = {
                         "fps": float(getattr(player_sig, "fps", params.sample_fps)),
@@ -354,6 +373,30 @@ def run_analysis(
                 except Exception as e:  # a player-module failure should not interrupt the whole analysis
                     player_trace = {"error": f"{type(e).__name__}: {e}"}
                     log.opt(exception=e).warning("player detection degraded")
+            _mark_stage(stage_times, "players", _t0)
+        if motion_acc is not None:
+            if player_sig is not None:
+                # The player pass consumed the frames: no second decode of the proxy. "motion"
+                # now measures the motion math only; the shared decode is counted in "players".
+                motion_sig = motion_acc.finalize()
+                stage_times["motion"] = motion_acc.seconds
+            else:
+                # Player detection disabled or failed: motion still gets its own pass so the
+                # downstream segmentation sees exactly the same signal as before.
+                emit(0.26, "motion", tr("analysis.stage.motion"))
+                _t0 = time.perf_counter()
+                motion_sig = MO.analyze_motion(
+                    media,
+                    sample_fps=min(params.sample_fps, 15.0),
+                    work_width=320,
+                    on=lambda p, m: emit(0.26 + 0.14 * p, "motion", m),
+                    cancel=cancel,
+                )
+                _mark_stage(stage_times, "motion", _t0)
+            motion_dict = {"fps": np.array([motion_sig.fps], dtype=np.float32), "motion": motion_sig.motion,
+                           "court_motion": motion_sig.court_motion, "sharpness": motion_sig.sharpness,
+                           "shake": motion_sig.shake}
+            motion_dict["fps"] = float(motion_sig.fps)
         if cancelled():
             res.status = "cancelled"
             return res
@@ -373,6 +416,7 @@ def run_analysis(
         if params.use_pose and player_sig is not None:
             boxes = getattr(player_sig, "frame_boxes", None)
             if boxes:
+                _t0 = time.perf_counter()
                 mod = _try_import("pose")
                 if mod is not None and hasattr(mod, "analyze_pose"):
                     try:
@@ -406,6 +450,7 @@ def run_analysis(
                         log.opt(exception=e).warning("pose gating degraded")
                 else:
                     pose_trace = {"disabled": tr("analysis.trace.pose.module_unavailable")}
+                _mark_stage(stage_times, "pose", _t0)
             else:
                 pose_trace = {"skipped": tr("analysis.trace.pose.no_boxes")}
         elif not params.use_pose:
@@ -423,6 +468,7 @@ def run_analysis(
         if params.use_shuttle:
             mod = _try_import("shuttle")
             if mod is not None and hasattr(mod, "analyze_shuttle"):
+                _t0 = time.perf_counter()
                 try:
                     budget = float(params.shuttle_budget_seconds or 0.0)
                     limit = min(duration, budget) if budget > 0 else 0.0
@@ -466,6 +512,7 @@ def run_analysis(
                 except Exception as e:
                     shuttle_trace = {"error": f"{type(e).__name__}: {e}"}
                     log.opt(exception=e).warning("shuttle tracking degraded")
+                _mark_stage(stage_times, "shuttle", _t0)
         else:
             shuttle_trace = {"disabled": tr("analysis.trace.shuttle.disabled")}
         if cancelled():
@@ -474,6 +521,7 @@ def run_analysis(
 
         # ---------------------------------------------------------- 6. fusion + segmentation
         emit(0.85, "segment", tr("analysis.stage.segment"))
+        _t0 = time.perf_counter()
         ana_fps = float(min(params.sample_fps, 15.0)) or 15.0
         fused = RA.fuse(
             fps=ana_fps,
@@ -547,6 +595,7 @@ def run_analysis(
         # the switch is off / pose unavailable, so default output is identical to the chain above.
         intervals, boundary_refine_trace = BD.refine_boundaries(
             intervals, boundary_ev, params, duration, method=seg_method)
+        _mark_stage(stage_times, "segment", _t0)
 
         # ---------------------------------------------------------- 7.5 speech recall pass
         # The full-file decode is unstable on some 30 s chunks and can drop a clear short shout
@@ -557,6 +606,7 @@ def run_analysis(
         if (params.use_speech and params.speech_fuzzy and speech_res is not None
                 and speech_res.available and media.audio_path and intervals):
             emit(0.90, "speech", tr("analysis.stage.speech_refine"))
+            _t0 = time.perf_counter()
             refined = SP.refine_phrases(
                 media.audio_path,
                 params.speech_phrases,
@@ -572,9 +622,11 @@ def run_analysis(
                 speech_events = _speech_events(refined)
                 speech_trace.update(refined.trace.get("refine", {}))
                 speech_trace["count"] = len(speech_events)
+            _mark_stage(stage_times, "speech", _t0)
 
         # ---------------------------------------------------------- 8. features + scoring
         emit(0.92, "score", tr("analysis.stage.score"))
+        _t0 = time.perf_counter()
         # Scoring needs shot evidence even when hit-sound detection is off. Audio hits stay the
         # source when they exist (they are already attributed by the pose gate); otherwise the
         # visual shot estimator supplies the exact same HitDetection shape, so both modes run the
@@ -612,6 +664,8 @@ def run_analysis(
             except Exception:
                 pass
 
+        _mark_stage(stage_times, "score", _t0)
+        _t0 = time.perf_counter()
         res.rallies = rallies
         res.hits = _hits_to_events(hits, intervals) if hits is not None else []
         res.signals = _pack_signals(fused, motion_sig, player_sig, shuttle_sig, hits, duration,
@@ -716,6 +770,7 @@ def run_analysis(
             res.stats["auto_roi"] = list(motion_sig.roi)
         res.calibration = calib.as_payload() if calib is not None else None
         res.court = _court_payload(motion_sig, player_sig, calib)
+        _mark_stage(stage_times, "write", _t0)
         res.status = "done"
         emit(1.0, "done", tr("analysis.stage.done", n=len(rallies)))
         log.info("analysis done: rallies={} hits={}", len(rallies), int(hits.times.size) if hits is not None else 0)
@@ -731,6 +786,8 @@ def run_analysis(
         import time as _t
 
         res.finished_at = int(_t.time() * 1000)
+        if stage_times:
+            res.stats["stage_times"] = {k: round(v, 3) for k, v in stage_times.items()}
 
 
 # ------------------------------------------------------------------ helpers

@@ -294,15 +294,10 @@ _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 
 
 def _pick_device() -> tuple[str, str]:
-    """Prefer CUDA float16 when CTranslate2 reports a GPU, else CPU int8."""
-    try:
-        import ctranslate2
+    """Prefer CUDA float16 when CTranslate2 reports a GPU, else CPU int8 (via :mod:`bms.inference`)."""
+    from ..inference import resolve_speech_runtime
 
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda", "float16"
-    except Exception:  # noqa: BLE001
-        pass
-    return "cpu", "int8"
+    return resolve_speech_runtime()
 
 
 def _load_model(model_id: str, device: str, compute_type: str) -> Any:

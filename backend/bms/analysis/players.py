@@ -35,7 +35,9 @@ import numpy as np
 from loguru import logger
 
 from ..i18n import tr
+from ..inference import resolve_detect_backend
 from .court_calib import point_in_poly
+from .frames import VideoFrameStream
 
 # ------------------------------------------------------------------ constants
 
@@ -710,17 +712,10 @@ def _resolve_weights(model_name: str, models_dir: Path) -> str:
 
 
 def _pick_device(device: str) -> str:
-    """Automatically fall back to CPU when there is no GPU."""
-    want = (device or "cpu").strip()
-    if want.lower().startswith("cuda"):
-        try:
-            import torch
+    """Automatically fall back to CPU when there is no GPU (delegates to :mod:`bms.inference`)."""
+    from ..inference import resolve_torch_device
 
-            if not torch.cuda.is_available():
-                return "cpu"
-        except Exception:
-            return "cpu"
-    return want
+    return resolve_torch_device(device)
 
 
 # ------------------------------------------------------------------ tracker
@@ -2096,6 +2091,7 @@ def analyze_players(
     size_filter: "SizeFilter | dict | None" = None,
     on_progress: Progress | None = None,
     cancel: Any = None,            # callable() -> bool
+    frame_consumers: Sequence[Any] | None = None,
 ) -> PlayerSignal:
     """Detect and track people in the video and pick out the players in a match.
 
@@ -2125,6 +2121,10 @@ def analyze_players(
             everyone is the same size, so only motion can distinguish them).
         on_progress: ``callable(progress: float, stage: str)`` progress callback.
         cancel: ``callable() -> bool``; when it returns True, abort as soon as possible and return the part already analyzed.
+        frame_consumers: Optional extra consumers of the **same decoded frames** (each exposes
+            ``sample_fps``, ``configure(src_fps, step)`` and ``feed(index, frame)``). The pipeline
+            uses this to compute the motion signal during this pass instead of decoding the proxy
+            a second time; detection/tracking output is unaffected.
 
     Returns:
         PlayerSignal (``size_stats`` carries the pre-filter box-height distribution, which the UI uses for tuning)
@@ -2187,6 +2187,17 @@ def analyze_players(
     )
     batch_size = max(1, int(batch_hint))
 
+    # Extra consumers (e.g. the motion accumulator) share this single decode pass. Their stride
+    # is derived exactly like this module's, so each one sees the frames it would have sampled
+    # in its own loop.
+    consumers = list(frame_consumers or [])
+    consumer_steps = [
+        max(1, int(round(src_fps / max(1e-3, float(getattr(c, "sample_fps", sample_fps) or sample_fps)))))
+        for c in consumers
+    ]
+    for consumer, cstep in zip(consumers, consumer_steps):
+        consumer.configure(src_fps, cstep)
+
     # ---- load the model ----
     try:
         from ultralytics import YOLO
@@ -2194,16 +2205,36 @@ def analyze_players(
         cap.release()
         raise RuntimeError(f"无法导入 ultralytics: {exc}") from exc
 
-    model = YOLO(weights)
-    # Tracking and the visualization cache need looser boxes (to pass through brief occlusion and to
-    # expose low-confidence misses); anything below LOW_CONF (0.10) is not trusted
     det_conf = float(min(conf, LOW_CONF))
+    # Backend switch (docs/mobile-and-device-ai-plan.md §5.1 P2). Torch stays the default; the
+    # ONNX path is opt-in via BMS_INFER_BACKEND=onnx and degrades to Torch when the runtime or
+    # the exported model is missing, so an unavailable accelerator never fails an analysis.
+    ort_det = None
+    model = None
+    if resolve_detect_backend() == "onnx":
+        try:
+            from ..inference.ort_backend import OrtDetector
+
+            ort_det = OrtDetector(imgsz=imgsz, conf=det_conf)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ONNX detector unavailable ({}: {}); using torch",
+                           type(exc).__name__, exc)
+    if ort_det is None:
+        model = YOLO(weights)
 
     tracker = _ByteTracker(fps=eff_fps, aspect=aspect)
 
     def _predict(frames: list[np.ndarray]) -> list[Any]:
         """Batch inference; on CUDA failure, fall back to CPU and retry once."""
-        nonlocal dev
+        nonlocal dev, ort_det, model
+        if ort_det is not None:
+            try:
+                return ort_det.predict(frames, conf=det_conf)
+            except Exception as exc:  # noqa: BLE001 - switch back instead of losing the stage
+                logger.warning("ONNX detection failed ({}: {}); switching to torch",
+                               type(exc).__name__, exc)
+                ort_det = None
+                model = YOLO(weights)
         try:
             return model.predict(
                 frames, classes=[0], conf=det_conf, imgsz=imgsz,
@@ -2260,8 +2291,6 @@ def analyze_players(
     buf: list[np.ndarray] = []
     buf_idx: list[int] = []
     proc = 0                     # number of sampled frames processed
-    read = 0                     # number of raw frames grabbed
-    idx = 0
     # Raw detection boxes per sampled frame (normalized, including background people). Used to
     # adaptively estimate "roughly how big the players are in this match", see `_box_size_stats`.
     det_frames: list[list[tuple[float, float, float, float]]] = []
@@ -2300,38 +2329,32 @@ def analyze_players(
         # crop tracking drop out completely.
         return kept or dets
 
-    while True:
+    # One decode pass for every grid: this module's own ``step`` plus each extra consumer's.
+    stream = VideoFrameStream(cap, [step, *consumer_steps], limit=limit, cancel=cancel)
+    for idx, frame in stream:
         if _cancelled():
             break
-        ok = cap.grab()
-        if not ok:
-            break
-        read += 1
-        if idx % step != 0:
-            idx += 1
-            continue
-        ok, frame = cap.retrieve()
-        idx += 1
-        if not ok or frame is None:
-            continue
-        if read > limit:
-            break
-        buf.append(frame)
-        buf_idx.append(proc)
-        proc += 1
+        if idx % step == 0:
+            buf.append(frame)
+            buf_idx.append(proc)
+            proc += 1
 
-        if len(buf) >= batch_size:
-            results = _predict(buf)
-            for k, res in enumerate(results):
-                dets_raw = _dets_of(res)
-                raw_dets.append(dets_raw)
-                dets = _apply_size_filter(dets_raw)
-                det_frames.append([b for b, _c in dets])
-                tracker.update(buf_idx[k], buf_idx[k] * step_dt, dets)
-            buf.clear()
-            buf_idx.clear()
-            if total_frames:
-                _report(min(0.95, read / min(total_frames, limit)), tr("players.detect_players"))
+            if len(buf) >= batch_size:
+                results = _predict(buf)
+                for k, res in enumerate(results):
+                    dets_raw = _dets_of(res)
+                    raw_dets.append(dets_raw)
+                    dets = _apply_size_filter(dets_raw)
+                    det_frames.append([b for b, _c in dets])
+                    tracker.update(buf_idx[k], buf_idx[k] * step_dt, dets)
+                buf.clear()
+                buf_idx.clear()
+                if total_frames:
+                    _report(min(0.95, (idx + 1) / min(total_frames, limit)),
+                            tr("players.detect_players"))
+        for consumer, cstep in zip(consumers, consumer_steps):
+            if idx % cstep == 0:
+                consumer.feed(idx, frame)
 
     if buf and not _cancelled():
         results = _predict(buf)

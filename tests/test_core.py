@@ -24,6 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from bms.analysis import court_calib as CC          # noqa: E402
+from bms.analysis import frames as FR              # noqa: E402
+from bms.analysis import motion as MO              # noqa: E402
 from bms.analysis import pipeline as P             # noqa: E402
 from bms.analysis import players as PL             # noqa: E402
 from bms.analysis import rally as RA               # noqa: E402
@@ -31,7 +33,7 @@ from bms.analysis import rally_vision as RV        # noqa: E402
 from bms.analysis import annotation as AN          # noqa: E402
 from bms.analysis import scoring as SC             # noqa: E402
 from bms.analysis import visual_shots as VS        # noqa: E402
-from bms.core.models import AnalysisParams, AnalysisResult  # noqa: E402
+from bms.core.models import AnalysisParams, AnalysisResult, MediaInfo  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -313,6 +315,66 @@ def test_size_filter_selects_end_to_end() -> None:
     check("尺寸上限能把大轨迹筛掉（阈值真的生效）", 1 not in ids2, str(ids2))
 
 
+def test_shared_frame_stream_and_motion_accumulator() -> None:
+    """One decode pass must reproduce the standalone motion signal exactly.
+
+    The shared stream retrieves a frame only when at least one consumer's sampling grid needs
+    it; motion fed through it must be bit-identical to its old dedicated loop.
+    """
+    print("\n共享解码：帧流网格与 motion 累加器")
+    try:
+        import cv2
+        import tempfile
+    except ImportError:  # pragma: no cover
+        check("opencv 可用（跳过共享解码用例）", False)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="bms_frames_") as tmp:
+        vid = Path(tmp) / "clip.avi"
+        w, h, fps, n = 160, 96, 12.0, 30
+        vw = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
+        if not vw.isOpened():  # pragma: no cover
+            print("  skip 本机 OpenCV 不能写 MJPG 视频，跳过共享解码用例")
+            return
+        for i in range(n):
+            frame = np.full((h, w, 3), (40 + i, 20, 10), dtype=np.uint8)
+            x = 10 + i * 3
+            cv2.rectangle(frame, (x, 20), (min(x + 20, w - 1), 60), (240, 240, 240), -1)
+            vw.write(frame)
+        vw.release()
+
+        cap = cv2.VideoCapture(str(vid))
+        got = [i for i, _ in FR.VideoFrameStream(cap, [2, 3])]
+        cap.release()
+        expect = [i for i in range(n) if i % 2 == 0 or i % 3 == 0]
+        check("帧流按消费者网格并集出帧", got == expect, f"{got} != {expect}")
+
+        cap = cv2.VideoCapture(str(vid))
+        limited = [i for i, _ in FR.VideoFrameStream(cap, [1], limit=5)]
+        cap.release()
+        check("帧流 limit 按源帧计数", limited == [0, 1, 2, 3, 4], str(limited))
+
+        media = MediaInfo(path=str(vid), name="clip", duration=n / fps, fps=fps,
+                          width=w, height=h)
+        standalone = MO.analyze_motion(media, sample_fps=6.0, work_width=64)
+        acc = MO.MotionAccumulator(sample_fps=6.0, work_width=64)
+        cap = cv2.VideoCapture(str(vid))
+        acc.configure(fps, 2)
+        for idx, frame in FR.VideoFrameStream(cap, [2]):
+            acc.feed(idx, frame)
+        cap.release()
+        shared = acc.finalize()
+        check("累加器帧率一致", shared.fps == standalone.fps == 6.0,
+              f"shared={shared.fps} standalone={standalone.fps}")
+        check("累加器 motion 逐元素一致", np.array_equal(shared.motion, standalone.motion))
+        check("累加器 brightness/sharpness/shake/cut 一致",
+              np.array_equal(shared.brightness, standalone.brightness)
+              and np.array_equal(shared.sharpness, standalone.sharpness)
+              and np.array_equal(shared.shake, standalone.shake)
+              and np.array_equal(shared.cut, standalone.cut))
+        check("累加器只累计运动计算耗时", acc.seconds > 0.0, str(acc.seconds))
+
+
 def test_analyze_players_smoke_empty_detections() -> None:
     """``analyze_players`` must run end-to-end with a stub YOLO that detects nothing.
 
@@ -371,6 +433,21 @@ def test_analyze_players_smoke_empty_detections() -> None:
                   and sig.format_mode.size == len(sig.frame_boxes),
                   f"count={sig.format_count.size} mode={sig.format_mode.size} "
                   f"frames={len(sig.frame_boxes)}")
+
+            # Same pass, with the motion accumulator attached: player output must not change,
+            # and the accumulator must see the frames it used to decode itself.
+            acc = MO.MotionAccumulator(sample_fps=5.0, work_width=64)
+            sig_shared = PL.analyze_players(str(vid), sample_fps=5.0, device="cpu",
+                                            model_name="nonexistent-stub.pt",
+                                            frame_consumers=[acc])
+            check("共享帧流不改变球员输出",
+                  sig_shared.fps == sig.fps
+                  and abs(sig_shared.duration - sig.duration) < 1e-9
+                  and sig_shared.active_player_ids == sig.active_player_ids
+                  and len(sig_shared.frame_boxes) == len(sig.frame_boxes))
+            check("球员 pass 同时喂到 motion 累加器",
+                  len(acc.motion) > 0 and acc.eff_fps == 5.0,
+                  f"frames={len(acc.motion)} fps={acc.eff_fps}")
         except Exception as exc:
             check("空检测桩下完整跑通", False, f"{type(exc).__name__}: {exc}")
         finally:
@@ -1638,6 +1715,311 @@ def test_shuttle_backend_selection() -> None:
             os.environ.pop("BMS_SHUTTLE_BACKEND", None)
         else:
             os.environ["BMS_SHUTTLE_BACKEND"] = old
+
+
+def test_inference_capabilities_and_selection() -> None:
+    """The inference facade is the single place that answers "is an accelerator usable?".
+
+    Capability probing is cached process-wide, so every fake probe must be followed by
+    ``reset()`` -- otherwise the next test silently sees stale acceleration facts.
+    """
+    print("\n推理门面：能力探测与设备选择")
+    from bms.analysis import pose as POSE
+    from bms.analysis import speech as SP
+    from bms.inference import capabilities as CAP
+    from bms.inference import scheduler as SCH
+
+    real = CAP.probe()
+    expect_cuda = "cuda" if real.cuda_available else "cpu"
+    check("players._pick_device 走门面", PL._pick_device("cuda") == expect_cuda)
+    check("pose 非标准设备名透传", POSE._pick_device("mps") == "mps")
+    check("speech._pick_device 走门面", SP._pick_device() == SCH.resolve_speech_runtime())
+
+    orig_torch = CAP._probe_torch
+    orig_ct2 = CAP._probe_ctranslate2
+    try:
+        CAP._probe_torch = lambda: (True, False, 0, "")
+        CAP._probe_ctranslate2 = lambda: 0
+        CAP.reset()
+        rep = CAP.probe()
+        check("无 CUDA 能力报告", rep.torch_available and not rep.cuda_available,
+              str(rep.as_dict()))
+        check("cuda 请求降级 cpu", SCH.resolve_torch_device("cuda") == "cpu")
+        check("cuda:1 请求降级 cpu", SCH.resolve_torch_device("cuda:1") == "cpu")
+        check("cpu 请求原样返回", SCH.resolve_torch_device("cpu") == "cpu")
+        check("空请求按 cpu", SCH.resolve_torch_device(None) == "cpu")
+        check("无 CTranslate2 GPU 用 cpu/int8", SCH.resolve_speech_runtime() == ("cpu", "int8"))
+
+        CAP._probe_torch = lambda: (True, True, 2, "Fake GPU")
+        CAP._probe_ctranslate2 = lambda: 1
+        CAP.reset()
+        rep = CAP.probe()
+        check("CUDA 能力报告",
+              rep.cuda_available and rep.cuda_device_count == 2
+              and rep.cuda_device_name == "Fake GPU", str(rep.as_dict()))
+        check("cuda 请求透传", SCH.resolve_torch_device("cuda") == "cuda")
+        check("cuda:1 请求透传", SCH.resolve_torch_device("cuda:1") == "cuda:1")
+        check("有 CTranslate2 GPU 用 cuda/float16",
+              SCH.resolve_speech_runtime() == ("cuda", "float16"))
+
+        CAP._probe_torch = lambda: (False, False, 0, "")
+        CAP.reset()
+        check("torch 缺失能力报告", CAP.probe().torch_available is False)
+        check("torch 缺失时 cuda 降级", SCH.resolve_torch_device("cuda") == "cpu")
+    finally:
+        CAP._probe_torch = orig_torch
+        CAP._probe_ctranslate2 = orig_ct2
+        CAP.reset()
+
+
+def test_inference_shuttle_backend_selection() -> None:
+    """Shuttle backend resolution keeps the old force/env semantics on top of the facade."""
+    print("\n推理门面：shuttle 后端选择")
+    from bms.inference import capabilities as CAP
+    from bms.inference import scheduler as SCH
+
+    orig_torch = CAP._probe_torch
+    try:
+        CAP._probe_torch = lambda: (True, False, 0, "")
+        CAP.reset()
+        check("无 CUDA auto→cpu", SCH.resolve_shuttle_backend() == "cpu")
+        check("无 CUDA force=cpu", SCH.resolve_shuttle_backend("cpu") == "cpu")
+        check("无 CUDA env=gpu 静默回退", SCH.resolve_shuttle_backend(None, "gpu") == "cpu")
+        check("非法值按 auto 处理", SCH.resolve_shuttle_backend(None, "garbage") == "cpu")
+        raised = False
+        try:
+            SCH.resolve_shuttle_backend("gpu", "auto")
+        except RuntimeError:
+            raised = True
+        check("无 CUDA force=gpu 硬失败", raised)
+
+        CAP._probe_torch = lambda: (True, True, 1, "Fake GPU")
+        CAP.reset()
+        check("有 CUDA auto→gpu", SCH.resolve_shuttle_backend(None, "auto") == "gpu")
+        check("有 CUDA env=cpu 覆盖", SCH.resolve_shuttle_backend(None, "cpu") == "cpu")
+    finally:
+        CAP._probe_torch = orig_torch
+        CAP.reset()
+
+
+def test_inference_registry_and_parity() -> None:
+    """Provider ranking is a pure function of "what the runtime reports"; parity pins the accept rule.
+
+    A wrongly ordered list silently runs a slow-but-available provider, and a wrong
+    recall definition silently accepts a drifting backend, so both are pinned here.
+    """
+    print("\n推理门面：后端排序与精度对齐")
+    from bms.inference import parity as PAR
+    from bms.inference import registry as REG
+
+    win = ["CPUExecutionProvider", "DmlExecutionProvider", "CUDAExecutionProvider"]
+    ranked = REG.rank_providers(REG.TASK_PLAYERS, win)
+    check("CUDA 排在 DML 之前",
+          ranked.index("CUDAExecutionProvider") < ranked.index("DmlExecutionProvider"), str(ranked))
+    check("CPU 永远兜底", ranked[-1] == "CPUExecutionProvider", str(ranked))
+    check("未安装的 EP 被过滤", "TensorrtExecutionProvider" not in ranked, str(ranked))
+    check("只有 CPU 时只剩 CPU",
+          REG.rank_providers(REG.TASK_PLAYERS, ["CPUExecutionProvider"]) == ["CPUExecutionProvider"])
+    check("无运行时时候选为空", REG.rank_providers(REG.TASK_PLAYERS, []) == [])
+    check("显式 torch", REG.resolve_detect_backend("torch") == "torch")
+    check("未知后端退回 torch", REG.resolve_detect_backend("quantum") == "torch")
+
+    orig = REG.available_providers
+    try:
+        REG.available_providers = lambda refresh=False: ["CPUExecutionProvider"]
+        check("有 ORT 时 onnx 可选", REG.resolve_detect_backend("onnx") == "onnx")
+        check("auto 有 ORT 时选 onnx", REG.resolve_detect_backend("auto") == "onnx")
+        snap = REG.snapshot()
+        check("snapshot 结构完整",
+              {"capabilities", "ort_providers", "detect_backend", "candidates"} <= set(snap),
+              str(sorted(snap)))
+        check("snapshot 报出候选",
+              snap["candidates"][REG.TASK_PLAYERS] == ["CPUExecutionProvider"])
+
+        REG.available_providers = lambda refresh=False: []
+        check("无 ORT 时 onnx 降级 torch", REG.resolve_detect_backend("onnx") == "torch")
+        check("无 ORT 时 auto 选 torch", REG.resolve_detect_backend("auto") == "torch")
+    finally:
+        REG.available_providers = orig
+
+    ref = [
+        [((10, 10, 50, 80), 0.9)],
+        [((0, 0, 20, 20), 0.5), ((100, 100, 140, 180), 0.7)],
+    ]
+    same = copy.deepcopy(ref)
+    m = PAR.match_frames(ref, same)
+    check("完全一致 recall/precision/mean_iou 均为 1",
+          m["recall"] == 1.0 and m["precision"] == 1.0 and m["mean_iou"] == 1.0, str(m))
+    check("一致的覆盖率为 1",
+          m["coverage_recall"] == 1.0 and m["coverage_precision"] == 1.0, str(m))
+
+    dup = [[((10, 10, 50, 80), 0.9), ((11, 10, 51, 80), 0.8)]]
+    md = PAR.match_frames([ref[0]], dup)
+    check("重复框拉低一对一 precision", md["precision"] < 0.75, str(md))
+    check("重复框不影响覆盖率", md["coverage_recall"] == 1.0 and md["coverage_precision"] == 1.0, str(md))
+
+    partial = [
+        [((12, 12, 52, 82), 0.88)],
+        [((0, 0, 20, 20), 0.5), ((300, 300, 340, 380), 0.9)],
+    ]
+    m2 = PAR.match_frames(ref, partial)
+    check("漏框降低 recall", m2["recall"] < 1.0, str(m2))
+    check("多框降低 precision", m2["precision"] < 1.0, str(m2))
+    check("worst_frame_recall 反映最差帧", m2["worst_frame_recall"] < 1.0, str(m2))
+    check("IoU 阈值生效",
+          PAR.match_frames(ref, [[((60, 60, 100, 130), 0.9)], []] , 0.5)["recall"] == 0.0)
+    check("空参考不惩罚召回", PAR.match_frames([[]], [[]])["recall"] == 1.0)
+    check("空参考但有候选时 precision=0",
+          PAR.match_frames([[]], [[((0, 0, 10, 10), 0.9)]])["precision"] == 0.0)
+    check("iou 自比为 1", abs(PAR.iou((0, 0, 10, 10), (0, 0, 10, 10)) - 1.0) < 1e-9)
+    check("iou 不相交为 0", PAR.iou((0, 0, 10, 10), (20, 20, 30, 30)) == 0.0)
+
+    ref_kp = [[{"slot": 0, "kps": [[10, 10, 0.9], [20, 20, 0.8]]}]]
+    check("关键点一致误差为 0", PAR.keypoint_l2(ref_kp, copy.deepcopy(ref_kp))["mean"] == 0.0)
+    off_kp = [[{"slot": 0, "kps": [[12, 11, 0.9], [20, 20, 0.8]]}]]
+    check("关键点偏移可量化", PAR.keypoint_l2(ref_kp, off_kp)["mean"] > 0)
+
+
+def test_ort_backend_geometry() -> None:
+    """Letterbox / box rescale must reproduce ultralytics' geometry.
+
+    A silent off-by-one here does not crash: it shifts every box, the tracker then
+    sees a different player, and only the rally quality drops. Hence exact numbers.
+    """
+    print("\nONNX 后端几何")
+    from bms.inference import ort_backend as ORT
+
+    img = np.full((540, 960, 3), 127, dtype=np.uint8)
+    padded, ratio, pad = ORT.letterbox(img, 640, auto=True)
+    check("auto 保留最小矩形", padded.shape[:2] == (384, 640), str(padded.shape))
+    check("缩放比例 2/3", abs(ratio - 2 / 3) < 1e-6, str(ratio))
+    check("只在上下各补 12px", pad == (0.0, 12.0), str(pad))
+
+    squared, _r2, pad2 = ORT.letterbox(img, 640, auto=False)
+    check("非 auto 补齐正方形", squared.shape[:2] == (640, 640), str(squared.shape))
+    check("非 auto 上下各补 140px", pad2 == (0.0, 140.0), str(pad2))
+
+    arr, metas = ORT.preprocess([img, img], 640, auto=True)
+    check("预处理为 NCHW", arr.shape == (2, 3, 384, 640), str(arr.shape))
+    check("预处理取值范围 0~1", 0.0 <= float(arr.min()) and float(arr.max()) <= 1.0)
+    check("预处理记录每帧几何", metas[0][0] == ratio and metas[0][2] == (540, 960), str(metas[0]))
+
+    xy = ORT._xywh_to_xyxy(np.array([[100.0, 50.0, 40.0, 20.0]]))
+    check("xywh -> xyxy", np.allclose(xy, [[80, 40, 120, 60]]), str(xy))
+    back = ORT._scale_boxes(np.array([[100.0, 50.0, 140.0, 90.0]]), 0.5, (0.0, 12.0), (540, 960))
+    check("反算回原图坐标", np.allclose(back, [[200, 76, 280, 156]]), str(back))
+
+    empty = ORT._nms(np.empty((0, 4)), np.empty(0), 0.7, 300)
+    check("空输入 NMS 不炸", len(empty) == 0)
+
+
+def test_inference_benchmark_cache() -> None:
+    """The provider ranking must use measured numbers when they exist, and degrade to static order."""
+    print("\n推理：测速缓存与后端排序")
+    import tempfile
+
+    from bms.inference import benchmark as BENCH
+    from bms.inference import registry as REG
+
+    orig_dir = BENCH.DATA_DIR
+    BENCH.DATA_DIR = Path(tempfile.mkdtemp())
+    try:
+        check("初始缓存为空", BENCH.table() == [])
+        BENCH.record("yolo26n.dynamic.onnx", REG.CPU_PROVIDER, 167.0, 168.0, 640, 8)
+        rows = BENCH.table()
+        check("写入后可读", len(rows) == 1 and rows[0]["provider"] == REG.CPU_PROVIDER, str(rows))
+        BENCH.record("yolo26n.dynamic.onnx", REG.CPU_PROVIDER, 150.0, 151.0, 640, 8)
+        rows = BENCH.table()
+        check("同键覆盖而不是追加", len(rows) == 1 and rows[0]["p50_ms"] == 150.0, str(rows))
+        check("指纹包含运行时与硬件", {"ort", "gpu", "os"} <= set(BENCH.fingerprint()))
+        check("缺失模型标记为 missing", BENCH._model_key("nope.onnx").endswith(":missing"))
+    finally:
+        BENCH.DATA_DIR = orig_dir
+
+    orig_avail = REG.available_providers
+    orig_table = BENCH.table
+    try:
+        REG.available_providers = lambda refresh=False: [
+            "CPUExecutionProvider", "DmlExecutionProvider", "CUDAExecutionProvider",
+        ]
+        BENCH.table = lambda model="", imgsz=0, batch=0: [
+            {"provider": "DmlExecutionProvider", "p50_ms": 10.0},
+            {"provider": "CUDAExecutionProvider", "p50_ms": 50.0},
+            {"provider": REG.CPU_PROVIDER, "p50_ms": 500.0},
+        ]
+        order = BENCH.preferred_order(REG.TASK_PLAYERS, "yolo26n.dynamic.onnx")
+        check("实测最快的排最前", order[0] == "DmlExecutionProvider", str(order))
+        check("CPU 永远最后", order[-1] == REG.CPU_PROVIDER, str(order))
+
+        BENCH.table = lambda model="", imgsz=0, batch=0: []
+        static = BENCH.preferred_order(REG.TASK_PLAYERS, "yolo26n.dynamic.onnx")
+        check("无实测时回到静态优先级", static[0] == "CUDAExecutionProvider", str(static))
+        check("静态顺序里 CPU 也最后", static[-1] == REG.CPU_PROVIDER, str(static))
+
+        REG.available_providers = lambda refresh=False: []
+        check("无运行时返回空顺序",
+              BENCH.preferred_order(REG.TASK_PLAYERS, "yolo26n.dynamic.onnx") == [])
+    finally:
+        REG.available_providers = orig_avail
+        BENCH.table = orig_table
+
+
+def test_desktop_stdio_guard() -> None:
+    """A frozen windowed app starts with sys.stdout/stderr = None; the shell must repair them.
+
+    Without this, loguru's stderr sink raises during ``bms.main`` import and the installed app
+    exits silently ~45 s after launch (the server thread never starts).
+    """
+    print("\n桌面壳：无控制台时的 stdout/stderr 兜底")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("bms_desktop_app", ROOT / "desktop" / "app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    old_out, old_err = sys.stdout, sys.stderr
+    repaired = False
+    try:
+        sys.stdout = None
+        sys.stderr = None
+        mod._ensure_stdio()
+        repaired = sys.stdout is not None and sys.stderr is not None
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+    check("补齐 stdout/stderr", repaired)
+
+
+def test_stage_times_recorded() -> None:
+    """stage_times is diagnostic only, but must survive the cancelled-early path too."""
+    print("\n分段计时：stage_times 写入 stats")
+    import tempfile
+    import time
+
+    from bms.core import media as M
+    from bms.core.models import MediaInfo
+
+    acc: dict[str, float] = {}
+    started = time.perf_counter()
+    P._mark_stage(acc, "dup", started)
+    P._mark_stage(acc, "dup", started)
+    check("同名阶段累加", list(acc) == ["dup"] and acc["dup"] >= 0, str(acc))
+
+    orig = (M.ensure_proxy, M.ensure_audio, M.ensure_poster)
+    try:
+        M.ensure_proxy = lambda media, **kw: None
+        M.ensure_audio = lambda media, **kw: None
+        M.ensure_poster = lambda media, **kw: None
+        media = MediaInfo(id="m_stage", path=str(Path(tempfile.gettempdir()) / "nope.mp4"),
+                          name="nope", duration=1.0, width=640, height=360)
+        res = P.run_analysis(media, AnalysisParams(), cancel=lambda: True)
+        st = res.stats.get("stage_times") or {}
+        check("取消时也写入 stage_times",
+              res.status == "cancelled" and {"proxy", "audio", "poster"} <= set(st),
+              str(res.stats))
+        check("stage_times 为非负秒",
+              all(isinstance(v, float) and v >= 0 for v in st.values()), str(st))
+    finally:
+        M.ensure_proxy, M.ensure_audio, M.ensure_poster = orig
 
 
 def test_shuttle_gpu_morph_equivalence() -> None:
@@ -4414,6 +4796,7 @@ def main() -> int:
     test_size_filter()
     test_probe_frame_capture()
     test_size_filter_selects_end_to_end()
+    test_shared_frame_stream_and_motion_accumulator()
     test_analyze_players_smoke_empty_detections()
     test_polygon_geometry()
     test_polygon_calibration()
@@ -4446,6 +4829,13 @@ def main() -> int:
     test_shuttle_in_flight_build()
     test_fuse_shuttle_in_flight_blend()
     test_shuttle_backend_selection()
+    test_inference_capabilities_and_selection()
+    test_inference_shuttle_backend_selection()
+    test_inference_registry_and_parity()
+    test_ort_backend_geometry()
+    test_inference_benchmark_cache()
+    test_desktop_stdio_guard()
+    test_stage_times_recorded()
     test_shuttle_gpu_morph_equivalence()
     test_shuttle_gpu_cpu_parity()
     test_shuttle_gpu_runtime_error_falls_back()

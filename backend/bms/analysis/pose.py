@@ -42,7 +42,10 @@ from typing import Any, Callable
 
 import numpy as np
 
+from loguru import logger
+
 from ..i18n import tr
+from ..inference import resolve_detect_backend
 
 EPS = 1e-9
 
@@ -211,10 +214,23 @@ def analyze_pose(
     except Exception:
         return None
 
-    try:
-        model = YOLO(weights)
-    except Exception:
-        return None
+    # Backend switch (docs/mobile-and-device-ai-plan.md §5.1 P2): Torch by default, ONNX
+    # opt-in. Missing runtime / model degrades to Torch instead of dropping the pose stage.
+    estimator = None
+    model = None
+    if resolve_detect_backend() == "onnx":
+        try:
+            from ..inference.ort_backend import OrtPoseEstimator
+
+            estimator = OrtPoseEstimator(imgsz=crop_size, conf=confidence)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ONNX pose model unavailable ({}: {}); using torch",
+                           type(exc).__name__, exc)
+    if estimator is None:
+        try:
+            model = YOLO(weights)
+        except Exception:
+            return None
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -237,11 +253,23 @@ def analyze_pose(
     kp_rec_conf: list[np.ndarray] = []                  # uint8 (17,)
 
     def _flush() -> None:
+        nonlocal estimator, model
         if not batch_patches:
             return
         try:
-            res = model.predict(batch_patches, imgsz=crop_size, conf=confidence,
-                                verbose=False, device=dev)
+            if estimator is not None:
+                try:
+                    res = estimator.predict(batch_patches, conf=confidence)
+                except Exception as exc:  # noqa: BLE001 - switch back rather than lose keypoints
+                    logger.warning("ONNX pose inference failed ({}: {}); switching to torch",
+                                   type(exc).__name__, exc)
+                    estimator = None
+                    model = YOLO(weights)
+                    res = model.predict(batch_patches, imgsz=crop_size, conf=confidence,
+                                        verbose=False, device=dev)
+            else:
+                res = model.predict(batch_patches, imgsz=crop_size, conf=confidence,
+                                    verbose=False, device=dev)
         except Exception:
             batch_patches.clear()
             batch_slots.clear()
@@ -900,14 +928,9 @@ def _resolve_weights(model_name: str) -> str | None:
 def _pick_device(device: str) -> str:
     if device not in ("cuda", "cpu"):
         return device
-    try:
-        import torch
+    from ..inference import resolve_torch_device
 
-        if device == "cuda" and not torch.cuda.is_available():
-            return "cpu"
-    except Exception:
-        return "cpu"
-    return device
+    return resolve_torch_device(device)
 
 
 __all__ = [

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import threading
@@ -23,6 +24,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
+
+
+def _ensure_stdio() -> None:
+    """Give the frozen windowed build writable stdout/stderr.
+
+    PyInstaller's windowed bootloader launches with ``sys.stdout`` / ``sys.stderr`` set to None when
+    there is no console (a normal double-click). loguru rejects a None sink and uvicorn writes to
+    stderr, so the backend import would die silently and the window never appears. Redirecting to
+    ``os.devnull`` keeps both working; file logging is unaffected.
+    """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+_ensure_stdio()
 
 
 def free_port(preferred: int = 8000) -> int:

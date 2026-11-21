@@ -69,7 +69,49 @@ the first analysis works offline.
 
 Runtime state (projects, caches, exports, logs) is written to `%LOCALAPPDATA%\BadmintonStudio`.
 
-> The portable build is produced with `pwsh -File packaging\build_release.ps1` (PyInstaller, one-folder).
+### Rebuilding the Windows installer
+
+One-time prerequisites: Node.js 18+, a Python 3.14 interpreter (the dev `.venv`), and Inno Setup 6
+(`winget install --id JRSoftware.InnoSetup --silent`, which installs `ISCC.exe` under
+`%LOCALAPPDATA%\Programs\Inno Setup 6`). The CPU packaging venv `packaging\.venv-cpu` is created on first run.
+
+```powershell
+cd D:\Projects\BadmintonStudio
+# frontend build + PyInstaller + zip + installer
+powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1 0.1.3 -Installer
+# backend-only change: reuse the existing frontend\dist
+powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1 0.1.3 -SkipFrontend -Installer
+```
+
+Outputs: `dist\BadmintonStudio\`, `dist\BadmintonStudio-<ver>-win64.zip`,
+`dist\BadmintonStudio-Setup-<ver>-win64.exe`. Expect ~10–20 s for the frontend, 3–5 min for PyInstaller
+and ~4 min for Inno Setup.
+
+Manual equivalent — run only what changed:
+
+| Change | Steps |
+| --- | --- |
+| Backend only | PyInstaller → Inno Setup |
+| Frontend only | `npm run build` → PyInstaller → Inno Setup |
+| Both | all three |
+
+```powershell
+cd frontend; npm run build; cd ..
+packaging\.venv-cpu\Scripts\python.exe -m PyInstaller --clean --noconfirm packaging\BadmintonStudio.spec
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.3 packaging\BadmintonStudio.iss
+```
+
+The version in the zip/installer names comes from those arguments (the `.iss` defaults to `0.1.0`).
+`APP_VERSION` in `backend/bms/config.py` is independent — update it too if `/api/health` should report it.
+
+Notes:
+
+- Never edit anything under `dist\` or `build\`; both are overwritten on every build. Change
+  `frontend\src\`, `backend\bms\`, `packaging\BadmintonStudio.spec` or `packaging\BadmintonStudio.iss`.
+- `models\yolo26n.pt` and `models\yolo26n-pose.pt` must exist when freezing; faster-whisper is not
+  bundled and downloads on first use.
+- The installer is unsigned, so SmartScreen warns on first run. Verify startup with `--browser` and
+  `http://127.0.0.1:8000/api/health`; windowed builds have no stdout/stderr (`_ensure_stdio()` handles it).
 
 ---
 

@@ -7,6 +7,7 @@ gym, vision suffers from crowd movement).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -15,6 +16,7 @@ import numpy as np
 from ..core.media import proxy_source
 from ..core.models import MediaInfo
 from ..i18n import tr
+from .frames import VideoFrameStream
 
 Progress = Callable[[float, str], None]
 
@@ -56,6 +58,102 @@ class MotionSignal:
         return out
 
 
+class MotionAccumulator:
+    """Incremental motion signal: one :meth:`feed` call per sampled source frame.
+
+    Split out of :func:`analyze_motion` so the same math can either own a decode pass or be fed
+    by :class:`frames.VideoFrameStream` inside the player pass -- one decode instead of two.
+    :meth:`configure` must run before the first frame: it fixes the stride this consumer uses
+    and, from the source fps, the frame rate of the resulting signal.
+
+    ``seconds`` measures only the motion math (no decoding), so the pipeline can still report a
+    "motion" cost after the separate motion stage has been folded into the player pass.
+    """
+
+    def __init__(self, sample_fps: float = 15.0, work_width: int = 256) -> None:
+        self.sample_fps = float(sample_fps)
+        self.work_width = int(work_width)
+        self.src_fps = 0.0
+        self.step = 1
+        self.eff_fps = float(sample_fps)
+        #: Wall-clock seconds spent inside :meth:`feed` (motion math only, not decoding).
+        self.seconds = 0.0
+        self.motion: list[float] = []
+        self.bright: list[float] = []
+        self.sharp: list[float] = []
+        self.shake: list[float] = []
+        self.cuts: list[float] = []
+        self.activity: np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None
+        self._prev_hist: np.ndarray | None = None
+        self._window: np.ndarray | None = None
+
+    def configure(self, src_fps: float, step: int) -> None:
+        """Pin the source fps and this consumer's stride (called by the decode owner)."""
+        self.src_fps = float(src_fps or 0.0)
+        self.step = max(1, int(step))
+        self.eff_fps = (self.src_fps / self.step) if self.src_fps > 0 else float(self.sample_fps)
+
+    def feed(self, index: int, frame: np.ndarray) -> None:
+        """Consume one sampled frame (``index`` is its source index; ordering is the caller's)."""
+        import cv2
+
+        started = time.perf_counter()
+        h, w = frame.shape[:2]
+        scale = self.work_width / max(1, w)
+        small = cv2.resize(frame, (self.work_width, max(2, int(round(h * scale)))),
+                           interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        grayf = gray.astype(np.float32)
+
+        self.bright.append(float(grayf.mean()) / 255.0)
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        self.sharp.append(float(lap.var()))
+
+        if self._prev_gray is not None and self._prev_gray.shape == grayf.shape:
+            d = np.abs(grayf - self._prev_gray)
+            self.motion.append(float(d.mean()) / 255.0)
+            diff = cv2.GaussianBlur(d, (0, 0), 1.2)
+            self.activity = diff if self.activity is None else 0.985 * self.activity + 0.015 * diff
+            # Global displacement (shake + panning)
+            if self._window is None:
+                wy = np.hanning(grayf.shape[0]).astype(np.float32)
+                wx = np.hanning(grayf.shape[1]).astype(np.float32)
+                self._window = np.outer(wy, wx).astype(np.float32)
+            (dx, dy), _ = cv2.phaseCorrelate(self._prev_gray, grayf, self._window)
+            self.shake.append(float(np.hypot(dx, dy)))
+        else:
+            self.motion.append(0.0)
+            self.shake.append(0.0)
+
+        hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).flatten()
+        hist /= (hist.sum() + 1e-9)
+        if self._prev_hist is not None:
+            self.cuts.append(float(0.5 * np.abs(hist - self._prev_hist).sum()))
+        else:
+            self.cuts.append(0.0)
+
+        self._prev_gray, self._prev_hist = grayf, hist
+        self.seconds += time.perf_counter() - started
+
+    def finalize(self) -> MotionSignal:
+        """Build the final signal from the frames fed so far (safe after an early stop)."""
+        sig = MotionSignal(
+            fps=self.eff_fps,
+            duration=(len(self.motion) / self.eff_fps) if self.eff_fps > 0 else 0.0,
+            motion=np.asarray(self.motion, dtype=np.float32),
+            brightness=np.asarray(self.bright, dtype=np.float32),
+            sharpness=_norm(np.asarray(self.sharp, dtype=np.float32)),
+            shake=_norm(np.asarray(self.shake, dtype=np.float32)),
+            cut=np.asarray(self.cuts, dtype=np.float32),
+            activity_map=self.activity,
+        )
+        sig.motion = _norm(sig.motion)
+        sig.roi = _auto_roi(self.activity)
+        sig.court_motion = sig.motion.copy()  # without players/court calibration, equate to global for now
+        return sig
+
+
 def analyze_motion(
     media: MediaInfo,
     sample_fps: float = 15.0,
@@ -64,6 +162,12 @@ def analyze_motion(
     on: Progress | None = None,
     cancel=None,
 ) -> MotionSignal:
+    """Standalone motion pass (owns its decode).
+
+    The pipeline normally folds this into the player pass and feeds :class:`MotionAccumulator`
+    from the same decoded frames; this wrapper remains for direct callers and as the fallback
+    when player detection is disabled or fails.
+    """
     import cv2
 
     src = str(proxy_source(media))
@@ -74,88 +178,18 @@ def analyze_motion(
     src_fps = cap.get(cv2.CAP_PROP_FPS) or media.fps or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     step = max(1, int(round(src_fps / max(1e-3, sample_fps))))
-    eff_fps = src_fps / step
     limit = int(max_seconds * src_fps) if max_seconds > 0 else (total or 10**9)
 
-    prev_gray: np.ndarray | None = None
-    prev_hist: np.ndarray | None = None
-    window: np.ndarray | None = None
-    motion, bright, sharp, shake, cuts = [], [], [], [], []
-    activity: np.ndarray | None = None
-
-    idx = 0
-    read = 0
-    while True:
-        if cancel and cancel():
-            break
-        ok = cap.grab()
-        if not ok:
-            break
-        read += 1
-        if idx % step != 0 and idx != 0:
-            idx += 1
-            continue
-        ok, frame = cap.retrieve()
-        idx += 1
-        if not ok or frame is None:
-            continue
-        if read > limit:
-            break
-
-        h, w = frame.shape[:2]
-        scale = work_width / max(1, w)
-        small = cv2.resize(frame, (work_width, max(2, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        grayf = gray.astype(np.float32)
-
-        bright.append(float(grayf.mean()) / 255.0)
-        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
-        sharp.append(float(lap.var()))
-
-        if prev_gray is not None and prev_gray.shape == grayf.shape:
-            d = np.abs(grayf - prev_gray)
-            motion.append(float(d.mean()) / 255.0)
-            diff = cv2.GaussianBlur(d, (0, 0), 1.2)
-            activity = diff if activity is None else 0.985 * activity + 0.015 * diff
-            # Global displacement (shake + panning)
-            if window is None:
-                wy = np.hanning(grayf.shape[0]).astype(np.float32)
-                wx = np.hanning(grayf.shape[1]).astype(np.float32)
-                window = np.outer(wy, wx).astype(np.float32)
-            (dx, dy), _ = cv2.phaseCorrelate(prev_gray, grayf, window)
-            shake.append(float(np.hypot(dx, dy)))
-        else:
-            motion.append(0.0)
-            shake.append(0.0)
-
-        hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).flatten()
-        hist /= (hist.sum() + 1e-9)
-        if prev_hist is not None:
-            cuts.append(float(0.5 * np.abs(hist - prev_hist).sum()))
-        else:
-            cuts.append(0.0)
-
-        prev_gray, prev_hist = grayf, hist
-
-        if on and total:
-            on(min(0.99, read / min(total, limit)), tr("analysis.stage.motion"))
-
-    cap.release()
-
-    sig = MotionSignal(
-        fps=eff_fps,
-        duration=(len(motion) / eff_fps) if eff_fps > 0 else 0.0,
-        motion=np.asarray(motion, dtype=np.float32),
-        brightness=np.asarray(bright, dtype=np.float32),
-        sharpness=_norm(np.asarray(sharp, dtype=np.float32)),
-        shake=_norm(np.asarray(shake, dtype=np.float32)),
-        cut=np.asarray(cuts, dtype=np.float32),
-        activity_map=activity,
-    )
-    sig.motion = _norm(sig.motion)
-    sig.roi = _auto_roi(activity)
-    sig.court_motion = sig.motion.copy()  # without players/court calibration, equate to global for now
-    return sig
+    acc = MotionAccumulator(sample_fps=sample_fps, work_width=work_width)
+    acc.configure(src_fps, step)
+    try:
+        for idx, frame in VideoFrameStream(cap, [step], limit=limit, cancel=cancel):
+            acc.feed(idx, frame)
+            if on and total:
+                on(min(0.99, (idx + 1) / min(total, limit)), tr("analysis.stage.motion"))
+    finally:
+        cap.release()
+    return acc.finalize()
 
 
 def _norm(a: np.ndarray) -> np.ndarray:

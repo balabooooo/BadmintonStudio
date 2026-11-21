@@ -266,6 +266,12 @@ def env_info() -> dict:
         probe = probe_backend_status()
     except Exception as e:  # noqa: BLE001
         probe = {"active": "unknown", "error": str(e)}
+    try:
+        from .inference import snapshot as inference_snapshot
+
+        inference = inference_snapshot()
+    except Exception as e:  # noqa: BLE001 - diagnostics must never break /api/env
+        inference = {"error": str(e)}
 
     return {
         "app": app_name(),
@@ -277,6 +283,7 @@ def env_info() -> dict:
         "probe": probe,
         "caps": caps,
         "gpu": gpu,
+        "inference": inference,
         "hardware_pipeline": bool(caps.get("cuda_decode") and hardware_available()),
         "data_dir": str(DATA_DIR),
         "models_dir": str(MODELS_DIR),
